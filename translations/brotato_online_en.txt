@@ -1,0 +1,17 @@
+key,text
+BROTATO_ONLINE_MENU_SETTINGS,Online Settings
+BROTATO_ONLINE_SETTINGS_TITLE,Online Settings
+BROTATO_ONLINE_LOCAL_CHARACTER_OUTLINE,Outline local character
+BROTATO_ONLINE_LOCAL_CHARACTER_OUTLINE_DESC,In online battles add an outline only to the player controlled on this machine.
+BROTATO_ONLINE_AUTO_JOIN_HOST_PLAYER,Auto-add host as Player 1
+BROTATO_ONLINE_AUTO_JOIN_HOST_PLAYER_DESC,Default: on. If disabled the host must first join and lock Player 1 with the intended keyboard/controller on the character selection screen; only then should other players join. If Player 2 joins before Player 1 is ready character slots or focus may desync.
+
+BROTATO_ONLINE_QUICK_CHAT_CANCEL,Release Ctrl to cancel
+BROTATO_ONLINE_QUICK_CHAT_COME,Stay alive
+BROTATO_ONLINE_QUICK_CHAT_HELP,Hurry!
+BROTATO_ONLINE_QUICK_CHAT_WAIT,......
+BROTATO_ONLINE_QUICK_CHAT_READY,This one
+BROTATO_ONLINE_QUICK_CHAT_BUY,Strong strong?
+BROTATO_ONLINE_QUICK_CHAT_NO_REROLL,?
+BROTATO_ONLINE_QUICK_CHAT_THANKS,NO!
+BROTATO_ONLINE_QUICK_CHAT_NICE,Wait a sec

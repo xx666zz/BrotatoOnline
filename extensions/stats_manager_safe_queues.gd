@@ -1,30 +1,72 @@
 extends "res://global/stats_manager.gd"
 
 # BrotatoOnline safety extension.
-# Vanilla StatsManager delays player/weapon/structure/pet stat recalculation in dictionaries.
-# On an online client the host-authoritative replica layer can remove local structures/pets
-# before those delayed queues are dequeued. Vanilla then reads `dead` on a previously freed
-# instance and crashes. Sanitize the queue keys before any property access.
+# Vanilla StatsManager keeps delayed recalculation queues whose object keys can become
+# invalid after host-authoritative replica cleanup. Remove only unusable keys first,
+# then use the vanilla implementation whenever the remaining entries have the normal
+# StatsManager interfaces. The local fallback is reserved for malformed-but-live keys.
 
 
+func _physics_process(_delta: float) -> void:
+	_brotato_online_sanitize_all_stat_queues("physics_pre")
+	if _brotato_online_can_use_vanilla_stat_queues():
+		._physics_process(_delta)
+		return
+	_brotato_online_process_stat_queues_safely()
 
 
-func _dict_size(value) -> int:
-	if typeof(value) == TYPE_DICTIONARY:
-		return value.size()
-	return 0
+func _brotato_online_can_use_vanilla_stat_queues() -> bool:
+	for player in _player_queue.keys():
+		if player.get("dead") == null or not player.has_method("update_player_stats"):
+			return false
+
+	for weapon in _weapon_queue.keys():
+		if not weapon.has_method("init_stats"):
+			return false
+
+	for player_structure_queue in _structure_queues:
+		if typeof(player_structure_queue) != TYPE_DICTIONARY:
+			return false
+		for structure in player_structure_queue.keys():
+			var structure_filename = structure.get("filename")
+			if structure.get("dead") == null or structure.get("is_cursed") == null or structure_filename == null:
+				return false
+			if str(structure_filename) == "" or structure.get("stats") == null:
+				return false
+			if not structure.has_method("reload_data") or not structure.has_method("set_current_stats"):
+				return false
+
+	for player_pet_queue in _pet_queues:
+		if typeof(player_pet_queue) != TYPE_DICTIONARY:
+			return false
+		for pet in player_pet_queue.keys():
+			var pet_filename = pet.get("filename")
+			if pet.get("dead") == null or pet.get("is_cursed") == null or pet_filename == null:
+				return false
+			if str(pet_filename) == "":
+				return false
+			if not pet.has_method("reload_data") or not pet.has_method("set_current_stats") or not pet.has_method("get_stats"):
+				return false
+
+	return true
 
 
-func _queue_array_size(value) -> int:
-	if typeof(value) != TYPE_ARRAY:
-		return 0
-	var total = 0
-	for queue in value:
-		if typeof(queue) == TYPE_DICTIONARY:
-			total += queue.size()
-	return total
+func _brotato_online_process_stat_queues_safely() -> void:
+	for player in _player_queue.keys():
+		if _brotato_online_should_drop_queue_key(player):
+			_player_queue.erase(player)
+			continue
+		if not bool(player.get("dead")) and player.has_method("update_player_stats"):
+			player.update_player_stats()
+	_player_queue.clear()
 
-func _dequeue_weapons() -> void:
+	_current_frame = Engine.get_physics_frames()
+	_brotato_online_dequeue_weapons_safely()
+	_brotato_online_dequeue_structures_safely()
+	_brotato_online_dequeue_pets_safely()
+
+
+func _brotato_online_dequeue_weapons_safely() -> void:
 	var count: int = 0
 	for weapon in _weapon_queue.keys():
 		if _brotato_online_should_drop_queue_key(weapon):
@@ -40,47 +82,47 @@ func _dequeue_weapons() -> void:
 			break
 
 
-func _dequeue_structures() -> void:
+func _brotato_online_dequeue_structures_safely() -> void:
 	for player_structure_queue in _structure_queues:
 		if typeof(player_structure_queue) != TYPE_DICTIONARY:
 			continue
 		var structure_cache = {}
 		var count: int = 0
 
-		for struct in player_structure_queue.keys():
-			if _brotato_online_should_drop_queue_key(struct):
-				player_structure_queue.erase(struct)
+		for structure in player_structure_queue.keys():
+			if _brotato_online_should_drop_queue_key(structure):
+				player_structure_queue.erase(structure)
 				count += 1
 				continue
 
-			var is_dead = bool(struct.get("dead"))
+			var is_dead = bool(structure.get("dead"))
 			if not is_dead:
-				var is_cursed = bool(struct.get("is_cursed"))
-				var filename = str(struct.get("filename"))
+				var is_cursed = bool(structure.get("is_cursed"))
+				var filename = str(structure.get("filename"))
 				if not is_cursed:
 					if filename != "" and structure_cache.has(filename):
-						if struct.has_method("set_current_stats"):
-							struct.set_current_stats(structure_cache[filename])
+						if structure.has_method("set_current_stats"):
+							structure.set_current_stats(structure_cache[filename])
 						count += 1
-						player_structure_queue.erase(struct)
-					elif _should_recalc_item(int(player_structure_queue.get(struct, _current_frame)), count):
-						if struct.has_method("reload_data"):
-							struct.reload_data()
+						player_structure_queue.erase(structure)
+					elif _should_recalc_item(int(player_structure_queue.get(structure, _current_frame)), count):
+						if structure.has_method("reload_data"):
+							structure.reload_data()
 						if filename != "":
-							structure_cache[filename] = struct.get("stats")
+							structure_cache[filename] = structure.get("stats")
 						count += 1
-						player_structure_queue.erase(struct)
-				elif _should_recalc_item(int(player_structure_queue.get(struct, _current_frame)), count):
-					if struct.has_method("reload_data"):
-						struct.reload_data()
+						player_structure_queue.erase(structure)
+				elif _should_recalc_item(int(player_structure_queue.get(structure, _current_frame)), count):
+					if structure.has_method("reload_data"):
+						structure.reload_data()
 					count += 1
-					player_structure_queue.erase(struct)
+					player_structure_queue.erase(structure)
 			else:
 				count += 1
-				player_structure_queue.erase(struct)
+				player_structure_queue.erase(structure)
 
 
-func _dequeue_pets() -> void:
+func _brotato_online_dequeue_pets_safely() -> void:
 	for player_pet_queue in _pet_queues:
 		if typeof(player_pet_queue) != TYPE_DICTIONARY:
 			continue
@@ -118,14 +160,11 @@ func _dequeue_pets() -> void:
 			player_pet_queue.erase(pet)
 
 
-func _brotato_online_sanitize_all_stat_queues(reason: String) -> void:
-	var removed = 0
-	removed += _brotato_online_sanitize_queue_dict(_player_queue)
-	removed += _brotato_online_sanitize_queue_dict(_weapon_queue)
-	removed += _brotato_online_sanitize_queue_array(_structure_queues)
-	removed += _brotato_online_sanitize_queue_array(_pet_queues)
-	if removed > 0 and _brotato_online_is_online_session_active():
-		pass
+func _brotato_online_sanitize_all_stat_queues(_reason: String) -> void:
+	_brotato_online_sanitize_queue_dict(_player_queue)
+	_brotato_online_sanitize_queue_dict(_weapon_queue)
+	_brotato_online_sanitize_queue_array(_structure_queues)
+	_brotato_online_sanitize_queue_array(_pet_queues)
 
 
 func _brotato_online_sanitize_queue_array(queues) -> int:
@@ -149,35 +188,10 @@ func _brotato_online_sanitize_queue_dict(queue) -> int:
 
 
 func _brotato_online_should_drop_queue_key(key) -> bool:
-	if key == null:
-		return true
-	if typeof(key) != TYPE_OBJECT:
+	if key == null or typeof(key) != TYPE_OBJECT:
 		return true
 	if not is_instance_valid(key):
 		return true
 	if key is Node and key.is_queued_for_deletion():
 		return true
 	return false
-
-
-func _brotato_online_is_online_session_active() -> bool:
-	var tree = get_tree()
-	if tree == null or tree.root == null:
-		return false
-	return bool(tree.root.get_meta("brotato_online_session_active", false))
-
-func _physics_process(_delta: float) -> void:
-	_brotato_online_sanitize_all_stat_queues("physics_pre")
-
-	for player in _player_queue.keys():
-		if _brotato_online_should_drop_queue_key(player):
-			_player_queue.erase(player)
-			continue
-		if not bool(player.get("dead")) and player.has_method("update_player_stats"):
-			player.update_player_stats()
-	_player_queue.clear()
-
-	_current_frame = Engine.get_physics_frames()
-	_dequeue_weapons()
-	_dequeue_structures()
-	_dequeue_pets()

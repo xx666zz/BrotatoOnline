@@ -807,48 +807,97 @@ func _exit_tree() -> void:
 		._exit_tree()
 		return
 
-	InputService.set_gamepad_echo_processing(true)
+	var skipped_pool_entries = _brotato_online_prepare_pool_for_vanilla_exit()
+	._exit_tree()
+	_brotato_online_clear_pool_arrays_after_exit()
+	_brotato_online_restore_skipped_pool_entries(skipped_pool_entries)
+
+
+func _brotato_online_prepare_pool_for_vanilla_exit() -> Dictionary:
+	var skipped_entries = {}
+	if _pool == null:
+		return skipped_entries
+	for key in _pool.keys():
+		var pool = _pool[key]
+		if typeof(pool) != TYPE_ARRAY:
+			skipped_entries[key] = pool
+			_pool.erase(key)
+			continue
+		for index in range(pool.size() - 1, -1, -1):
+			var node = pool[index]
+			if not is_instance_valid(node) or (node is Node and node.is_queued_for_deletion()):
+				pool.remove(index)
+	return skipped_entries
+
+
+func _brotato_online_clear_pool_arrays_after_exit() -> void:
 	if _pool == null:
 		return
 	for key in _pool.keys():
 		var pool = _pool[key]
-		if typeof(pool) != TYPE_ARRAY:
-			continue
-		for node in pool:
-			if not is_instance_valid(node):
-				continue
-			if node is Node and node.is_queued_for_deletion():
-				continue
-			node.queue_free()
-		pool.clear()
+		if typeof(pool) == TYPE_ARRAY:
+			pool.clear()
+
+
+func _brotato_online_restore_skipped_pool_entries(skipped_entries: Dictionary) -> void:
+	if _pool == null:
+		return
+	for key in skipped_entries.keys():
+		_pool[key] = skipped_entries[key]
 
 
 func _check_for_pause() -> void:
-	# Always guard the action lookup, not only while the Steam session meta is active.
-	# During online scene teardown / player removal, RunData can still be coop while
-	# CoopService.get_remapped_player_device() temporarily returns -1 for a slot.
-	# Vanilla Main then polls ui_pause_-1 every frame, which floods the log and stalls
-	# weaker clients.
+	# Normal input maps use the original Main implementation. The fallback only runs
+	# while online teardown leaves a missing action or a temporary -1 device mapping.
+	if _brotato_online_can_use_vanilla_pause_check():
+		._check_for_pause()
+		return
+
 	if _skip_pause_check:
 		_skip_pause_check = false
 		return
 
-	if RunData.is_coop_run:
-		if RunData.is_streamplay_run:
-			var remapped_device = CoopService.get_remapped_player_device(0)
-			if remapped_device >= 0 and _brotato_online_is_action_just_released_safe("ui_pause_%s" % remapped_device):
-				_pause_menu.pause(0)
-		else:
-			for player_index in RunData.get_player_count():
-				var remapped_device = CoopService.get_remapped_player_device(player_index)
-				if remapped_device < 0:
-					continue
-				if _brotato_online_is_action_just_released_safe("ui_pause_%s" % remapped_device):
-					_pause_menu.pause(player_index)
-					break
-	else:
-		if _brotato_online_is_action_just_released_safe("ui_pause"):
-			_pause_menu.pause(0)
+	var player_index = _brotato_online_get_safe_pause_request_player()
+	if player_index >= 0:
+		_pause_menu.pause(player_index)
+
+
+func _brotato_online_can_use_vanilla_pause_check() -> bool:
+	if _skip_pause_check:
+		return true
+	if not RunData.is_coop_run:
+		return InputMap.has_action("ui_pause")
+	if RunData.is_streamplay_run:
+		return _brotato_online_has_pause_action_for_player(0)
+	for player_index in RunData.get_player_count():
+		if not _brotato_online_has_pause_action_for_player(player_index):
+			return false
+	return true
+
+
+func _brotato_online_has_pause_action_for_player(player_index: int) -> bool:
+	var remapped_device = CoopService.get_remapped_player_device(player_index)
+	if remapped_device < 0:
+		return false
+	return InputMap.has_action("ui_pause_%s" % remapped_device)
+
+
+func _brotato_online_get_safe_pause_request_player() -> int:
+	if not RunData.is_coop_run:
+		return 0 if _brotato_online_is_action_just_released_safe("ui_pause") else -1
+	if RunData.is_streamplay_run:
+		return 0 if _brotato_online_is_player_pause_released_safe(0) else -1
+	for player_index in RunData.get_player_count():
+		if _brotato_online_is_player_pause_released_safe(player_index):
+			return player_index
+	return -1
+
+
+func _brotato_online_is_player_pause_released_safe(player_index: int) -> bool:
+	var remapped_device = CoopService.get_remapped_player_device(player_index)
+	if remapped_device < 0:
+		return false
+	return _brotato_online_is_action_just_released_safe("ui_pause_%s" % remapped_device)
 
 
 func _brotato_online_is_action_just_released_safe(action_name: String) -> bool:

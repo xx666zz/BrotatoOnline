@@ -4,14 +4,18 @@ extends Node
 const BROTATO_APP_ID = 1942280
 const MAX_LOBBY_MEMBERS = 4
 const META_AUTO_JOIN_HOST_PLAYER = "brotato_online_auto_join_host_player"
+const META_PUBLIC_LOBBY_ENABLED = "brotato_online_public_lobby_enabled"
 
-# Friends-only is better for the current test stage than private:
-# - strangers cannot browse/join like public lobbies;
-# - Steam friends can use Friends List / Rich Presence join more reliably.
+# GodotSteam exposes these lobby types as integer enums. Keep explicit fallbacks
+# because the Brotato build used by the mod does not expose constants uniformly.
 const LOBBY_TYPE_FRIENDS_ONLY_FALLBACK = 1
+const LOBBY_TYPE_PUBLIC_FALLBACK = 2
 const LOBBY_CONNECT_PREFIX = "+connect_lobby "
+const LOBBY_JOIN_SUCCESS_RESPONSE = 1
+const LOBBY_JOIN_TIMEOUT_MSEC = 12000
 const P2P_CHANNEL_MENU = 0
 const P2P_CHANNEL_BATTLE = 1
+const P2P_CHANNEL_LOBBY_BROWSER = 2
 const P2P_POLL_LIMIT_PER_FRAME = 32
 const P2P_BATTLE_POLL_LIMIT_PER_FRAME = 64
 const SELECTION_BROADCAST_INTERVAL_MSEC = 250
@@ -53,6 +57,7 @@ const AUTO_CREATE_LOBBY_ON_OFFICIAL_COOP_CONTINUE = true
 const OFFICIAL_COOP_CONTINUE_AUTO_LOBBY_DELAY_MSEC = 300
 const HOST_SELECTION_REQUEST_REPLY_MIN_INTERVAL_MSEC = 300
 const HOST_SELECTION_REQUEST_SETUP_MIN_INTERVAL_MSEC = 2000
+const BROWSER_PING_REPLY_MIN_INTERVAL_MSEC = 100
 const UPGRADE_DIRECT_FALLBACK_FIRST_SEND_MSEC = 650
 const UPGRADE_DIRECT_FALLBACK_RESEND_MSEC = 900
 const UPGRADE_DIRECT_FALLBACK_TTL_MSEC = 9000
@@ -96,6 +101,9 @@ var _open_invite_overlay_after_create = false
 var _last_key_time = 0
 var _pending_join_lobby_id = 0
 var _client_join_requested_lobby_id = 0
+var _client_join_request_started_msec = 0
+var _join_failure_dialog = null
+var _join_failure_dialog_parent = null
 var _checked_launch_args = false
 var _last_selection_broadcast_msec = 0
 var _last_broadcast_selection_key = ""
@@ -121,6 +129,7 @@ var _client_seen_host_setup_key_by_sender = {}
 var _client_seen_host_setup_msec_by_sender = {}
 var _last_selection_request_reply_msec_by_steam_id = {}
 var _last_selection_request_setup_msec_by_steam_id = {}
+var _browser_ping_last_reply_msec_by_steam_id = {}
 var _last_host_phase_poll_msec = 0
 var _last_battle_snapshot_send_msec = 0
 var _last_battle_snapshot_sent_tick_by_steam_id = {}
@@ -340,7 +349,7 @@ func _get_auto_join_host_player_enabled() -> bool:
 func _ui_text(key: String) -> String:
 	var zh = _get_ui_language_code() == "zh"
 	if key == "main_menu_online":
-		return "好友联机" if zh else "Online"
+		return "创建大厅" if zh else "Create Lobby"
 	if key == "friend_join_toggle":
 		return "开启大厅" if zh else "Friend Join"
 	if key == "invite_friend":
@@ -355,6 +364,16 @@ func _ui_text(key: String) -> String:
 		return "加入中…" if zh else "Joining..."
 	if key == "joining_overlay_host":
 		return "加入中…\n正在准备联机大厅" if zh else "Joining...\nPreparing online lobby"
+	if key == "join_failed_title":
+		return "加入大厅失败" if zh else "Failed to Join Lobby"
+	if key == "join_failed_invalid":
+		return "大厅信息无效。" if zh else "The lobby information is invalid."
+	if key == "join_failed_steam_unavailable":
+		return "Steam 大厅服务不可用。" if zh else "The Steam lobby service is unavailable."
+	if key == "join_failed_timeout":
+		return "加入大厅超时，请刷新大厅列表后重试。" if zh else "Joining the lobby timed out. Refresh the lobby list and try again."
+	if key == "join_failed_stale":
+		return "大厅已关闭或房主已经离开。" if zh else "The lobby is closed or the host has left."
 	return key
 
 
@@ -388,6 +407,7 @@ func _process(_delta: float) -> void:
 	var t_boot = OS.get_ticks_usec()
 	_run_steam_callbacks()
 	_consume_pending_join_if_ready()
+	_poll_join_request_timeout()
 	_handle_shortcuts()
 	_bo_net_diag_cost("steam_callbacks_and_shortcuts", t_boot)
 
@@ -491,7 +511,7 @@ func create_lobby_and_invite(open_overlay_after_create: bool = false) -> void:
 		return
 
 	_open_invite_overlay_after_create = open_overlay_after_create
-	var lobby_type = _get_steam_const("LOBBY_TYPE_FRIENDS_ONLY", LOBBY_TYPE_FRIENDS_ONLY_FALLBACK)
+	var lobby_type = _get_steam_const("LOBBY_TYPE_PUBLIC", LOBBY_TYPE_PUBLIC_FALLBACK) if _get_public_lobby_enabled() else _get_steam_const("LOBBY_TYPE_FRIENDS_ONLY", LOBBY_TYPE_FRIENDS_ONLY_FALLBACK)
 
 	if not _steam.has_method("createLobby"):
 		_lobby_toggle_pending_create = false
@@ -521,6 +541,12 @@ func open_invite_overlay() -> void:
 	if _lobby_id == 0:
 		return
 
+	# Disabling Public closes the lobby immediately so stale public-browser rows
+	# cannot still enter. Opening the explicit Steam invite dialog re-enables the
+	# friends-only lobby for invited players without publishing it publicly again.
+	if _is_game_host() and not _get_public_lobby_enabled():
+		_prepare_friends_only_lobby_for_invite()
+
 	if _steam.has_method("activateGameOverlayInviteDialog"):
 		_steam.activateGameOverlayInviteDialog(_lobby_id)
 	else:
@@ -529,11 +555,16 @@ func open_invite_overlay() -> void:
 
 func join_lobby(lobby_id) -> void:
 	if lobby_id == null:
+		_show_join_failure(_ui_text("join_failed_invalid"))
 		return
 
 	var target_lobby_id = _normalize_lobby_id(lobby_id)
 	if target_lobby_id == 0:
+		_show_join_failure(_ui_text("join_failed_invalid"))
 		return
+
+	if _client_join_request_started_msec == 0:
+		_client_join_request_started_msec = OS.get_ticks_msec()
 
 	if not _ensure_steam_ready():
 		_pending_join_lobby_id = target_lobby_id
@@ -556,9 +587,14 @@ func join_lobby(lobby_id) -> void:
 	_client_join_requested_lobby_id = target_lobby_id
 
 	if not _steam.has_method("joinLobby"):
+		_clear_pending_join_request()
+		_show_join_failure(_ui_text("join_failed_steam_unavailable"))
 		return
 
-	_steam.joinLobby(target_lobby_id)
+	var join_result = _steam.joinLobby(target_lobby_id)
+	if typeof(join_result) == TYPE_BOOL and not bool(join_result):
+		_clear_pending_join_request()
+		_show_join_failure(_ui_text("join_failed_steam_unavailable"))
 
 
 func leave_lobby() -> void:
@@ -589,6 +625,7 @@ func leave_lobby() -> void:
 	_members.clear()
 	_pending_join_lobby_id = 0
 	_client_join_requested_lobby_id = 0
+	_client_join_request_started_msec = 0
 	_clear_join_presence()
 	_accepted_p2p_sessions.clear()
 	_host_known_remote_ids.clear()
@@ -606,6 +643,7 @@ func leave_lobby() -> void:
 	_client_seen_host_setup_msec_by_sender.clear()
 	_last_selection_request_reply_msec_by_steam_id.clear()
 	_last_selection_request_setup_msec_by_steam_id.clear()
+	_browser_ping_last_reply_msec_by_steam_id.clear()
 	_last_battle_snapshot_send_msec = 0
 	_last_battle_snapshot_sent_tick_by_steam_id.clear()
 	_last_battle_reliable_sent_key_by_steam_id.clear()
@@ -669,6 +707,62 @@ func is_online_session_active() -> bool:
 
 func has_active_online_session() -> bool:
 	return _has_active_online_session()
+
+
+func get_lobby_id() -> int:
+	return int(_lobby_id)
+
+
+func get_online_role() -> String:
+	return _online_role
+
+
+func is_public_lobby_enabled() -> bool:
+	return _get_public_lobby_enabled()
+
+
+func set_public_lobby_enabled(enabled: bool) -> void:
+	var tree = get_tree()
+	if tree != null and tree.root != null:
+		tree.root.set_meta(META_PUBLIC_LOBBY_ENABLED, enabled)
+
+	if _steam == null or _lobby_id == 0 or not _is_game_host():
+		return
+
+	# Close first. This invalidates stale public-browser rows before changing the
+	# advertised type/metadata. A private lobby is reopened only through the
+	# explicit Invite Friend action below.
+	if _steam.has_method("setLobbyJoinable"):
+		_steam.setLobbyJoinable(_lobby_id, false)
+
+	var lobby_type = _get_steam_const("LOBBY_TYPE_PUBLIC", LOBBY_TYPE_PUBLIC_FALLBACK) if enabled else _get_steam_const("LOBBY_TYPE_FRIENDS_ONLY", LOBBY_TYPE_FRIENDS_ONLY_FALLBACK)
+	if _steam.has_method("setLobbyType"):
+		_steam.setLobbyType(_lobby_id, lobby_type)
+	if _steam.has_method("setLobbyData"):
+		_steam.setLobbyData(_lobby_id, "visibility", "public" if enabled else "friends")
+
+	if enabled and _steam.has_method("setLobbyJoinable"):
+		var joinable = _is_host_at_character_selection_for_lobby() or _is_in_official_coop_resume_scene()
+		_steam.setLobbyJoinable(_lobby_id, joinable)
+
+
+func _prepare_friends_only_lobby_for_invite() -> void:
+	if _steam == null or _lobby_id == 0 or not _is_game_host():
+		return
+	if _steam.has_method("setLobbyType"):
+		_steam.setLobbyType(_lobby_id, _get_steam_const("LOBBY_TYPE_FRIENDS_ONLY", LOBBY_TYPE_FRIENDS_ONLY_FALLBACK))
+	if _steam.has_method("setLobbyData"):
+		_steam.setLobbyData(_lobby_id, "visibility", "friends")
+	if _steam.has_method("setLobbyJoinable"):
+		var joinable = _is_host_at_character_selection_for_lobby() or _is_in_official_coop_resume_scene()
+		_steam.setLobbyJoinable(_lobby_id, joinable)
+
+
+func _get_public_lobby_enabled() -> bool:
+	var tree = get_tree()
+	if tree == null or tree.root == null or not tree.root.has_meta(META_PUBLIC_LOBBY_ENABLED):
+		return false
+	return bool(tree.root.get_meta(META_PUBLIC_LOBBY_ENABLED))
 
 
 func get_self_steam_id() -> String:
@@ -785,7 +879,7 @@ func _on_lobby_created(connect_result = 0, lobby_id = 0) -> void:
 	_update_self_steam_id()
 	_setup_lobby_data()
 	_setup_join_presence()
-	_refresh_lobby_members()
+	_refresh_lobby_members(true)
 
 	var should_open_invite_overlay = _open_invite_overlay_after_create
 	_open_invite_overlay_after_create = false
@@ -806,7 +900,19 @@ func _on_lobby_created(connect_result = 0, lobby_id = 0) -> void:
 
 
 func _on_lobby_joined(lobby_id = 0, permissions = 0, locked = false, response = 0) -> void:
+	var response_code = int(response)
+	var join_succeeded = response_code == LOBBY_JOIN_SUCCESS_RESPONSE
+	# Compatibility with older GodotSteam builds that emitted only three signal
+	# arguments and therefore leave the optional response parameter at zero.
+	if response_code == 0 and int(lobby_id) != 0 and _steam != null and _steam.has_method("getLobbyOwner"):
+		join_succeeded = int(_steam.getLobbyOwner(lobby_id)) != 0
+	if not join_succeeded or int(lobby_id) == 0:
+		_clear_pending_join_request()
+		_show_join_failure(_get_lobby_join_failure_text(response_code))
+		return
+
 	var joined_from_client_request = _client_join_requested_lobby_id != 0 and str(_client_join_requested_lobby_id) == str(lobby_id)
+	_client_join_request_started_msec = 0
 	_reset_transient_online_state_for_new_session("lobby_joined")
 	_lobby_id = lobby_id
 	_pending_join_lobby_id = 0
@@ -827,6 +933,7 @@ func _on_lobby_joined(lobby_id = 0, permissions = 0, locked = false, response = 
 			_online_role = "client"
 		else:
 			leave_lobby()
+			_show_join_failure(_ui_text("join_failed_stale"))
 			return
 	else:
 		_game_host_steam_id = lobby_host_id
@@ -850,7 +957,7 @@ func _on_lobby_joined(lobby_id = 0, permissions = 0, locked = false, response = 
 		_setup_client_presence()
 		_client_hello_retry_until_msec = OS.get_ticks_msec() + CLIENT_HELLO_RETRY_DURATION_MSEC
 		_last_client_hello_retry_msec = 0
-	_refresh_lobby_members()
+	_refresh_lobby_members(true)
 	_update_lobby_toggle_button_state()
 	_update_character_invite_button_state()
 	_update_continue_invite_button_state()
@@ -859,6 +966,95 @@ func _on_lobby_joined(lobby_id = 0, permissions = 0, locked = false, response = 
 	_update_online_session_runtime_flag()
 	if not _is_game_host():
 		_send_client_hello_to_host()
+
+
+func _clear_pending_join_request() -> void:
+	_pending_join_lobby_id = 0
+	_client_join_requested_lobby_id = 0
+	_client_join_request_started_msec = 0
+	_remove_joining_overlay()
+	_update_online_session_runtime_flag()
+
+
+func _poll_join_request_timeout() -> void:
+	if _pending_join_lobby_id == 0 and _client_join_requested_lobby_id == 0:
+		_client_join_request_started_msec = 0
+		return
+	if _client_join_request_started_msec == 0:
+		_client_join_request_started_msec = OS.get_ticks_msec()
+		return
+	if OS.get_ticks_msec() - _client_join_request_started_msec < LOBBY_JOIN_TIMEOUT_MSEC:
+		return
+	_clear_pending_join_request()
+	_show_join_failure(_ui_text("join_failed_timeout"))
+
+
+func _get_lobby_join_failure_text(response_code: int) -> String:
+	var zh = _get_ui_language_code() == "zh"
+	match response_code:
+		2:
+			return "大厅不存在或已经关闭。" if zh else "The lobby no longer exists or has been closed."
+		3:
+			return "无权加入该大厅。房主可能已经关闭公开。" if zh else "You are not allowed to join this lobby. The host may have disabled Public."
+		4:
+			return "大厅人数已满。" if zh else "The lobby is full."
+		5:
+			return "Steam 在加入大厅时发生错误。" if zh else "Steam reported an error while joining the lobby."
+		6:
+			return "你已被该大厅禁止加入。" if zh else "You are banned from this lobby."
+		7:
+			return "当前 Steam 账户无法加入该大厅。" if zh else "This Steam account is not allowed to join the lobby."
+		8:
+			return "该大厅当前不可加入。" if zh else "This lobby is currently unavailable."
+		9:
+			return "Steam 社区限制导致无法加入。" if zh else "A Steam Community restriction prevented joining."
+		10:
+			return "大厅中的玩家已屏蔽你。" if zh else "A player in the lobby has blocked you."
+		11:
+			return "你屏蔽了大厅中的玩家。" if zh else "You have blocked a player in the lobby."
+		15:
+			return "加入请求过于频繁，请稍后重试。" if zh else "Too many join attempts. Try again shortly."
+		_:
+			return ("无法加入大厅（Steam 返回码：" + str(response_code) + "）。") if zh else ("Could not join the lobby (Steam response " + str(response_code) + ").")
+
+
+func _show_join_failure(message: String) -> void:
+	_remove_joining_overlay()
+	call_deferred("_show_join_failure_deferred", message)
+
+
+func _show_join_failure_deferred(message: String) -> void:
+	var tree = get_tree()
+	if tree == null or tree.root == null:
+		return
+	var parent = tree.current_scene
+	if parent == null:
+		parent = tree.root
+
+	if _join_failure_dialog != null and is_instance_valid(_join_failure_dialog):
+		_join_failure_dialog.dialog_text = message
+		_join_failure_dialog.window_title = _ui_text("join_failed_title")
+		_join_failure_dialog.popup_centered(Vector2(520, 220))
+		return
+
+	var dialog = AcceptDialog.new()
+	dialog.name = "BrotatoOnlineJoinFailureDialog"
+	dialog.pause_mode = Node.PAUSE_MODE_PROCESS
+	dialog.window_title = _ui_text("join_failed_title")
+	dialog.dialog_text = message
+	dialog.rect_min_size = Vector2(520, 220)
+	parent.add_child(dialog)
+	_join_failure_dialog = dialog
+	_join_failure_dialog_parent = parent
+	dialog.connect("popup_hide", self, "_on_join_failure_dialog_hidden")
+	dialog.popup_centered(Vector2(520, 220))
+
+
+func _on_join_failure_dialog_hidden() -> void:
+	if _join_failure_dialog != null and is_instance_valid(_join_failure_dialog):
+		_join_failure_dialog.queue_free()
+	_join_failure_dialog = null
+	_join_failure_dialog_parent = null
 
 
 func _on_lobby_chat_update(lobby_id = 0, changed_id = 0, making_change_id = 0, chat_state = 0) -> void:
@@ -921,15 +1117,28 @@ func _setup_lobby_data() -> void:
 	if _steam == null or _lobby_id == 0:
 		return
 
+	var public_lobby = _get_public_lobby_enabled()
+	var lobby_type = _get_steam_const("LOBBY_TYPE_PUBLIC", LOBBY_TYPE_PUBLIC_FALLBACK) if public_lobby else _get_steam_const("LOBBY_TYPE_FRIENDS_ONLY", LOBBY_TYPE_FRIENDS_ONLY_FALLBACK)
+	if _steam.has_method("setLobbyType"):
+		_steam.setLobbyType(_lobby_id, lobby_type)
 	if _steam.has_method("setLobbyJoinable"):
 		_steam.setLobbyJoinable(_lobby_id, true)
 
 	if _steam.has_method("setLobbyData"):
+		var host_name = _self_steam_id
+		if _steam.has_method("getPersonaName"):
+			host_name = str(_steam.getPersonaName()).strip_edges()
+		if host_name.length() > 64:
+			host_name = host_name.substr(0, 64)
 		_steam.setLobbyData(_lobby_id, "mod", "six666-BrotatoOnline")
 		_steam.setLobbyData(_lobby_id, "mod_version", "1.1.0")
 		_steam.setLobbyData(_lobby_id, "game_version", "1.1.15.4")
 		_steam.setLobbyData(_lobby_id, "state", "character_selection")
 		_steam.setLobbyData(_lobby_id, "host", _self_steam_id)
+		_steam.setLobbyData(_lobby_id, "host_name", host_name)
+		_steam.setLobbyData(_lobby_id, "member_count", "1")
+		_steam.setLobbyData(_lobby_id, "member_limit", str(MAX_LOBBY_MEMBERS))
+		_steam.setLobbyData(_lobby_id, "visibility", "public" if public_lobby else "friends")
 		_steam.setLobbyData(_lobby_id, "connect", _make_lobby_connect_string(_lobby_id))
 
 
@@ -979,7 +1188,14 @@ func _clear_stale_join_presence_at_boot() -> void:
 	_clear_join_presence()
 
 
-func _refresh_lobby_members() -> void:
+func _refresh_lobby_members(force_slot_sync: bool = false) -> void:
+	var previous_member_ids = []
+	for previous_member in _members:
+		var previous_id = str(previous_member.get("steam_id", ""))
+		if previous_id != "":
+			previous_member_ids.append(previous_id)
+	previous_member_ids.sort()
+
 	_members.clear()
 	if _steam == null or _lobby_id == 0:
 		return
@@ -991,6 +1207,7 @@ func _refresh_lobby_members() -> void:
 
 	var owner_id = _get_lobby_owner_id()
 	var count = int(_steam.getNumLobbyMembers(_lobby_id))
+	var current_member_ids = []
 	for i in range(count):
 		var member_id = str(_steam.getLobbyMemberByIndex(_lobby_id, i))
 		var member_name = member_id
@@ -1002,11 +1219,21 @@ func _refresh_lobby_members() -> void:
 			"name": member_name,
 			"owner": member_id == owner_id
 		})
+		if member_id != "":
+			current_member_ids.append(member_id)
+
+	current_member_ids.sort()
+	var membership_changed = to_json(previous_member_ids) != to_json(current_member_ids)
 
 	if not _is_game_host() and _game_host_steam_id != "" and not _member_list_has_steam_id(_game_host_steam_id):
 		leave_lobby()
 		return
-	_sync_host_coop_slots_from_lobby()
+
+	# Ordinary lobby metadata updates (state, host name, visibility, etc.) must not
+	# rebuild COOP slots. Creation/join/restage paths may force one repair because
+	# P0 can be missing even when the Steam member set itself has not changed.
+	if membership_changed or force_slot_sync:
+		_sync_host_coop_slots_from_lobby()
 	_update_character_lobby_status_label_state()
 	_update_continue_lobby_status_label_state()
 
@@ -1836,10 +2063,18 @@ func _poll_p2p_packets() -> void:
 
 	_poll_p2p_channel(P2P_CHANNEL_MENU, P2P_POLL_LIMIT_PER_FRAME)
 	_poll_p2p_channel(P2P_CHANNEL_BATTLE, P2P_BATTLE_POLL_LIMIT_PER_FRAME)
+	# The browser node owns channel 2 while searching from the title screen. A
+	# public host polls it here only to answer pre-join latency probes.
+	if _lobby_id != 0 and _is_game_host() and _get_public_lobby_enabled() and (_is_host_at_character_selection_for_lobby() or _is_in_official_coop_resume_scene()):
+		_poll_p2p_channel(P2P_CHANNEL_LOBBY_BROWSER, P2P_POLL_LIMIT_PER_FRAME)
 
 
 func _poll_p2p_channel(channel: int, limit: int) -> void:
-	var prefix = "p2p_menu" if channel == P2P_CHANNEL_MENU else "p2p_battle"
+	var prefix = "p2p_menu"
+	if channel == P2P_CHANNEL_BATTLE:
+		prefix = "p2p_battle"
+	elif channel == P2P_CHANNEL_LOBBY_BROWSER:
+		prefix = "p2p_browser"
 	var t_receive = OS.get_ticks_usec()
 	var messages = _receive_steam_messages_on_channel(channel, limit)
 	_bo_net_diag_cost(prefix + "_receive", t_receive, "count=" + str(messages.size()) + " limit=" + str(limit))
@@ -1899,12 +2134,47 @@ func _handle_raw_p2p_packet(packet) -> void:
 				_bo_net_diag_state_change("RX_CHUNK", from_steam_id + ":" + chunk_type + ":" + str(chunk_count) + ":" + str(original_bytes), "from=" + from_steam_id + " final_type=" + chunk_type + " chunks=" + str(chunk_count) + " original_bytes=" + str(original_bytes), 1000)
 			return
 		msg_type = str(parsed.get("msg_type", ""))
+	# Browser probes are intentionally sent before joining a lobby, so they must
+	# bypass the online-session generation/member filters used by game traffic.
+	if msg_type == "lobby_ping_request":
+		_handle_lobby_browser_ping_request(from_steam_id, parsed)
+		_bo_net_diag_cost("packet_total:" + msg_type, packet_start_usec, "bytes=" + str(bytes.size()) + " from=" + from_steam_id)
+		return
 	if _should_drop_p2p_message_for_session(from_steam_id, parsed):
 		return
 	var t_handle = OS.get_ticks_usec()
 	_handle_p2p_message(from_steam_id, parsed)
 	_bo_net_diag_cost("packet_handle:" + msg_type, t_handle, "bytes=" + str(bytes.size()) + " from=" + from_steam_id + " " + _bo_net_diag_message_summary(parsed))
 	_bo_net_diag_cost("packet_total:" + msg_type, packet_start_usec, "bytes=" + str(bytes.size()) + " from=" + from_steam_id + " " + _bo_net_diag_message_summary(parsed))
+
+
+func _handle_lobby_browser_ping_request(from_steam_id: String, message: Dictionary) -> void:
+	if _steam == null or _lobby_id == 0 or not _is_game_host() or not _get_public_lobby_enabled():
+		return
+	if from_steam_id == "" or from_steam_id == "0" or from_steam_id == _self_steam_id:
+		return
+	if int(str(message.get("lobby_id", "0"))) != int(_lobby_id):
+		return
+	var nonce = str(message.get("nonce", ""))
+	if nonce == "" or nonce.length() > 160:
+		return
+
+	var now = OS.get_ticks_msec()
+	var last_reply = int(_browser_ping_last_reply_msec_by_steam_id.get(from_steam_id, 0))
+	if now - last_reply < BROWSER_PING_REPLY_MIN_INTERVAL_MSEC:
+		return
+	_browser_ping_last_reply_msec_by_steam_id[from_steam_id] = now
+
+	if not _steam.has_method("sendMessageToUser"):
+		return
+	_prepare_steam_messages_session_with_peer(from_steam_id, "lobby_browser_ping")
+	var response = {
+		"msg_type": "lobby_ping_response",
+		"lobby_id": str(_lobby_id),
+		"nonce": nonce
+	}
+	var payload = to_json(response).to_utf8()
+	var _result = _steam.sendMessageToUser(int(from_steam_id), payload, 0, P2P_CHANNEL_LOBBY_BROWSER)
 
 
 func _extract_packet_sender(packet: Dictionary) -> String:
@@ -3276,6 +3546,10 @@ func _on_host_difficulty_element_pressed(element, selection: Node, inventory_ind
 			continue
 		_send_p2p_json(steam_id, prepare, true)
 
+
+
+func has_pending_synced_shop_game_start() -> bool:
+	return not _pending_host_game_start.empty() and str(_pending_host_game_start.get("start_kind", "")) == "shop"
 
 
 func request_synced_shop_game_start(shop, player_index: int, run_config: Dictionary = {}) -> bool:
@@ -5835,6 +6109,8 @@ func _log_steam_message_send_failure(target_steam_id: String, msg_type: String, 
 
 
 func _get_p2p_channel_for_message_type(msg_type: String) -> int:
+	if msg_type == "lobby_ping_request" or msg_type == "lobby_ping_response":
+		return P2P_CHANNEL_LOBBY_BROWSER
 	if msg_type == "battle_input" or msg_type == "battle_snapshot" or msg_type == "battle_reliable_events" or msg_type == "battle_terminal_state" or msg_type == "damage_claim_batch" or msg_type == "player_hp_state" or msg_type == "player_state" or msg_type == "entity_kill_claim" or msg_type == "boss_damage_report" or msg_type == "pickup_claim" or msg_type == "battle_entity_resync_request":
 		return P2P_CHANNEL_BATTLE
 	return P2P_CHANNEL_MENU
@@ -5977,7 +6253,9 @@ func _handle_online_character_selection_restage_after_new_run() -> void:
 	_last_battle_terminal_state_key_by_steam_id.clear()
 	_last_battle_terminal_state_msec_by_steam_id.clear()
 
-	_refresh_lobby_members()
+	# The slot layout can be stale even when Steam membership itself is unchanged.
+	# Force one host-side sync so P0 and any remote placeholders are rebuilt.
+	_refresh_lobby_members(true)
 	_send_host_phase_messages_to_all(true)
 	_broadcast_selection_state(true)
 
@@ -7067,21 +7345,33 @@ func _update_main_menu_online_button_layout(parent: Node, start_button: Node, on
 		child.rect_min_size = min_size
 
 	var profile_button = parent.get_node_or_null("ProfileButton")
+	var browser_button = parent.get_node_or_null("BrotatoOnlinePublicLobbyBrowserButton")
 	var continue_button = parent.get_node_or_null("ContinueButton")
 	var quit_button = parent.get_node_or_null("QuitButton")
 
 	if start_button is Control:
-		start_button.focus_neighbour_bottom = online_button.get_path()
+		start_button.focus_neighbour_bottom = start_button.get_path_to(online_button)
 		if continue_button != null and continue_button is Control and continue_button.visible:
-			start_button.focus_neighbour_top = continue_button.get_path()
+			start_button.focus_neighbour_top = start_button.get_path_to(continue_button)
 	if online_button is Control:
-		online_button.focus_neighbour_top = start_button.get_path()
-		if profile_button != null and profile_button is Control:
-			online_button.focus_neighbour_bottom = profile_button.get_path()
+		online_button.focus_neighbour_top = online_button.get_path_to(start_button)
+		if browser_button != null and browser_button is Control:
+			online_button.focus_neighbour_bottom = online_button.get_path_to(browser_button)
+		elif profile_button != null and profile_button is Control:
+			online_button.focus_neighbour_bottom = online_button.get_path_to(profile_button)
 		online_button.focus_neighbour_left = start_button.focus_neighbour_left
 		online_button.focus_neighbour_right = start_button.focus_neighbour_right
+	if browser_button != null and browser_button is Control:
+		browser_button.focus_neighbour_top = browser_button.get_path_to(online_button)
+		browser_button.focus_neighbour_left = online_button.focus_neighbour_left
+		browser_button.focus_neighbour_right = online_button.focus_neighbour_right
+		if profile_button != null and profile_button is Control:
+			browser_button.focus_neighbour_bottom = browser_button.get_path_to(profile_button)
 	if profile_button != null and profile_button is Control:
-		profile_button.focus_neighbour_top = online_button.get_path()
+		if browser_button != null and browser_button is Control:
+			profile_button.focus_neighbour_top = profile_button.get_path_to(browser_button)
+		else:
+			profile_button.focus_neighbour_top = profile_button.get_path_to(online_button)
 	if continue_button != null and continue_button is Control:
 		continue_button.focus_neighbour_bottom = start_button.get_path()
 	if quit_button != null and quit_button is Control:

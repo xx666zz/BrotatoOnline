@@ -1707,7 +1707,6 @@ func _on_client_shop_go_pressed(player_index: int) -> void:
 	if _is_valid_shop_node(shop):
 		was_pressed = bool(_get_node_array_value(shop, "_player_pressed_go_button", player_index, false))
 	var desired_pressed = not was_pressed
-	var may_start_game = _would_shop_go_press_start_game(shop, player_index, desired_pressed)
 
 	# Client does not execute the vanilla Go action locally, but the player should
 	# immediately see their own ready/cancel state while waiting for Host confirmation.
@@ -1727,8 +1726,10 @@ func _on_client_shop_go_pressed(player_index: int) -> void:
 		"desired_pressed": desired_pressed
 	}
 	_submit_local_shop_action(msg, player_index, "go")
-	if not _is_game_host() and may_start_game:
-		begin_game_start_guard(0, "client_local_shop_go_final", true)
+	# Do not enter the transition guard from a speculative local ready press.
+	# Host may still receive a cancel/focus-exit before it commits the start. The
+	# authoritative game_start_prepare packet is the only point that may arm the
+	# client transition guard.
 
 
 func _would_shop_go_press_start_game(shop: Node, player_index: int, desired_pressed: bool) -> bool:
@@ -2501,6 +2502,16 @@ func _apply_shop_go_action(player_index: int, _message: Dictionary) -> bool:
 	if not shop.has_method("_on_GoButton_pressed"):
 		return false
 
+	# Once the synchronized shop start handshake has begun, its ready snapshot is
+	# authoritative. Host-local Go presses used to bypass SteamLobbyManager's
+	# guarded network-action path and could cancel readiness after Clients had
+	# already accepted game_start_commit, splitting Host and Client scenes.
+	if _is_game_host():
+		var steam_lobby_pending = _get_steam_lobby_manager()
+		if steam_lobby_pending != null and steam_lobby_pending.has_method("has_pending_synced_shop_game_start"):
+			if bool(steam_lobby_pending.has_pending_synced_shop_game_start()):
+				return true
+
 	# Online final-ready is special: vanilla _on_GoButton_pressed() immediately
 	# changes to MenuData.game_scene when all players are ready. In an online run
 	# that makes Host enter battle before Clients receive/apply the last shop state.
@@ -2584,11 +2595,15 @@ func execute_synced_shop_game_start(shop, player_index: int) -> bool:
 	if not _is_valid_shop_node(shop) or not shop.has_method("_on_GoButton_pressed"):
 		return false
 
-	# We pre-marked this player ready when scheduling the sync. Vanilla treats a
-	# second press as cancellation, so flip only the stored flag back before the
-	# scheduled call. The checkmark is irrelevant because the scene will change.
-	_set_node_array_value(shop, "_player_pressed_go_button", player_index, false)
+	# BaseShop clears a player's ready flag whenever that player's Go button loses
+	# focus. Focus restoration and a Host cancel press can therefore alter the
+	# flags while the network start handshake is in flight. Rebuild the committed
+	# all-ready snapshot immediately before the one vanilla call that changes the
+	# scene. Leave only the triggering player false so vanilla turns it true rather
+	# than interpreting this call as a cancellation.
 	_force_run_player_count_to_online_coop_layout("execute_synced_shop_game_start")
+	for ready_player_index in range(_get_run_player_count()):
+		_force_shop_go_visual_state(shop, ready_player_index, ready_player_index != player_index)
 	shop._on_GoButton_pressed(player_index)
 	_pending_synced_shop_start_id = 0
 	return true
@@ -9202,23 +9217,30 @@ func _install_client_press_intercept(selection: Node, screen: String, player_ind
 	if not selection.has_method("_get_inventories"):
 		return
 
+	# CharacterSelection can be found before its onready Inventory references are ready.
+	# Do not mark this selection as intercepted until every returned Inventory is live
+	# and the client callback is actually connected; otherwise later retries are skipped.
+	var inventories = selection._get_inventories()
+	if typeof(inventories) != TYPE_ARRAY or inventories.empty():
+		return
+	for inventory in inventories:
+		if not _is_live_ref(inventory):
+			return
+
 	var selection_id = selection.get_instance_id()
 	if _client_intercept_selection_instance_id == selection_id:
-		return
-	_client_intercept_selection_instance_id = selection_id
-
-	var inventories = selection._get_inventories()
-	if typeof(inventories) != TYPE_ARRAY:
 		return
 
 	for inv_index in range(inventories.size()):
 		var inventory = inventories[inv_index]
-		if not _is_live_ref(inventory):
-			continue
 		if inventory.is_connected("element_pressed", selection, "_on_element_pressed"):
 			inventory.disconnect("element_pressed", selection, "_on_element_pressed")
 		if not inventory.is_connected("element_pressed", self, "_on_client_inventory_element_pressed"):
 			inventory.connect("element_pressed", self, "_on_client_inventory_element_pressed", [selection, screen, inv_index])
+		if not inventory.is_connected("element_pressed", self, "_on_client_inventory_element_pressed"):
+			return
+
+	_client_intercept_selection_instance_id = selection_id
 
 
 
@@ -10490,5 +10512,8 @@ func _input(event: InputEvent) -> void:
 		return
 	_bo_ui_diag_log_input_event(event, "menu_sync_manager")
 	var t_input = OS.get_ticks_usec()
-	_maybe_schedule_client_shop_direct_lock_probe(event)
+	# Lock changes are already captured by the lock-button signal and by the
+	# shop-state diff poll. The old raw select-input probe could run while backing
+	# out to the stats panel with focus still on an item and submit a false lock
+	# action, which then disabled/locked that entry on Host and Client.
 	_bo_ui_diag_log_cost("input_handler", t_input)

@@ -106,6 +106,7 @@ func _ready() -> void:
 	_add_online_player_slot_manager()
 	_add_menu_sync_manager()
 	_add_steam_lobby_manager()
+	_add_public_lobby_browser()
 	_add_quick_chat_wheel_manager()
 	_add_online_input_manager()
 	_add_runtime_locator()
@@ -141,6 +142,13 @@ func _add_steam_lobby_manager() -> void:
 		true
 	)
 
+
+func _add_public_lobby_browser() -> void:
+	_add_script_node(
+		"BrotatoOnlinePublicLobbyBrowser",
+		"scripts/public_lobby_browser.gd",
+		true
+	)
 
 
 func _add_quick_chat_wheel_manager() -> void:

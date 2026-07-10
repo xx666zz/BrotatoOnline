@@ -17,8 +17,33 @@ const META_LOCAL_OUTLINE_OWNED = "brotato_online_local_outline_owned"
 # the material to surviving leg sprites only. This keeps the visual option from
 # crashing the end-of-run death path.
 func _set_outlines(alpha: float = 1.0, desaturation: float = 0.0) -> void:
+	if _brotato_online_can_use_vanilla_outline_setup():
+		._set_outlines(alpha, desaturation)
+		return
 	_brotato_online_set_sprite_outline_material(alpha, desaturation)
 	_brotato_online_copy_outline_material_to_legs()
+
+
+func _brotato_online_can_use_vanilla_outline_setup() -> bool:
+	if sprite == null or not is_instance_valid(sprite):
+		return false
+	if not _outline_colors:
+		return _brotato_online_has_live_leg_sprites()
+	if outline_material == null or outline_material.shader == null or sprite.texture == null:
+		return false
+	return _brotato_online_has_live_leg_sprites()
+
+
+func _brotato_online_has_live_leg_sprites() -> bool:
+	if _legs == null or not is_instance_valid(_legs):
+		return false
+	for leg in _legs.get_children():
+		if leg == null or not is_instance_valid(leg):
+			return false
+		var leg_sprite = leg.get_node_or_null("Sprite")
+		if leg_sprite == null or not is_instance_valid(leg_sprite):
+			return false
+	return true
 
 
 func _brotato_online_set_sprite_outline_material(alpha: float = 1.0, desaturation: float = 0.0) -> void:

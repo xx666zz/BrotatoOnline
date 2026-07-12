@@ -6745,6 +6745,8 @@ func _get_upgrade_data_from_select_action(container: Node, message: Dictionary):
 			return data
 		if wanted_item_hash != 0 and data_item_hash == wanted_item_hash:
 			return data
+	if wanted_upgrade_hash != 0 or wanted_item_hash != 0:
+		return null
 	var target = str(message.get("target", ""))
 	var fallback_data = _get_upgrade_data_for_progression_target(container, target)
 	return fallback_data

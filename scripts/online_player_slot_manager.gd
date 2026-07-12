@@ -37,6 +37,7 @@ var _local_mirrored_steam_id = ""
 var _local_mirrored_player_index = -1
 var _online_run_slots_locked = false
 var _mirrored_connected_players = []
+var _pending_offline_reset_reason = ""
 var _last_mirror_restore_log_msec = 0
 var _bo_resume_emit_scene_id = 0
 var _bo_resume_last_emitted_count = -1
@@ -228,6 +229,11 @@ func _process(_delta: float) -> void:
 	var now = OS.get_ticks_msec()
 	if now - _last_restore_check_time >= RESTORE_CHECK_INTERVAL_MSEC:
 		_last_restore_check_time = now
+		if _pending_offline_reset_reason != "" and not _is_in_active_online_run_scene():
+			var pending_reason = _pending_offline_reset_reason
+			_pending_offline_reset_reason = ""
+			online_reset_to_offline(pending_reason)
+			return
 		_bo_slot_diag_periodic("restore_check")
 		var t_restore = OS.get_ticks_usec()
 		_restore_tracked_coop_players_if_needed()
@@ -247,6 +253,7 @@ func are_online_run_slots_locked() -> bool:
 func online_sync_remote_steam_ids(remote_steam_ids: Array) -> void:
 	if _is_slot_mutation_locked():
 		return
+	_pending_offline_reset_reason = ""
 	# Host 侧由 SteamLobbyManager 调用。
 	# 目标：Steam lobby 成员变化后，保持 CoopService.connected_players 与远程 Steam 成员一致。
 	# 先清掉没有 Steam 映射的旧远程占位槽，避免空房间里 device=1/2/3
@@ -318,6 +325,12 @@ func online_reset_to_offline(reason: String = "") -> void:
 	# manager created for online staging. Otherwise the next CharacterSelection
 	# scene can reopen in COOP with an empty/stale slot list, producing focus jumps
 	# or dead input until the periodic guard repairs it.
+	if _is_in_active_online_run_scene():
+		_pending_offline_reset_reason = "deferred:" + reason
+		dump_slots()
+		return
+
+	_pending_offline_reset_reason = ""
 	var was_tracking_online_slots = _host_player_joined_by_manager or not _remote_devices.empty() or _local_mirrored_player_index >= 0 or not _mirrored_connected_players.empty()
 	_online_run_slots_locked = false
 	_mirrored_connected_players.clear()
@@ -331,11 +344,6 @@ func online_reset_to_offline(reason: String = "") -> void:
 	_device_by_remote_steam_id.clear()
 	_remote_steam_id_by_device.clear()
 	_remote_devices.clear()
-
-	if _is_in_active_online_run_scene():
-		# Do not shrink RunData during an active battle/shop; that can corrupt the run.
-		dump_slots()
-		return
 
 	var restored_selection_to_solo = false
 	if was_tracking_online_slots:
@@ -474,6 +482,7 @@ func apply_host_selection_layout(selection_state: Dictionary, self_steam_id: Str
 	var connected_players_unchanged = _connected_players_match(new_connected_players)
 	_bo_slot_diag_log("APPLY_HOST_LAYOUT", "unchanged=" + str(connected_players_unchanged) + " self=" + self_steam_id + " host=" + host_steam_id + " new=" + str(new_connected_players) + " old=" + _bo_slot_diag_players())
 
+	_pending_offline_reset_reason = ""
 	_local_mirrored_steam_id = self_steam_id
 	_local_mirrored_player_index = new_local_mirrored_player_index
 	_mirrored_connected_players = _duplicate_connected_players(new_connected_players)

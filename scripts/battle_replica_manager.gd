@@ -725,7 +725,7 @@ func _prepare_remote_player_damage_proxies(force: bool) -> void:
 		if not _is_valid_node(player):
 			continue
 		var player_index = _get_player_index_from_node(player, i)
-		if player_index == owned_index:
+		if player_index == owned_index or _is_locally_controlled_player_index(player_index):
 			continue
 		_disable_player_hurtbox_for_net_proxy(player, player_index, "client_remote_guard")
 
@@ -1715,7 +1715,10 @@ func _apply_remote_player_states(snapshot: Dictionary, server_time_msec: int) ->
 		if typeof(p) != TYPE_DICTIONARY:
 			continue
 		var idx = int(p.get("player_index", -1))
-		if idx < 0 or idx == owned_index:
+		if idx < 0:
+			continue
+		if idx == owned_index or _is_locally_controlled_player_index(idx):
+			_clear_remote_player_motion_state(idx)
 			continue
 		var pos = _dict_to_vec2(p.get("pos", {}))
 		var vel = _dict_to_vec2(p.get("vel", {}))
@@ -1744,6 +1747,9 @@ func _update_remote_player_positions(delta: float) -> void:
 			continue
 		var idx = _get_player_index_from_node(player, i)
 		if not _remote_player_targets.has(idx):
+			continue
+		if _is_client_owned_player_index(idx) or _is_locally_controlled_player_index(idx):
+			_clear_remote_player_motion_state(idx)
 			continue
 		var sample = _sample_position(_remote_player_samples.get(idx, []), target_time, _remote_player_targets.get(idx, _get_node_global_pos(player)), _remote_player_velocities.get(idx, Vector2.ZERO))
 		_set_node_global_pos(player, _get_node_global_pos(player).linear_interpolate(sample[0], alpha))
@@ -2781,7 +2787,7 @@ func _sync_host_pending_progression_queues(main: Node, players: Array) -> void:
 		if typeof(pending_upgrades) != TYPE_ARRAY or typeof(pending_consumables) != TYPE_ARRAY:
 			continue
 		var queue_key = str(player_index) + ":" + to_json(pending_upgrades) + ":" + to_json(pending_consumables)
-		if str(_last_progression_queue_key_by_player.get(player_index, "")) == queue_key:
+		if str(_last_progression_queue_key_by_player.get(player_index, "")) == queue_key and _local_progression_queues_match_host(upgrades_all[player_index], consumables_all[player_index], pending_upgrades, pending_consumables):
 			continue
 		var new_upgrades = []
 		for upgrade_state in pending_upgrades:
@@ -2816,6 +2822,12 @@ func _sync_host_pending_progression_queues(main: Node, players: Array) -> void:
 		main.set("_upgrades_to_process", upgrades_all)
 	if typeof(consumables_all) == TYPE_ARRAY:
 		main.set("_consumables_to_process", consumables_all)
+
+
+func _local_progression_queues_match_host(local_upgrades, local_consumables, pending_upgrades: Array, pending_consumables: Array) -> bool:
+	if typeof(local_upgrades) != TYPE_ARRAY or typeof(local_consumables) != TYPE_ARRAY:
+		return false
+	return local_upgrades.size() == pending_upgrades.size() and local_consumables.size() == pending_consumables.size()
 
 
 func _sync_things_to_process_hud_counts(main: Node, player_index: int, upgrade_count: int, item_box_count: int, legendary_item_box_count: int, other_consumable_count: int = 0) -> void:
@@ -3895,6 +3907,25 @@ func _is_client_owned_player_index(player_index: int) -> bool:
 	if _is_game_host():
 		return false
 	return player_index >= 0 and player_index == _get_owned_player_index()
+
+
+func _is_locally_controlled_player_index(player_index: int) -> bool:
+	if CoopService == null or typeof(CoopService.connected_players) != TYPE_ARRAY:
+		return false
+	if player_index < 0 or player_index >= CoopService.connected_players.size():
+		return false
+	var entry = CoopService.connected_players[player_index]
+	if typeof(entry) != TYPE_ARRAY or entry.empty():
+		return false
+	var device = int(entry[0])
+	return device == CoopService.KEYBOARD_REMAPPED_DEVICE_ID or device == CoopService.GAMEPAD_REMAPPED_DEVICE_ID
+
+
+func _clear_remote_player_motion_state(player_index: int) -> void:
+	_remote_player_targets.erase(player_index)
+	_remote_player_velocities.erase(player_index)
+	_remote_player_rx_msec.erase(player_index)
+	_remote_player_samples.erase(player_index)
 
 
 func _get_owned_player_node() -> Node:

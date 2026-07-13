@@ -103,6 +103,8 @@ func _install_player_local_outline_extension() -> void:
 func _ready() -> void:
 
 	# 子弹、命中、伤害跳字、死亡表现逐步改为 Host presentation event 驱动。
+	_add_i18n_manager()
+	_add_version_adapter()
 	_add_online_player_slot_manager()
 	_add_menu_sync_manager()
 	_add_steam_lobby_manager()
@@ -117,6 +119,22 @@ func _ready() -> void:
 	_add_brotato_online_api()
 	_remove_legacy_battle_ghost_layer_if_present()
 	_add_pause_focus_alias_manager()
+
+
+func _add_i18n_manager() -> void:
+	_add_script_node(
+		"BrotatoOnlineI18n",
+		"scripts/brotato_online_i18n.gd",
+		true
+	)
+
+
+func _add_version_adapter() -> void:
+	_add_script_node(
+		"BrotatoOnlineVersionAdapter",
+		"scripts/brotato_version_adapter.gd",
+		true
+	)
 
 
 func _add_online_player_slot_manager() -> void:

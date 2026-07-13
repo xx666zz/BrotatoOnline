@@ -12,6 +12,10 @@ const FULL_CIRCLE = PI * 2.0
 const BUBBLE_SECONDS = 3.0
 const BUBBLE_JITTER = Vector2(18, 10)
 const TEXT_LIMIT = 32
+const SHARED_FONT_PATHS = [
+	"res://resources/fonts/actual/base/font_26_outline.tres",
+	"res://resources/fonts/actual/base/font_26.tres"
+]
 
 const OPTION_IDS = [
 	"come",
@@ -23,48 +27,6 @@ const OPTION_IDS = [
 	"thanks",
 	"nice"
 ]
-
-const BUILTIN_TRANSLATIONS = {
-	"en": {
-		"BROTATO_ONLINE_QUICK_CHAT_CANCEL": "Release Ctrl to cancel",
-		"BROTATO_ONLINE_QUICK_CHAT_COME": "Stay alive",
-		"BROTATO_ONLINE_QUICK_CHAT_HELP": "Hurry!",
-		"BROTATO_ONLINE_QUICK_CHAT_WAIT": "......",
-		"BROTATO_ONLINE_QUICK_CHAT_READY": "This one",
-		"BROTATO_ONLINE_QUICK_CHAT_BUY": "Strong strong?",
-		"BROTATO_ONLINE_QUICK_CHAT_NO_REROLL": "?",
-		"BROTATO_ONLINE_QUICK_CHAT_THANKS": "NO!",
-		"BROTATO_ONLINE_QUICK_CHAT_NICE": "Wait a sec"
-	},
-	"zh": {
-		"BROTATO_ONLINE_QUICK_CHAT_CANCEL": "松开 Ctrl 取消",
-		"BROTATO_ONLINE_QUICK_CHAT_COME": "活下去",
-		"BROTATO_ONLINE_QUICK_CHAT_HELP": "快點！",
-		"BROTATO_ONLINE_QUICK_CHAT_WAIT": "······",
-		"BROTATO_ONLINE_QUICK_CHAT_READY": "这个",
-		"BROTATO_ONLINE_QUICK_CHAT_BUY": "强强？",
-		"BROTATO_ONLINE_QUICK_CHAT_NO_REROLL": "？",
-		"BROTATO_ONLINE_QUICK_CHAT_THANKS": "NO!",
-		"BROTATO_ONLINE_QUICK_CHAT_NICE": "等一下"
-	},
-	"zh_TW": {
-		"BROTATO_ONLINE_QUICK_CHAT_CANCEL": "放開 Ctrl 取消",
-		"BROTATO_ONLINE_QUICK_CHAT_COME": "活下去",
-		"BROTATO_ONLINE_QUICK_CHAT_HELP": "快點！",
-		"BROTATO_ONLINE_QUICK_CHAT_WAIT": "······",
-		"BROTATO_ONLINE_QUICK_CHAT_READY": "這個",
-		"BROTATO_ONLINE_QUICK_CHAT_BUY": "強強？",
-		"BROTATO_ONLINE_QUICK_CHAT_NO_REROLL": "？",
-		"BROTATO_ONLINE_QUICK_CHAT_THANKS": "NO!",
-		"BROTATO_ONLINE_QUICK_CHAT_NICE": "等一下"
-	}
-}
-
-const TRANSLATION_FILE_MAP = {
-	"en": "translations/brotato_online_en.txt",
-	"zh": "translations/brotato_online_zh.txt",
-	"zh_TW": "translations/brotato_online_zh.txt"
-}
 
 var _overlay_layer = null
 var _overlay_root = null
@@ -79,7 +41,6 @@ var _rng = RandomNumberGenerator.new()
 var _seen_chat_keys = {}
 var _last_seen_prune_msec = 0
 var _shared_font = null
-var _file_translations = {}
 var _gamepad_active = false
 var _gamepad_device = -1
 var _gamepad_lt_down = {}
@@ -93,7 +54,6 @@ func _ready() -> void:
 	set_process(true)
 	set_process_input(true)
 	_rng.randomize()
-	_load_translation_files()
 
 
 func _input(event: InputEvent) -> void:
@@ -646,32 +606,13 @@ func _apply_label_style(label: Label, color: Color) -> void:
 func _ensure_shared_font() -> void:
 	if _shared_font != null:
 		return
-	var tree = get_tree()
-	if tree == null:
-		return
-	var search_roots = [tree.current_scene, tree.root]
-	for root in search_roots:
-		if root == null:
+	for font_path in SHARED_FONT_PATHS:
+		if not ResourceLoader.exists(font_path):
 			continue
-		var font = _find_font_in_node(root, 0)
+		var font = load(font_path)
 		if font != null:
 			_shared_font = font
 			return
-
-
-func _find_font_in_node(node: Node, depth: int):
-	if node == null or depth > 10:
-		return null
-	if node is Control:
-		var control = node as Control
-		var font = control.get_font("font")
-		if font != null:
-			return font
-	for child in node.get_children():
-		var found = _find_font_in_node(child, depth + 1)
-		if found != null:
-			return found
-	return null
 
 
 func _try_open_gamepad_wheel(device: int) -> void:
@@ -804,95 +745,31 @@ func _option_text_by_index(index: int) -> String:
 func _option_text_by_id(id: String) -> String:
 	match id:
 		"come":
-			return _t("BROTATO_ONLINE_QUICK_CHAT_COME")
+			return _t("BROTATO_ONLINE_QUICK_CHAT_STAY_ALIVE")
 		"help":
-			return _t("BROTATO_ONLINE_QUICK_CHAT_HELP")
+			return _t("BROTATO_ONLINE_QUICK_CHAT_HURRY")
 		"wait":
-			return _t("BROTATO_ONLINE_QUICK_CHAT_WAIT")
+			return _t("BROTATO_ONLINE_QUICK_CHAT_ELLIPSIS")
 		"ready":
-			return _t("BROTATO_ONLINE_QUICK_CHAT_READY")
+			return _t("BROTATO_ONLINE_QUICK_CHAT_THIS_ONE")
 		"buy":
-			return _t("BROTATO_ONLINE_QUICK_CHAT_BUY")
+			return _t("BROTATO_ONLINE_QUICK_CHAT_STRONG_STRONG")
 		"no_reroll":
-			return _t("BROTATO_ONLINE_QUICK_CHAT_NO_REROLL")
+			return _t("BROTATO_ONLINE_QUICK_CHAT_QUESTION")
 		"thanks":
-			return _t("BROTATO_ONLINE_QUICK_CHAT_THANKS")
+			return _t("BROTATO_ONLINE_QUICK_CHAT_NO")
 		"nice":
-			return _t("BROTATO_ONLINE_QUICK_CHAT_NICE")
+			return _t("BROTATO_ONLINE_QUICK_CHAT_WAIT_A_SEC")
 	return ""
 
 
 func _t(key: String) -> String:
-	var locale_candidates = _get_locale_candidates(TranslationServer.get_locale())
-	for locale in locale_candidates:
-		if _file_translations.has(locale) and _file_translations[locale].has(key):
-			return str(_file_translations[locale][key])
-		if BUILTIN_TRANSLATIONS.has(locale) and BUILTIN_TRANSLATIONS[locale].has(key):
-			return str(BUILTIN_TRANSLATIONS[locale][key])
+	var parent = get_parent()
+	if parent != null:
+		var i18n = parent.get_node_or_null("BrotatoOnlineI18n")
+		if i18n != null and i18n.has_method("get_text"):
+			return str(i18n.call("get_text", key))
 	return key
-
-
-func _load_translation_files() -> void:
-	_file_translations.clear()
-	var script_path = ""
-	if get_script() != null:
-		script_path = str(get_script().resource_path)
-	if script_path == "":
-		return
-	var scripts_dir = script_path.get_base_dir()
-	var mod_dir = scripts_dir.get_base_dir()
-	for locale in TRANSLATION_FILE_MAP.keys():
-		var rel_path = str(TRANSLATION_FILE_MAP[locale])
-		var abs_path = mod_dir.plus_file(rel_path)
-		var table = _parse_translation_file(abs_path)
-		if not table.empty():
-			_file_translations[locale] = table
-
-
-func _parse_translation_file(path: String) -> Dictionary:
-	var out = {}
-	var file = File.new()
-	if not file.file_exists(path):
-		return out
-	if file.open(path, File.READ) != OK:
-		return out
-	while not file.eof_reached():
-		var line = file.get_line()
-		if line == null:
-			continue
-		line = line.strip_edges()
-		if line == "":
-			continue
-		var row = line.split(",", false, 2)
-		if row.size() < 2:
-			continue
-		var key = str(row[0]).strip_edges()
-		if key == "" or key.to_lower() == "key":
-			continue
-		out[key] = str(row[1]).strip_edges()
-	file.close()
-	return out
-
-
-func _get_locale_candidates(locale: String) -> Array:
-	var normalized = locale.replace("-", "_").strip_edges()
-	var candidates = []
-	if normalized != "":
-		candidates.append(normalized)
-	if normalized.begins_with("zh_TW") or normalized.begins_with("zh_HK") or normalized.begins_with("zh_Hant"):
-		if not candidates.has("zh_TW"):
-			candidates.append("zh_TW")
-		if not candidates.has("zh"):
-			candidates.append("zh")
-	elif normalized.begins_with("zh"):
-		if not candidates.has("zh"):
-			candidates.append("zh")
-	var base = normalized.split("_")[0] if normalized.find("_") != -1 else normalized
-	if base != "" and not candidates.has(base):
-		candidates.append(base)
-	if not candidates.has("en"):
-		candidates.append("en")
-	return candidates
 
 
 func _get_steam_lobby_manager() -> Node:

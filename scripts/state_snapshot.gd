@@ -8,8 +8,7 @@ const BULL_CHARACTER_ID = "character_bull"
 # entities are carried by lightweight unreliable snapshots. Host still owns economy/XP/box queues and boss HP; pickup visuals are local-only.
 
 
-const SNAPSHOT_INTERVAL_MSEC = 80
-const BIRTH_ONLY_RESEND_INTERVAL_MSEC = 0
+const SNAPSHOT_INTERVAL_MSEC = 120
 const SYNC_MODE_BIRTH_ONLY = "birth_only"
 const SYNC_MODE_HOST_MOTION = "host_motion"
 const SUMMARY_PRINT_INTERVAL_MSEC = 5000
@@ -70,7 +69,6 @@ var _damage_claim_batches_applied = 0
 var _damage_claim_damage_applied = 0
 var _birth_only_announced_net_ids = {}
 var _birth_only_first_seen_msec = {}
-var _last_birth_only_resend_msec = 0
 var _announced_death_net_ids = {}
 var _birth_marker_announced_net_ids = {}
 var _reserved_spawn_by_birth_id = {}
@@ -135,12 +133,10 @@ func build_snapshot() -> Dictionary:
 	var locator = _get_runtime_locator()
 	var registry = _get_net_id_registry()
 	var players = []
-	var enemies = [] # Backward-compatible enemy/boss list for older ghost fallback.
-	var entities = [] # Unreliable state payload: host-motion entities every snapshot; birth-only entities only on first sight.
-	var reliable_birth_entities = [] # Reliable one-shot spawn payload for all newly seen network entities.
-	var reliable_birth_markers = [] # Reliable one-shot warning payload; includes reserved entity net_id.
-	var births = []
-	var pickups = []
+	# Continuous snapshot payload contains only entities whose current state must be
+	# host-driven every sample. Regular enemies/neutrals/structures are born through
+	# the reliable event queue and then simulate locally.
+	var entities = []
 	var removed = []
 	var counts = {}
 	var active_dynamic_net_ids = {}
@@ -149,10 +145,6 @@ func build_snapshot() -> Dictionary:
 	var now_msec = OS.get_ticks_msec()
 	var wave_timer_state = _build_wave_timer_state(locator, now_msec)
 	var battle_allows_births = _wave_timer_state_allows_births(wave_timer_state)
-	var resend_birth_only = now_msec - _last_birth_only_resend_msec >= BIRTH_ONLY_RESEND_INTERVAL_MSEC
-	if resend_birth_only:
-		_last_birth_only_resend_msec = now_msec
-
 	if locator != null:
 		_ensure_spawner_signal_connections(locator)
 	if locator != null and locator.has_method("get_entity_counts"):
@@ -166,12 +158,12 @@ func build_snapshot() -> Dictionary:
 				continue
 			players.append(_build_player_state(player, i, registry))
 
-	_process_pending_signal_spawn_nodes(locator, registry, now_msec, entities, enemies, active_dynamic_net_ids, reliable_birth_entities, emitted_dynamic_net_ids)
-	_append_dynamic_entity_states(locator, registry, "get_enemy_nodes", "enemy", _entity_type_enemy(), "enemy", SYNC_MODE_BIRTH_ONLY, resend_birth_only, now_msec, entities, enemies, active_dynamic_net_ids, reliable_birth_entities, emitted_dynamic_net_ids)
-	_append_dynamic_entity_states(locator, registry, "get_bosses", "boss", _entity_type_boss(), "boss", SYNC_MODE_HOST_MOTION, resend_birth_only, now_msec, entities, enemies, active_dynamic_net_ids, reliable_birth_entities, emitted_dynamic_net_ids)
-	_append_dynamic_entity_states(locator, registry, "get_neutrals", "neutral", _entity_type_neutral(), "neutral", SYNC_MODE_BIRTH_ONLY, resend_birth_only, now_msec, entities, [], active_dynamic_net_ids, reliable_birth_entities, emitted_dynamic_net_ids)
-	_append_dynamic_entity_states(locator, registry, "get_structures", "structure", _entity_type_structure(), "structure", SYNC_MODE_BIRTH_ONLY, resend_birth_only, now_msec, entities, [], active_dynamic_net_ids, reliable_birth_entities, emitted_dynamic_net_ids)
-	_append_dynamic_entity_states(locator, registry, "get_pets", "pet", _entity_type_pet(), "pet", SYNC_MODE_HOST_MOTION, resend_birth_only, now_msec, entities, [], active_dynamic_net_ids, reliable_birth_entities, emitted_dynamic_net_ids)
+	_process_pending_signal_spawn_nodes(locator, registry, now_msec, entities, active_dynamic_net_ids, emitted_dynamic_net_ids)
+	_append_dynamic_entity_states(locator, registry, "get_enemy_nodes", "enemy", _entity_type_enemy(), "enemy", SYNC_MODE_BIRTH_ONLY, now_msec, entities, active_dynamic_net_ids, emitted_dynamic_net_ids)
+	_append_dynamic_entity_states(locator, registry, "get_bosses", "boss", _entity_type_boss(), "boss", SYNC_MODE_HOST_MOTION, now_msec, entities, active_dynamic_net_ids, emitted_dynamic_net_ids)
+	_append_dynamic_entity_states(locator, registry, "get_neutrals", "neutral", _entity_type_neutral(), "neutral", SYNC_MODE_BIRTH_ONLY, now_msec, entities, active_dynamic_net_ids, emitted_dynamic_net_ids)
+	_append_dynamic_entity_states(locator, registry, "get_structures", "structure", _entity_type_structure(), "structure", SYNC_MODE_BIRTH_ONLY, now_msec, entities, active_dynamic_net_ids, emitted_dynamic_net_ids)
+	_append_dynamic_entity_states(locator, registry, "get_pets", "pet", _entity_type_pet(), "pet", SYNC_MODE_HOST_MOTION, now_msec, entities, active_dynamic_net_ids, emitted_dynamic_net_ids)
 
 	if battle_allows_births and locator != null and locator.has_method("get_births"):
 		var birth_nodes = locator.get_births()
@@ -180,12 +172,10 @@ func build_snapshot() -> Dictionary:
 				continue
 			var birth_state = _build_birth_state(birth, registry, now_msec)
 			if not birth_state.empty():
-				births.append(birth_state)
 				var birth_id = str(birth_state.get("net_id", ""))
 				active_dynamic_net_ids[birth_id] = true
 				if birth_id != "" and not _birth_marker_announced_net_ids.has(birth_id):
 					_birth_marker_announced_net_ids[birth_id] = true
-					reliable_birth_markers.append(birth_state.duplicate(true))
 					_queue_pending_reliable_birth_marker(birth_state)
 
 
@@ -228,13 +218,8 @@ func build_snapshot() -> Dictionary:
 		"wave": _safe_int_from_object(RunData, "current_wave", 0),
 		"player_count": RunData.get_player_count(),
 		"players": players,
-		"enemies": enemies,
 		"entities": entities,
 		"active_entity_ids": active_dynamic_net_ids.keys(),
-		"reliable_birth_entities": reliable_birth_entities,
-		"reliable_birth_markers": reliable_birth_markers,
-		"births": births,
-		"pickups": [],
 		"wave_timer_state": wave_timer_state,
 		"economy_state": economy_state,
 		"progression_state": progression_state,
@@ -293,7 +278,7 @@ func _is_valid_timer(value) -> bool:
 	return value != null and is_instance_valid(value) and value is Timer
 
 
-func _append_dynamic_entity_states(locator: Node, registry: Node, method_name: String, category: String, entity_type: int, prefix: String, sync_mode: String, _resend_birth_only: bool, now_msec: int, entities_out: Array, legacy_enemies_out: Array, active_dynamic_net_ids: Dictionary, reliable_birth_entities_out: Array, emitted_dynamic_net_ids: Dictionary) -> void:
+func _append_dynamic_entity_states(locator: Node, registry: Node, method_name: String, category: String, entity_type: int, prefix: String, sync_mode: String, now_msec: int, entities_out: Array, active_dynamic_net_ids: Dictionary, emitted_dynamic_net_ids: Dictionary) -> void:
 	if locator == null or not locator.has_method(method_name):
 		return
 
@@ -302,10 +287,10 @@ func _append_dynamic_entity_states(locator: Node, registry: Node, method_name: S
 		return
 
 	for node in nodes:
-		_append_dynamic_node_state(node, registry, category, entity_type, prefix, sync_mode, now_msec, entities_out, legacy_enemies_out, active_dynamic_net_ids, reliable_birth_entities_out, emitted_dynamic_net_ids)
+		_append_dynamic_node_state(node, registry, category, entity_type, prefix, sync_mode, now_msec, entities_out, active_dynamic_net_ids, emitted_dynamic_net_ids)
 
 
-func _append_dynamic_node_state(node, registry: Node, category: String, entity_type: int, prefix: String, sync_mode: String, now_msec: int, entities_out: Array, legacy_enemies_out: Array, active_dynamic_net_ids: Dictionary, reliable_birth_entities_out: Array, emitted_dynamic_net_ids: Dictionary) -> void:
+func _append_dynamic_node_state(node, registry: Node, category: String, entity_type: int, prefix: String, sync_mode: String, now_msec: int, entities_out: Array, active_dynamic_net_ids: Dictionary, emitted_dynamic_net_ids: Dictionary) -> void:
 	if not _is_valid_node(node):
 		return
 
@@ -324,15 +309,12 @@ func _append_dynamic_node_state(node, registry: Node, category: String, entity_t
 		var full_state = _build_dynamic_entity_state_from_net_id(node, net_id, category, entity_type)
 		if not full_state.empty():
 			full_state["sync_mode"] = sync_mode
-			reliable_birth_entities_out.append(full_state.duplicate(true))
 			_queue_pending_reliable_birth_entity(full_state)
 			_store_structure_curse_data_signature_if_present(net_id, full_state)
 			_birth_only_announced_net_ids[net_id] = true
-			if not emitted_dynamic_net_ids.has(net_id):
+			if sync_mode == SYNC_MODE_HOST_MOTION and not emitted_dynamic_net_ids.has(net_id):
 				entities_out.append(full_state)
 				emitted_dynamic_net_ids[net_id] = true
-				if legacy_enemies_out != null:
-					legacy_enemies_out.append(full_state)
 		return
 
 	if _should_sync_entity_curse_status(category):
@@ -343,11 +325,10 @@ func _append_dynamic_node_state(node, registry: Node, category: String, entity_t
 			var status_state = _build_dynamic_entity_state_from_net_id(node, net_id, category, entity_type)
 			if not status_state.empty():
 				status_state["sync_mode"] = sync_mode
-				reliable_birth_entities_out.append(status_state.duplicate(true))
 				_queue_pending_reliable_birth_entity(status_state)
 
 	if category == "structure":
-		_maybe_append_structure_curse_data_update(node, net_id, category, entity_type, sync_mode, reliable_birth_entities_out)
+		_maybe_append_structure_curse_data_update(node, net_id, category, entity_type, sync_mode)
 
 	if sync_mode != SYNC_MODE_HOST_MOTION:
 		# Known regular enemies/trees/structures are now only touched for liveness and
@@ -364,8 +345,6 @@ func _append_dynamic_node_state(node, registry: Node, category: String, entity_t
 	motion_state["sync_mode"] = sync_mode
 	entities_out.append(motion_state)
 	emitted_dynamic_net_ids[net_id] = true
-	if legacy_enemies_out != null:
-		legacy_enemies_out.append(motion_state)
 
 
 func _get_or_assign_entity_net_id(entity: Node, registry: Node, category: String, entity_type: int, prefix: String) -> String:
@@ -447,7 +426,7 @@ func _build_dynamic_entity_state_from_net_id(entity: Node, net_id: String, categ
 		result["online_drop_result"] = online_drop_result.duplicate(true)
 	return result
 
-func _maybe_append_structure_curse_data_update(node: Node, net_id: String, category: String, entity_type: int, sync_mode: String, reliable_birth_entities_out: Array) -> void:
+func _maybe_append_structure_curse_data_update(node: Node, net_id: String, category: String, entity_type: int, sync_mode: String) -> void:
 	if net_id == "" or category != "structure" or not _is_valid_node(node):
 		return
 	var scene_path = _get_scene_path(node)
@@ -466,7 +445,6 @@ func _maybe_append_structure_curse_data_update(node: Node, net_id: String, categ
 	if state.empty():
 		return
 	state["sync_mode"] = sync_mode
-	reliable_birth_entities_out.append(state.duplicate(true))
 	_queue_pending_reliable_birth_entity(state)
 	_structure_curse_data_signature_by_net_id[net_id] = signature
 func _store_structure_curse_data_signature_if_present(net_id: String, state: Dictionary) -> void:
@@ -693,7 +671,7 @@ func _queue_signal_spawn_node(entity, hint_category: String) -> void:
 	_pending_signal_spawn_nodes.append({"node": entity, "hint_category": hint_category})
 
 
-func _process_pending_signal_spawn_nodes(locator: Node, registry: Node, now_msec: int, entities_out: Array, legacy_enemies_out: Array, active_dynamic_net_ids: Dictionary, reliable_birth_entities_out: Array, emitted_dynamic_net_ids: Dictionary) -> void:
+func _process_pending_signal_spawn_nodes(locator: Node, registry: Node, now_msec: int, entities_out: Array, active_dynamic_net_ids: Dictionary, emitted_dynamic_net_ids: Dictionary) -> void:
 	if _pending_signal_spawn_nodes.empty():
 		return
 	var pending = _pending_signal_spawn_nodes
@@ -712,10 +690,7 @@ func _process_pending_signal_spawn_nodes(locator: Node, registry: Node, now_msec
 		var entity_type = _entity_type_from_category(category)
 		var prefix = _prefix_from_category(category)
 		var sync_mode = _sync_mode_from_category(category)
-		var legacy = []
-		if category == "enemy" or category == "boss":
-			legacy = legacy_enemies_out
-		_append_dynamic_node_state(node, registry, category, entity_type, prefix, sync_mode, now_msec, entities_out, legacy, active_dynamic_net_ids, reliable_birth_entities_out, emitted_dynamic_net_ids)
+		_append_dynamic_node_state(node, registry, category, entity_type, prefix, sync_mode, now_msec, entities_out, active_dynamic_net_ids, emitted_dynamic_net_ids)
 
 
 func _infer_dynamic_category(locator: Node, node: Node, hint_category: String) -> String:
@@ -2249,9 +2224,7 @@ func _clear_pending_reliable_events() -> void:
 
 func _print_snapshot_summary(snapshot: Dictionary) -> void:
 	var players = snapshot.get("players", [])
-	var enemies = snapshot.get("enemies", [])
 	var entities = snapshot.get("entities", [])
-	var births = snapshot.get("births", [])
 	var removed = snapshot.get("removed", [])
 	var events = snapshot.get("events", [])
 	var counts = snapshot.get("counts", {})
@@ -2306,7 +2279,6 @@ func _ensure_current_game_scene_registered(reason: String, locator: Node, is_hos
 		_pending_signal_spawn_nodes.clear()
 		_pending_signal_spawn_instance_ids.clear()
 		_connected_spawner_instance_id = ""
-		_last_birth_only_resend_msec = 0
 		_last_game_scene_instance_id = current_scene_id
 		_game_scene_enter_msec = OS.get_ticks_msec()
 		var registry = _get_net_id_registry()
@@ -2342,7 +2314,6 @@ func _on_left_game_scene() -> void:
 	_pending_signal_spawn_nodes.clear()
 	_pending_signal_spawn_instance_ids.clear()
 	_connected_spawner_instance_id = ""
-	_last_birth_only_resend_msec = 0
 	_last_game_scene_instance_id = 0
 	_game_scene_enter_msec = 0
 	_last_scene_was_game = false

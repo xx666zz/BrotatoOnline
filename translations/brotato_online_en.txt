@@ -1,17 +1,82 @@
 key,text
+MENU_BACK,Back
 BROTATO_ONLINE_MENU_SETTINGS,Online Settings
-BROTATO_ONLINE_SETTINGS_TITLE,Online Settings
+BROTATO_ONLINE_SETTINGS_TITLE,Brotato Online Settings
 BROTATO_ONLINE_LOCAL_CHARACTER_OUTLINE,Outline local character
-BROTATO_ONLINE_LOCAL_CHARACTER_OUTLINE_DESC,In online battles add an outline only to the player controlled on this machine.
+BROTATO_ONLINE_LOCAL_CHARACTER_OUTLINE_DESC,"In online battles, add a character outline only to the player controlled on this machine. This does not change the vanilla circle under players."
 BROTATO_ONLINE_AUTO_JOIN_HOST_PLAYER,Auto-add host as Player 1
-BROTATO_ONLINE_AUTO_JOIN_HOST_PLAYER_DESC,Default: on. If disabled the host must first join and lock Player 1 with the intended keyboard/controller on the character selection screen; only then should other players join. If Player 2 joins before Player 1 is ready character slots or focus may desync.
-
+BROTATO_ONLINE_AUTO_JOIN_HOST_PLAYER_DESC,"Default: on. If you turn this off, the host must first join and lock Player 1 with the intended keyboard/controller on the character selection screen, then other players may join. If Player 2 joins before Player 1 is ready, character slots or focus may desync."
 BROTATO_ONLINE_QUICK_CHAT_CANCEL,Release Ctrl to cancel
-BROTATO_ONLINE_QUICK_CHAT_COME,Stay alive
-BROTATO_ONLINE_QUICK_CHAT_HELP,Hurry!
-BROTATO_ONLINE_QUICK_CHAT_WAIT,......
-BROTATO_ONLINE_QUICK_CHAT_READY,This one
-BROTATO_ONLINE_QUICK_CHAT_BUY,Strong strong?
-BROTATO_ONLINE_QUICK_CHAT_NO_REROLL,?
-BROTATO_ONLINE_QUICK_CHAT_THANKS,NO!
-BROTATO_ONLINE_QUICK_CHAT_NICE,Wait a sec
+BROTATO_ONLINE_QUICK_CHAT_STAY_ALIVE,Stay alive
+BROTATO_ONLINE_QUICK_CHAT_HURRY,Hurry!
+BROTATO_ONLINE_QUICK_CHAT_ELLIPSIS,......
+BROTATO_ONLINE_QUICK_CHAT_THIS_ONE,This one
+BROTATO_ONLINE_QUICK_CHAT_STRONG_STRONG,Strong strong?
+BROTATO_ONLINE_QUICK_CHAT_QUESTION,?
+BROTATO_ONLINE_QUICK_CHAT_NO,NO!
+BROTATO_ONLINE_QUICK_CHAT_WAIT_A_SEC,Wait a sec
+BROTATO_ONLINE_PUBLIC_LOBBY_BROWSER_BUTTON,Public Lobbies
+BROTATO_ONLINE_PUBLIC_LOBBY_PUBLIC_TOGGLE,Public
+BROTATO_ONLINE_PUBLIC_LOBBY_TITLE,Public Lobbies
+BROTATO_ONLINE_PUBLIC_LOBBY_SEARCHING,Searching for public lobbies...
+BROTATO_ONLINE_PUBLIC_LOBBY_NONE,No joinable public lobbies found
+BROTATO_ONLINE_PUBLIC_LOBBY_STEAM_UNAVAILABLE,Steam lobby service is unavailable
+BROTATO_ONLINE_PUBLIC_LOBBY_REQUEST_FAILED,Could not request the lobby list
+BROTATO_ONLINE_PUBLIC_LOBBY_REFRESH,Refresh
+BROTATO_ONLINE_PUBLIC_LOBBY_BACK,Back
+BROTATO_ONLINE_PUBLIC_LOBBY_HOST,Host
+BROTATO_ONLINE_PUBLIC_LOBBY_PLAYERS,Players
+BROTATO_ONLINE_PUBLIC_LOBBY_PING,Latency
+BROTATO_ONLINE_PUBLIC_LOBBY_STATE,State
+BROTATO_ONLINE_PUBLIC_LOBBY_JOIN,Join
+BROTATO_ONLINE_PUBLIC_LOBBY_JOINING,Joining...
+BROTATO_ONLINE_PUBLIC_LOBBY_CHECKING_LOBBY,Checking lobby status...
+BROTATO_ONLINE_PUBLIC_LOBBY_LOBBY_NO_LONGER_PUBLIC,This lobby is no longer public. Refresh the list.
+BROTATO_ONLINE_PUBLIC_LOBBY_LOBBY_NO_LONGER_JOINABLE,This lobby is no longer joinable.
+BROTATO_ONLINE_PUBLIC_LOBBY_JOIN_VERIFY_FAILED,Could not verify the lobby status. Refresh and try again.
+BROTATO_ONLINE_PUBLIC_LOBBY_VERSION_MISMATCH,Version mismatch
+BROTATO_ONLINE_PUBLIC_LOBBY_FULL,Full
+BROTATO_ONLINE_PUBLIC_LOBBY_CHARACTER_SELECTION,Character select
+BROTATO_ONLINE_PUBLIC_LOBBY_COOP_RESUME,Waiting for reconnect
+BROTATO_ONLINE_PUBLIC_LOBBY_WEAPON_SELECTION,Choosing weapons
+BROTATO_ONLINE_PUBLIC_LOBBY_DIFFICULTY_SELECTION,Choosing difficulty
+BROTATO_ONLINE_PUBLIC_LOBBY_GAME,In game
+BROTATO_ONLINE_PUBLIC_LOBBY_SHOP,In shop
+BROTATO_ONLINE_PUBLIC_LOBBY_BUSY,Not joinable
+BROTATO_ONLINE_PUBLIC_LOBBY_UNKNOWN,Unknown
+BROTATO_ONLINE_PUBLIC_LOBBY_COUNT,%d lobbies
+BROTATO_ONLINE_STEAM_MAIN_MENU_ONLINE,Create Lobby
+BROTATO_ONLINE_STEAM_FRIEND_JOIN_TOGGLE,Friend Join
+BROTATO_ONLINE_STEAM_INVITE_FRIEND,Invite Friend
+BROTATO_ONLINE_STEAM_CREATING,Creating...
+BROTATO_ONLINE_STEAM_RECREATE_LOBBY,Recreate Lobby
+BROTATO_ONLINE_STEAM_CREATE_LOBBY,Create Lobby
+BROTATO_ONLINE_STEAM_JOINING_OVERLAY_CLIENT,Joining...
+BROTATO_ONLINE_STEAM_JOINING_OVERLAY_HOST,Joining...\nPreparing online lobby
+BROTATO_ONLINE_STEAM_RETURN_TO_LOBBY,Return to Lobby
+BROTATO_ONLINE_STEAM_JOIN_FAILED_TITLE,Failed to Join Lobby
+BROTATO_ONLINE_STEAM_JOIN_FAILED_INVALID,The lobby information is invalid.
+BROTATO_ONLINE_STEAM_JOIN_FAILED_STEAM_UNAVAILABLE,The Steam lobby service is unavailable.
+BROTATO_ONLINE_STEAM_JOIN_FAILED_TIMEOUT,Joining the lobby timed out. Refresh the lobby list and try again.
+BROTATO_ONLINE_STEAM_JOIN_FAILED_STALE,The lobby is closed or the host has left.
+BROTATO_ONLINE_STEAM_JOIN_RESPONSE_2,The lobby no longer exists or has been closed.
+BROTATO_ONLINE_STEAM_JOIN_RESPONSE_3,You are not allowed to join this lobby. The host may have disabled Public.
+BROTATO_ONLINE_STEAM_JOIN_RESPONSE_4,The lobby is full.
+BROTATO_ONLINE_STEAM_JOIN_RESPONSE_5,Steam reported an error while joining the lobby.
+BROTATO_ONLINE_STEAM_JOIN_RESPONSE_6,You are banned from this lobby.
+BROTATO_ONLINE_STEAM_JOIN_RESPONSE_7,This Steam account is not allowed to join the lobby.
+BROTATO_ONLINE_STEAM_JOIN_RESPONSE_8,This lobby is currently unavailable.
+BROTATO_ONLINE_STEAM_JOIN_RESPONSE_9,A Steam Community restriction prevented joining.
+BROTATO_ONLINE_STEAM_JOIN_RESPONSE_10,A player in the lobby has blocked you.
+BROTATO_ONLINE_STEAM_JOIN_RESPONSE_11,You have blocked a player in the lobby.
+BROTATO_ONLINE_STEAM_JOIN_RESPONSE_15,Too many join attempts. Try again shortly.
+BROTATO_ONLINE_STEAM_JOIN_RESPONSE_UNKNOWN,Could not join the lobby (Steam response %d).
+BROTATO_ONLINE_STEAM_STATUS_CREATING_STEAM,Creating Steam lobby...
+BROTATO_ONLINE_STEAM_STATUS_PREPARING,Preparing online lobby...
+BROTATO_ONLINE_STEAM_STATUS_CLOSE_AFTER_CREATION,Lobby will close after creation
+BROTATO_ONLINE_STEAM_STATUS_OPEN,"Lobby open, invite friends %d/%d"
+BROTATO_ONLINE_STEAM_STATUS_AUTO_PLAYER_ONE_OFF,"Auto Player 1 is off: host must choose an input device first, then others may join"
+BROTATO_ONLINE_STEAM_STATUS_FAILED_STEAM_NOT_READY,Failed to create lobby: Steam is not ready
+BROTATO_ONLINE_STEAM_STATUS_FAILED_API_UNAVAILABLE,Failed to create lobby: Steam API unavailable
+BROTATO_ONLINE_STEAM_STATUS_FAILED_CODE,"Failed to create lobby, code %d"
+BROTATO_ONLINE_STEAM_STATUS_CLOSED,Lobby closed

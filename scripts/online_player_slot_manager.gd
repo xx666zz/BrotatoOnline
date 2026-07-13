@@ -400,18 +400,24 @@ func apply_host_selection_layout(selection_state: Dictionary, self_steam_id: Str
 	if typeof(players) != TYPE_ARRAY or players.empty():
 		return
 
-	_ensure_coop_mode_if_possible()
-
 	var new_connected_players = []
 	var new_remote_steam_id_by_device = {}
 	var new_device_by_remote_steam_id = {}
 	var new_remote_devices = []
 
 	var new_local_mirrored_player_index = -1
+	var matched_local_player_count = 0
 	var target_client_player_index = int(selection_state.get("target_client_player_index", selection_state.get("client_player_index", -1)))
 	var target_client_steam_id = str(selection_state.get("target_client_steam_id", self_steam_id))
 	if target_client_steam_id == "":
 		target_client_steam_id = self_steam_id
+
+	# Targeted layouts must never be consumed by another client. More importantly,
+	# treat layout application as a transaction: keep the last valid mirror until the
+	# incoming payload can identify exactly one local-owned slot.
+	if self_steam_id != "" and target_client_steam_id != "" and target_client_steam_id != self_steam_id:
+		_bo_slot_diag_log("APPLY_HOST_LAYOUT_REJECT", "reason=wrong_target self=" + self_steam_id + " target=" + target_client_steam_id + " target_idx=" + str(target_client_player_index) + " old_idx=" + str(_local_mirrored_player_index))
+		return
 
 	for player_data in players:
 		if typeof(player_data) != TYPE_DICTIONARY:
@@ -432,13 +438,14 @@ func apply_host_selection_layout(selection_state: Dictionary, self_steam_id: Str
 		# Use it as a fallback when an early selection_state/host_*_setup arrives before
 		# every players[] entry has a Steam id. This prevents P2/P3 clients from both
 		# mirroring the same local slot during three-player joins.
-		if not is_self and target_client_player_index >= 0 and player_index == target_client_player_index:
+		if not is_self and steam_id == "" and target_client_player_index >= 0 and player_index == target_client_player_index:
 			if target_client_steam_id == "" or target_client_steam_id == self_steam_id:
 				is_self = true
 		var device = CoopService.KEYBOARD_REMAPPED_DEVICE_ID
 		var player_type = CoopService.PlayerType.KEYBOARD_AND_MOUSE
 
 		if is_self:
+			matched_local_player_count += 1
 			# 本机真实输入必须保留真实设备。旧逻辑强制写 keyboard device=7，
 			# 会让插着手柄的客户端/主机进入联机后只能用键盘槽位。
 			var local_entry = _get_preferred_local_player_entry(true)
@@ -471,8 +478,17 @@ func apply_host_selection_layout(selection_state: Dictionary, self_steam_id: Str
 		_bo_slot_diag_log("APPLY_HOST_LAYOUT_SKIP", "reason=new_empty self=" + self_steam_id + " host=" + host_steam_id + " players=" + _bo_slot_diag_players())
 		return
 
+	if matched_local_player_count != 1 or new_local_mirrored_player_index < 0 or new_local_mirrored_player_index >= new_connected_players.size():
+		_bo_slot_diag_log("APPLY_HOST_LAYOUT_REJECT", "reason=invalid_local_slot self=" + self_steam_id + " host=" + host_steam_id + " target=" + target_client_steam_id + " target_idx=" + str(target_client_player_index) + " matched=" + str(matched_local_player_count) + " new_idx=" + str(new_local_mirrored_player_index) + " old_idx=" + str(_local_mirrored_player_index) + " incoming=" + str(players))
+		return
+
+	# Validation above has no global side effects. Only now may this payload switch the
+	# local run into COOP mode and commit the rebuilt mirror.
+	_ensure_coop_mode_if_possible()
+
 	var connected_players_unchanged = _connected_players_match(new_connected_players)
-	_bo_slot_diag_log("APPLY_HOST_LAYOUT", "unchanged=" + str(connected_players_unchanged) + " self=" + self_steam_id + " host=" + host_steam_id + " new=" + str(new_connected_players) + " old=" + _bo_slot_diag_players())
+	if not connected_players_unchanged:
+		_bo_slot_diag_log("APPLY_HOST_LAYOUT_CHANGE", "self=" + self_steam_id + " host=" + host_steam_id + " new=" + str(new_connected_players) + " old=" + _bo_slot_diag_players())
 
 	_local_mirrored_steam_id = self_steam_id
 	_local_mirrored_player_index = new_local_mirrored_player_index

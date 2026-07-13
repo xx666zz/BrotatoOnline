@@ -4,7 +4,7 @@ extends Node
 # path. The SteamLobbyManager remains the single owner of lobby join/leave state.
 
 const MOD_ID = "six666-BrotatoOnline"
-const MOD_PROTOCOL_VERSION = "1.1.0"
+const MOD_VERSION = "1.1.0"
 const GAME_VERSION = "1.1.15.4"
 const META_PUBLIC_LOBBY_ENABLED = "brotato_online_public_lobby_enabled"
 const SETTINGS_FILE_PATH = "user://brotato_online_settings.cfg"
@@ -115,6 +115,31 @@ func _input(event: InputEvent) -> void:
 		get_tree().set_input_as_handled()
 
 
+func _get_version_adapter():
+	var parent = get_parent()
+	if parent == null:
+		return null
+	return parent.get_node_or_null("BrotatoOnlineVersionAdapter")
+
+
+func _steam_has_method(method_name: String) -> bool:
+	if _steam == null:
+		return false
+	var adapter = _get_version_adapter()
+	if adapter != null and adapter.has_method("has_method_cached"):
+		return bool(adapter.has_method_cached(_steam, method_name))
+	return _steam.has_method(method_name)
+
+
+func _steam_has_signal(signal_name: String) -> bool:
+	if _steam == null:
+		return false
+	var adapter = _get_version_adapter()
+	if adapter != null and adapter.has_method("has_signal_cached"):
+		return bool(adapter.has_signal_cached(_steam, signal_name))
+	return _steam.has_signal(signal_name)
+
+
 func _setup_steam() -> void:
 	if Engine.has_singleton("Steam"):
 		_steam = Engine.get_singleton("Steam")
@@ -128,7 +153,7 @@ func _connect_steam_signals() -> void:
 
 
 func _connect_signal_if_exists(signal_name: String, method_name: String) -> void:
-	if _steam == null or not _steam.has_signal(signal_name):
+	if _steam == null or not _steam_has_signal(signal_name):
 		return
 	if _steam.is_connected(signal_name, self, method_name):
 		return
@@ -148,78 +173,14 @@ func _on_ui_language_changed() -> void:
 		_rebuild_lobby_rows()
 
 
-func _get_ui_language_code() -> String:
-	var language = ""
-	if ProgressData != null and typeof(ProgressData.settings) == TYPE_DICTIONARY:
-		language = str(ProgressData.settings.get("language", ""))
-	if language == "":
-		language = str(TranslationServer.get_locale())
-	language = language.to_lower()
-	return "zh" if language.begins_with("zh") else "en"
-
-
 func _text(key: String) -> String:
-	var zh = _get_ui_language_code() == "zh"
-	match key:
-		"browser_button":
-			return "公共大厅" if zh else "Public Lobbies"
-		"public_toggle":
-			return "公开" if zh else "Public"
-		"title":
-			return "公共大厅" if zh else "Public Lobbies"
-		"searching":
-			return "正在搜索公共大厅…" if zh else "Searching for public lobbies..."
-		"none":
-			return "没有找到可加入的公共大厅" if zh else "No joinable public lobbies found"
-		"steam_unavailable":
-			return "Steam 大厅接口不可用" if zh else "Steam lobby service is unavailable"
-		"request_failed":
-			return "无法请求大厅列表" if zh else "Could not request the lobby list"
-		"refresh":
-			return "刷新" if zh else "Refresh"
-		"back":
-			return "返回" if zh else "Back"
-		"host":
-			return "房主" if zh else "Host"
-		"players":
-			return "人数" if zh else "Players"
-		"ping":
-			return "延迟" if zh else "Latency"
-		"state":
-			return "状态" if zh else "State"
-		"join":
-			return "加入" if zh else "Join"
-		"joining":
-			return "加入中…" if zh else "Joining..."
-		"checking_lobby":
-			return "正在确认大厅状态…" if zh else "Checking lobby status..."
-		"lobby_no_longer_public":
-			return "该大厅已关闭公开，请刷新列表。" if zh else "This lobby is no longer public. Refresh the list."
-		"lobby_no_longer_joinable":
-			return "该大厅当前不可加入。" if zh else "This lobby is no longer joinable."
-		"join_verify_failed":
-			return "无法确认大厅状态，请刷新后重试。" if zh else "Could not verify the lobby status. Refresh and try again."
-		"version_mismatch":
-			return "版本不兼容" if zh else "Version mismatch"
-		"full":
-			return "已满" if zh else "Full"
-		"character_selection":
-			return "角色选择" if zh else "Character select"
-		"coop_resume":
-			return "等待重连" if zh else "Waiting for reconnect"
-		"weapon_selection":
-			return "武器选择中" if zh else "Choosing weapons"
-		"difficulty_selection":
-			return "难度选择中" if zh else "Choosing difficulty"
-		"game":
-			return "游戏中" if zh else "In game"
-		"shop":
-			return "商店中" if zh else "In shop"
-		"busy":
-			return "不可加入" if zh else "Not joinable"
-		"unknown":
-			return "未知" if zh else "Unknown"
-	return key
+	var translation_key = "BROTATO_ONLINE_PUBLIC_LOBBY_" + key.to_upper()
+	var parent = get_parent()
+	if parent != null:
+		var i18n = parent.get_node_or_null("BrotatoOnlineI18n")
+		if i18n != null and i18n.has_method("get_text"):
+			return str(i18n.call("get_text", translation_key))
+	return translation_key
 
 
 func _load_public_lobby_preference() -> void:
@@ -736,7 +697,7 @@ func _close_browser_overlay() -> void:
 func request_public_lobby_list() -> void:
 	if not _overlay_open or _list_request_pending:
 		return
-	if _steam == null or not _steam.has_method("requestLobbyList"):
+	if _steam == null or not _steam_has_method("requestLobbyList"):
 		_list_request_pending = false
 		_set_status(_text("steam_unavailable"))
 		return
@@ -746,14 +707,14 @@ func request_public_lobby_list() -> void:
 	_list_request_pending = true
 	_last_list_request_msec = OS.get_ticks_msec()
 
-	if _steam.has_method("addRequestLobbyListStringFilter"):
+	if _steam_has_method("addRequestLobbyListStringFilter"):
 		_steam.addRequestLobbyListStringFilter("mod", MOD_ID, LOBBY_COMPARISON_EQUAL)
 		_steam.addRequestLobbyListStringFilter("visibility", "public", LOBBY_COMPARISON_EQUAL)
-	if _steam.has_method("addRequestLobbyListFilterSlotsAvailable"):
+	if _steam_has_method("addRequestLobbyListFilterSlotsAvailable"):
 		_steam.addRequestLobbyListFilterSlotsAvailable(1)
-	if _steam.has_method("addRequestLobbyListDistanceFilter"):
+	if _steam_has_method("addRequestLobbyListDistanceFilter"):
 		_steam.addRequestLobbyListDistanceFilter(LOBBY_DISTANCE_WORLDWIDE)
-	if _steam.has_method("addRequestLobbyListResultCountFilter"):
+	if _steam_has_method("addRequestLobbyListResultCountFilter"):
 		_steam.addRequestLobbyListResultCountFilter(LOBBY_LIST_RESULT_LIMIT)
 	var result = _steam.requestLobbyList()
 	if typeof(result) == TYPE_BOOL and not bool(result):
@@ -778,7 +739,7 @@ func _normalize_lobby_match_list_payload(payload) -> Array:
 		for key in ["lobbies", "lobby_ids", "results", "data"]:
 			if payload.has(key) and typeof(payload[key]) == TYPE_ARRAY:
 				return payload[key]
-	if typeof(payload) == TYPE_INT and _steam != null and _steam.has_method("getLobbyByIndex"):
+	if typeof(payload) == TYPE_INT and _steam != null and _steam_has_method("getLobbyByIndex"):
 		var result = []
 		for i in range(max(0, int(payload))):
 			result.append(_steam.getLobbyByIndex(i))
@@ -801,7 +762,7 @@ func _build_lobby_entries(lobby_ids: Array) -> void:
 
 
 func _read_lobby_entry(lobby_id: int) -> Dictionary:
-	if _steam == null or not _steam.has_method("getLobbyData"):
+	if _steam == null or not _steam_has_method("getLobbyData"):
 		return {}
 	var mod_id = str(_steam.getLobbyData(lobby_id, "mod"))
 	var visibility = str(_steam.getLobbyData(lobby_id, "visibility"))
@@ -814,18 +775,18 @@ func _read_lobby_entry(lobby_id: int) -> Dictionary:
 		state = "unknown"
 	var host_id = str(_steam.getLobbyData(lobby_id, "host"))
 	var host_name = str(_steam.getLobbyData(lobby_id, "host_name"))
-	if host_name == "" and host_id != "" and host_id != "0" and _steam.has_method("getFriendPersonaName"):
+	if host_name == "" and host_id != "" and host_id != "0" and _steam_has_method("getFriendPersonaName"):
 		host_name = str(_steam.getFriendPersonaName(int(host_id)))
 	if host_name == "":
 		host_name = host_id if host_id != "" else str(lobby_id)
 
 	var member_count = int(str(_steam.getLobbyData(lobby_id, "member_count")))
-	if _steam.has_method("getNumLobbyMembers"):
+	if _steam_has_method("getNumLobbyMembers"):
 		var live_count = int(_steam.getNumLobbyMembers(lobby_id))
 		if live_count > 0:
 			member_count = live_count
 	var member_limit = int(str(_steam.getLobbyData(lobby_id, "member_limit")))
-	if _steam.has_method("getLobbyMemberLimit"):
+	if _steam_has_method("getLobbyMemberLimit"):
 		var live_limit = int(_steam.getLobbyMemberLimit(lobby_id))
 		if live_limit > 0:
 			member_limit = live_limit
@@ -834,7 +795,7 @@ func _read_lobby_entry(lobby_id: int) -> Dictionary:
 	if member_count <= 0:
 		member_count = 1
 
-	var compatible = mod_version == MOD_PROTOCOL_VERSION and game_version == GAME_VERSION
+	var compatible = mod_version == MOD_VERSION and game_version == GAME_VERSION
 	var joinable_state = state == "character_selection" or state == "coop_resume"
 	var full = member_count >= member_limit
 	return {
@@ -868,7 +829,7 @@ func _rebuild_lobby_rows() -> void:
 		_rows_container.add_child(empty_label)
 		return
 
-	_set_status(str(_lobby_entries.size()) + (" 个大厅" if _get_ui_language_code() == "zh" else " lobbies"))
+	_set_status(_text("count") % _lobby_entries.size())
 	for entry in _lobby_entries:
 		_add_lobby_row(entry)
 
@@ -954,7 +915,7 @@ func _clear_lobby_results() -> void:
 func _on_join_lobby_pressed(lobby_id: int) -> void:
 	if lobby_id == 0 or _pending_public_join_lobby_id != 0:
 		return
-	if _steam == null or not _steam.has_method("requestLobbyData"):
+	if _steam == null or not _steam_has_method("requestLobbyData"):
 		_set_status(_text("steam_unavailable"))
 		return
 
@@ -982,7 +943,7 @@ func _on_lobby_data_update(success = false, lobby_id = 0, member_id = 0) -> void
 		return
 
 	var visibility = ""
-	if _steam != null and _steam.has_method("getLobbyData"):
+	if _steam != null and _steam_has_method("getLobbyData"):
 		visibility = str(_steam.getLobbyData(target_lobby_id, "visibility"))
 	if visibility != "public":
 		_remove_lobby_entry(target_lobby_id)
@@ -1042,7 +1003,7 @@ func _start_ping_measurements() -> void:
 
 
 func _poll_pending_ping_requests(now: int) -> void:
-	if _steam == null or not _steam.has_method("sendMessageToUser"):
+	if _steam == null or not _steam_has_method("sendMessageToUser"):
 		return
 	var expired_nonces = []
 	for nonce in _pending_ping_by_nonce.keys():
@@ -1075,7 +1036,7 @@ func _send_lobby_ping(lobby_id: int, state: Dictionary) -> void:
 		"nonce": nonce
 	}
 	var payload = to_json(message).to_utf8()
-	if _steam.has_method("acceptSessionWithUser"):
+	if _steam_has_method("acceptSessionWithUser"):
 		_steam.acceptSessionWithUser(int(host_id))
 	var _result = _steam.sendMessageToUser(int(host_id), payload, STEAM_NETWORKING_SEND_UNRELIABLE, P2P_CHANNEL_LOBBY_BROWSER)
 	_pending_ping_by_nonce[nonce] = {
@@ -1089,7 +1050,7 @@ func _send_lobby_ping(lobby_id: int, state: Dictionary) -> void:
 
 
 func _poll_browser_ping_packets() -> void:
-	if _steam == null or not _steam.has_method("receiveMessagesOnChannel"):
+	if _steam == null or not _steam_has_method("receiveMessagesOnChannel"):
 		return
 	var packets = _normalize_received_messages(_steam.receiveMessagesOnChannel(P2P_CHANNEL_LOBBY_BROWSER, 64))
 	for packet in packets:
@@ -1204,7 +1165,7 @@ func _set_lobby_data_if_changed(lobby_id: int, key: String, value: String) -> vo
 		return
 	# _setup_lobby_data() already publishes the initial values. Seed the cache from
 	# Steam instead of writing the same value again on the browser's first poll.
-	if not _published_lobby_metadata.has(key) and _steam.has_method("getLobbyData"):
+	if not _published_lobby_metadata.has(key) and _steam_has_method("getLobbyData"):
 		if str(_steam.getLobbyData(lobby_id, key)) == value:
 			_published_lobby_metadata[key] = value
 			return
@@ -1233,7 +1194,7 @@ func _poll_host_lobby_metadata(now: int) -> void:
 	if lobby_id == 0 or not bool(manager.call("is_host")):
 		_reset_host_metadata_cache()
 		return
-	if not _steam.has_method("setLobbyData"):
+	if not _steam_has_method("setLobbyData"):
 		return
 
 	if _published_lobby_id != lobby_id:
@@ -1242,20 +1203,20 @@ func _poll_host_lobby_metadata(now: int) -> void:
 
 	var state = _detect_host_lobby_state()
 	var member_count = 1
-	if _steam.has_method("getNumLobbyMembers"):
+	if _steam_has_method("getNumLobbyMembers"):
 		member_count = max(1, int(_steam.getNumLobbyMembers(lobby_id)))
 
 	_set_lobby_data_if_changed(lobby_id, "state", state)
 	_set_lobby_data_if_changed(lobby_id, "member_count", str(member_count))
 	_set_lobby_data_if_changed(lobby_id, "member_limit", "4")
 	_set_lobby_data_if_changed(lobby_id, "visibility", "public")
-	if _steam.has_method("getPersonaName"):
+	if _steam_has_method("getPersonaName"):
 		var persona_name = str(_steam.getPersonaName()).strip_edges()
 		if persona_name.length() > 64:
 			persona_name = persona_name.substr(0, 64)
 		_set_lobby_data_if_changed(lobby_id, "host_name", persona_name)
 
-	if _steam.has_method("setLobbyJoinable"):
+	if _steam_has_method("setLobbyJoinable"):
 		var joinable = state == "character_selection" or state == "coop_resume"
 		if _published_lobby_joinable == null or bool(_published_lobby_joinable) != joinable:
 			_steam.setLobbyJoinable(lobby_id, joinable)

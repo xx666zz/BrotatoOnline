@@ -3,6 +3,7 @@ extends Node
 
 const BROTATO_APP_ID = 1942280
 const MAX_LOBBY_MEMBERS = 4
+const MOD_VERSION = "1.1.0"
 const META_AUTO_JOIN_HOST_PLAYER = "brotato_online_auto_join_host_player"
 const META_PUBLIC_LOBBY_ENABLED = "brotato_online_public_lobby_enabled"
 
@@ -193,6 +194,8 @@ var _official_continue_auto_lobby_done_for_scene_id = 0
 var _retry_wave_intercept_scene_id = 0
 var _retry_wave_intercept_node_id = 0
 var _retry_wave_intercept_button_id = 0
+var _retry_wave_intercept_cancel_button_id = 0
+var _retry_wave_intercept_ok_button_id = 0
 var _retry_wave_ready_by_steam_id = {}
 var _retry_wave_ready_context_key = ""
 var _retry_wave_local_waiting_context_key = ""
@@ -200,6 +203,13 @@ var _retry_wave_last_state_broadcast_msec = 0
 var _retry_wave_starting_context_key = ""
 var _retry_wave_last_started_context_key = ""
 var _retry_wave_host_context_key = ""
+var _retry_wave_ending_context_key = ""
+var _client_retry_wave_setting_override_active = false
+var _client_retry_wave_setting_before_override = false
+var _end_run_intercept_scene_id = 0
+var _end_run_intercept_restart_button_id = 0
+var _end_run_intercept_new_run_button_id = 0
+var _end_run_intercept_exit_button_id = 0
 var _last_battle_terminal_state_key_by_steam_id = {}
 var _last_battle_terminal_state_msec_by_steam_id = {}
 var _host_current_battle_start_id = 0
@@ -326,17 +336,14 @@ func _on_ui_language_changed() -> void:
 	_update_continue_lobby_status_label_state()
 
 
-func _get_ui_language_code() -> String:
-	var language = ""
-	if ProgressData != null and typeof(ProgressData.settings) == TYPE_DICTIONARY:
-		language = str(ProgressData.settings.get("language", ""))
-	if language == "":
-		language = str(TranslationServer.get_locale())
-
-	language = language.to_lower()
-	if language.begins_with("zh"):
-		return "zh"
-	return "en"
+func _ui_text(key: String) -> String:
+	var translation_key = "BROTATO_ONLINE_STEAM_" + key.to_upper()
+	var parent = get_parent()
+	if parent != null:
+		var i18n = parent.get_node_or_null("BrotatoOnlineI18n")
+		if i18n != null and i18n.has_method("get_text"):
+			return str(i18n.call("get_text", translation_key))
+	return translation_key
 
 
 func _get_auto_join_host_player_enabled() -> bool:
@@ -344,37 +351,6 @@ func _get_auto_join_host_player_enabled() -> bool:
 	if tree == null or tree.root == null:
 		return true
 	return bool(tree.root.get_meta(META_AUTO_JOIN_HOST_PLAYER, true))
-
-
-func _ui_text(key: String) -> String:
-	var zh = _get_ui_language_code() == "zh"
-	if key == "main_menu_online":
-		return "创建大厅" if zh else "Create Lobby"
-	if key == "friend_join_toggle":
-		return "开启大厅" if zh else "Friend Join"
-	if key == "invite_friend":
-		return "邀请好友" if zh else "Invite Friend"
-	if key == "creating":
-		return "创建中" if zh else "Creating..."
-	if key == "recreate_lobby":
-		return "重新创建大厅" if zh else "Recreate Lobby"
-	if key == "create_lobby":
-		return "创建大厅" if zh else "Create Lobby"
-	if key == "joining_overlay_client":
-		return "加入中…" if zh else "Joining..."
-	if key == "joining_overlay_host":
-		return "加入中…\n正在准备联机大厅" if zh else "Joining...\nPreparing online lobby"
-	if key == "join_failed_title":
-		return "加入大厅失败" if zh else "Failed to Join Lobby"
-	if key == "join_failed_invalid":
-		return "大厅信息无效。" if zh else "The lobby information is invalid."
-	if key == "join_failed_steam_unavailable":
-		return "Steam 大厅服务不可用。" if zh else "The Steam lobby service is unavailable."
-	if key == "join_failed_timeout":
-		return "加入大厅超时，请刷新大厅列表后重试。" if zh else "Joining the lobby timed out. Refresh the lobby list and try again."
-	if key == "join_failed_stale":
-		return "大厅已关闭或房主已经离开。" if zh else "The lobby is closed or the host has left."
-	return key
 
 
 func _disable_custom_button_auto_translation(button: Node) -> void:
@@ -440,6 +416,7 @@ func _process(_delta: float) -> void:
 
 	var t_retry = OS.get_ticks_usec()
 	_poll_retry_wave_intercept()
+	_poll_end_run_intercept()
 	_bo_net_diag_cost("poll_retry_wave_intercept", t_retry)
 	var t_start = OS.get_ticks_usec()
 	_poll_host_difficulty_start_intercept()
@@ -513,7 +490,7 @@ func create_lobby_and_invite(open_overlay_after_create: bool = false) -> void:
 	_open_invite_overlay_after_create = open_overlay_after_create
 	var lobby_type = _get_steam_const("LOBBY_TYPE_PUBLIC", LOBBY_TYPE_PUBLIC_FALLBACK) if _get_public_lobby_enabled() else _get_steam_const("LOBBY_TYPE_FRIENDS_ONLY", LOBBY_TYPE_FRIENDS_ONLY_FALLBACK)
 
-	if not _steam.has_method("createLobby"):
+	if not _steam_has_method("createLobby"):
 		_lobby_toggle_pending_create = false
 		_last_lobby_create_failed_result = -2
 		_update_lobby_toggle_button_state()
@@ -547,7 +524,7 @@ func open_invite_overlay() -> void:
 	if _is_game_host() and not _get_public_lobby_enabled():
 		_prepare_friends_only_lobby_for_invite()
 
-	if _steam.has_method("activateGameOverlayInviteDialog"):
+	if _steam_has_method("activateGameOverlayInviteDialog"):
 		_steam.activateGameOverlayInviteDialog(_lobby_id)
 	else:
 		pass
@@ -586,7 +563,7 @@ func join_lobby(lobby_id) -> void:
 	_reset_transient_online_state_for_new_session("join_lobby")
 	_client_join_requested_lobby_id = target_lobby_id
 
-	if not _steam.has_method("joinLobby"):
+	if not _steam_has_method("joinLobby"):
 		_clear_pending_join_request()
 		_show_join_failure(_ui_text("join_failed_steam_unavailable"))
 		return
@@ -600,18 +577,19 @@ func join_lobby(lobby_id) -> void:
 func leave_lobby() -> void:
 	var leaving_lobby_id = _lobby_id
 	_bump_online_session_generation("leave_lobby")
+	_restore_client_retry_wave_setting_override()
 	_close_tracked_p2p_sessions()
 	_lobby_toggle_pending_create = false
 	_lobby_toggle_close_after_create = false
 	_last_lobby_create_failed_result = 0
 	_open_invite_overlay_after_create = false
 	if _steam != null and leaving_lobby_id != 0:
-		if _steam.has_method("setLobbyJoinable"):
+		if _steam_has_method("setLobbyJoinable"):
 			_steam.setLobbyJoinable(leaving_lobby_id, false)
-		if _steam.has_method("setLobbyData"):
+		if _steam_has_method("setLobbyData"):
 			_steam.setLobbyData(leaving_lobby_id, "state", "closed")
 			_steam.setLobbyData(leaving_lobby_id, "connect", "")
-		if _steam.has_method("leaveLobby"):
+		if _steam_has_method("leaveLobby"):
 			_steam.leaveLobby(leaving_lobby_id)
 
 	_lobby_id = 0
@@ -732,16 +710,16 @@ func set_public_lobby_enabled(enabled: bool) -> void:
 	# Close first. This invalidates stale public-browser rows before changing the
 	# advertised type/metadata. A private lobby is reopened only through the
 	# explicit Invite Friend action below.
-	if _steam.has_method("setLobbyJoinable"):
+	if _steam_has_method("setLobbyJoinable"):
 		_steam.setLobbyJoinable(_lobby_id, false)
 
 	var lobby_type = _get_steam_const("LOBBY_TYPE_PUBLIC", LOBBY_TYPE_PUBLIC_FALLBACK) if enabled else _get_steam_const("LOBBY_TYPE_FRIENDS_ONLY", LOBBY_TYPE_FRIENDS_ONLY_FALLBACK)
-	if _steam.has_method("setLobbyType"):
+	if _steam_has_method("setLobbyType"):
 		_steam.setLobbyType(_lobby_id, lobby_type)
-	if _steam.has_method("setLobbyData"):
+	if _steam_has_method("setLobbyData"):
 		_steam.setLobbyData(_lobby_id, "visibility", "public" if enabled else "friends")
 
-	if enabled and _steam.has_method("setLobbyJoinable"):
+	if enabled and _steam_has_method("setLobbyJoinable"):
 		var joinable = _is_host_at_character_selection_for_lobby() or _is_in_official_coop_resume_scene()
 		_steam.setLobbyJoinable(_lobby_id, joinable)
 
@@ -749,11 +727,11 @@ func set_public_lobby_enabled(enabled: bool) -> void:
 func _prepare_friends_only_lobby_for_invite() -> void:
 	if _steam == null or _lobby_id == 0 or not _is_game_host():
 		return
-	if _steam.has_method("setLobbyType"):
+	if _steam_has_method("setLobbyType"):
 		_steam.setLobbyType(_lobby_id, _get_steam_const("LOBBY_TYPE_FRIENDS_ONLY", LOBBY_TYPE_FRIENDS_ONLY_FALLBACK))
-	if _steam.has_method("setLobbyData"):
+	if _steam_has_method("setLobbyData"):
 		_steam.setLobbyData(_lobby_id, "visibility", "friends")
-	if _steam.has_method("setLobbyJoinable"):
+	if _steam_has_method("setLobbyJoinable"):
 		var joinable = _is_host_at_character_selection_for_lobby() or _is_in_official_coop_resume_scene()
 		_steam.setLobbyJoinable(_lobby_id, joinable)
 
@@ -777,6 +755,31 @@ func are_online_run_slots_locked() -> bool:
 	return _online_run_slots_locked
 
 
+func _get_version_adapter():
+	var parent = get_parent()
+	if parent == null:
+		return null
+	return parent.get_node_or_null("BrotatoOnlineVersionAdapter")
+
+
+func _steam_has_method(method_name: String) -> bool:
+	if _steam == null:
+		return false
+	var adapter = _get_version_adapter()
+	if adapter != null and adapter.has_method("has_method_cached"):
+		return bool(adapter.has_method_cached(_steam, method_name))
+	return _steam.has_method(method_name)
+
+
+func _steam_has_signal(signal_name: String) -> bool:
+	if _steam == null:
+		return false
+	var adapter = _get_version_adapter()
+	if adapter != null and adapter.has_method("has_signal_cached"):
+		return bool(adapter.has_signal_cached(_steam, signal_name))
+	return _steam.has_signal(signal_name)
+
+
 func _setup_steam() -> void:
 	if Engine.has_singleton("Steam"):
 		_steam = Engine.get_singleton("Steam")
@@ -795,12 +798,12 @@ func _try_init_steam() -> void:
 	# Do not call Steam.loggedOn() here. Some Brotato/GodotSteam builds expose the
 	# method name but fail at runtime with "User class not found when calling loggedOn".
 	# steamInitEx/steamInit plus getSteamID() is enough for this mod stage.
-	if _steam.has_method("steamInitEx"):
+	if _steam_has_method("steamInitEx"):
 		var init_result = _steam.steamInitEx(BROTATO_APP_ID, true)
-	elif _steam.has_method("steamInit"):
+	elif _steam_has_method("steamInit"):
 		var init_result2 = _steam.steamInit()
 
-	if _steam.has_method("initRelayNetworkAccess"):
+	if _steam_has_method("initRelayNetworkAccess"):
 		_steam.initRelayNetworkAccess()
 
 
@@ -827,7 +830,7 @@ func _connect_steam_signals() -> void:
 
 
 func _connect_signal_if_exists(signal_name: String, method_name: String) -> void:
-	if not _steam.has_signal(signal_name):
+	if not _steam_has_signal(signal_name):
 		return
 
 	if _steam.is_connected(signal_name, self, method_name):
@@ -904,7 +907,7 @@ func _on_lobby_joined(lobby_id = 0, permissions = 0, locked = false, response = 
 	var join_succeeded = response_code == LOBBY_JOIN_SUCCESS_RESPONSE
 	# Compatibility with older GodotSteam builds that emitted only three signal
 	# arguments and therefore leave the optional response parameter at zero.
-	if response_code == 0 and int(lobby_id) != 0 and _steam != null and _steam.has_method("getLobbyOwner"):
+	if response_code == 0 and int(lobby_id) != 0 and _steam != null and _steam_has_method("getLobbyOwner"):
 		join_succeeded = int(_steam.getLobbyOwner(lobby_id)) != 0
 	if not join_succeeded or int(lobby_id) == 0:
 		_clear_pending_join_request()
@@ -990,32 +993,11 @@ func _poll_join_request_timeout() -> void:
 
 
 func _get_lobby_join_failure_text(response_code: int) -> String:
-	var zh = _get_ui_language_code() == "zh"
 	match response_code:
-		2:
-			return "大厅不存在或已经关闭。" if zh else "The lobby no longer exists or has been closed."
-		3:
-			return "无权加入该大厅。房主可能已经关闭公开。" if zh else "You are not allowed to join this lobby. The host may have disabled Public."
-		4:
-			return "大厅人数已满。" if zh else "The lobby is full."
-		5:
-			return "Steam 在加入大厅时发生错误。" if zh else "Steam reported an error while joining the lobby."
-		6:
-			return "你已被该大厅禁止加入。" if zh else "You are banned from this lobby."
-		7:
-			return "当前 Steam 账户无法加入该大厅。" if zh else "This Steam account is not allowed to join the lobby."
-		8:
-			return "该大厅当前不可加入。" if zh else "This lobby is currently unavailable."
-		9:
-			return "Steam 社区限制导致无法加入。" if zh else "A Steam Community restriction prevented joining."
-		10:
-			return "大厅中的玩家已屏蔽你。" if zh else "A player in the lobby has blocked you."
-		11:
-			return "你屏蔽了大厅中的玩家。" if zh else "You have blocked a player in the lobby."
-		15:
-			return "加入请求过于频繁，请稍后重试。" if zh else "Too many join attempts. Try again shortly."
+		2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15:
+			return _ui_text("join_response_" + str(response_code))
 		_:
-			return ("无法加入大厅（Steam 返回码：" + str(response_code) + "）。") if zh else ("Could not join the lobby (Steam response " + str(response_code) + ").")
+			return _ui_text("join_response_unknown") % response_code
 
 
 func _show_join_failure(message: String) -> void:
@@ -1119,19 +1101,19 @@ func _setup_lobby_data() -> void:
 
 	var public_lobby = _get_public_lobby_enabled()
 	var lobby_type = _get_steam_const("LOBBY_TYPE_PUBLIC", LOBBY_TYPE_PUBLIC_FALLBACK) if public_lobby else _get_steam_const("LOBBY_TYPE_FRIENDS_ONLY", LOBBY_TYPE_FRIENDS_ONLY_FALLBACK)
-	if _steam.has_method("setLobbyType"):
+	if _steam_has_method("setLobbyType"):
 		_steam.setLobbyType(_lobby_id, lobby_type)
-	if _steam.has_method("setLobbyJoinable"):
+	if _steam_has_method("setLobbyJoinable"):
 		_steam.setLobbyJoinable(_lobby_id, true)
 
-	if _steam.has_method("setLobbyData"):
+	if _steam_has_method("setLobbyData"):
 		var host_name = _self_steam_id
-		if _steam.has_method("getPersonaName"):
+		if _steam_has_method("getPersonaName"):
 			host_name = str(_steam.getPersonaName()).strip_edges()
 		if host_name.length() > 64:
 			host_name = host_name.substr(0, 64)
 		_steam.setLobbyData(_lobby_id, "mod", "six666-BrotatoOnline")
-		_steam.setLobbyData(_lobby_id, "mod_version", "1.1.0")
+		_steam.setLobbyData(_lobby_id, "mod_version", MOD_VERSION)
 		_steam.setLobbyData(_lobby_id, "game_version", "1.1.15.4")
 		_steam.setLobbyData(_lobby_id, "state", "character_selection")
 		_steam.setLobbyData(_lobby_id, "host", _self_steam_id)
@@ -1168,7 +1150,7 @@ func _set_rich_presence(key: String, value: String) -> void:
 	if _steam == null:
 		return
 
-	if _steam.has_method("setRichPresence"):
+	if _steam_has_method("setRichPresence"):
 		var ok = _steam.setRichPresence(key, value)
 	else:
 		pass
@@ -1202,7 +1184,7 @@ func _refresh_lobby_members(force_slot_sync: bool = false) -> void:
 
 	_update_lobby_owner_state()
 
-	if not _steam.has_method("getNumLobbyMembers") or not _steam.has_method("getLobbyMemberByIndex"):
+	if not _steam_has_method("getNumLobbyMembers") or not _steam_has_method("getLobbyMemberByIndex"):
 		return
 
 	var owner_id = _get_lobby_owner_id()
@@ -1211,7 +1193,7 @@ func _refresh_lobby_members(force_slot_sync: bool = false) -> void:
 	for i in range(count):
 		var member_id = str(_steam.getLobbyMemberByIndex(_lobby_id, i))
 		var member_name = member_id
-		if _steam.has_method("getFriendPersonaName"):
+		if _steam_has_method("getFriendPersonaName"):
 			member_name = str(_steam.getFriendPersonaName(int(member_id)))
 
 		_members.append({
@@ -1297,7 +1279,7 @@ func _is_current_lobby_remote_member(steam_id: String) -> bool:
 	for member in _members:
 		if str(member.get("steam_id", "")) == steam_id:
 			return true
-	if _steam.has_method("getNumLobbyMembers") and _steam.has_method("getLobbyMemberByIndex"):
+	if _steam_has_method("getNumLobbyMembers") and _steam_has_method("getLobbyMemberByIndex"):
 		var count = int(_steam.getNumLobbyMembers(_lobby_id))
 		for i in range(count):
 			if str(_steam.getLobbyMemberByIndex(_lobby_id, i)) == steam_id:
@@ -1383,14 +1365,14 @@ func _get_lobby_owner_id() -> String:
 	if _steam == null or _lobby_id == 0:
 		return ""
 
-	if _steam.has_method("getLobbyOwner"):
+	if _steam_has_method("getLobbyOwner"):
 		return str(_steam.getLobbyOwner(_lobby_id))
 
 	return ""
 
 
 func _update_self_steam_id() -> void:
-	if _steam != null and _steam.has_method("getSteamID"):
+	if _steam != null and _steam_has_method("getSteamID"):
 		_self_steam_id = str(_steam.getSteamID())
 
 
@@ -1418,9 +1400,9 @@ func _run_steam_callbacks() -> void:
 	if _steam == null:
 		return
 
-	if _steam.has_method("run_callbacks"):
+	if _steam_has_method("run_callbacks"):
 		_steam.run_callbacks()
-	elif _steam.has_method("runCallbacks"):
+	elif _steam_has_method("runCallbacks"):
 		_steam.runCallbacks()
 
 
@@ -1635,6 +1617,7 @@ func _bump_online_session_generation(reason: String = "") -> void:
 
 func _reset_transient_online_state_for_new_session(reason: String = "") -> void:
 	_bump_online_session_generation(reason)
+	_restore_client_retry_wave_setting_override()
 	_last_online_character_selection_restage_scene_id = 0
 	# Clear per-lobby runtime state before accepting a new lobby/session. Steam reliable P2P
 	# can deliver old packets after leaving/rejoining; caches from the previous room must not
@@ -1810,11 +1793,11 @@ func _get_message_lobby_id(message: Dictionary) -> String:
 
 
 func _is_known_online_message_type(msg_type: String) -> bool:
-	return msg_type == "hello" or msg_type == "request_selection_state" or msg_type == "menu_focus" or msg_type == "select_character" or msg_type == "select_weapon" or msg_type == "select_difficulty" or msg_type == "select_zone" or msg_type == "host_character_setup" or msg_type == "host_weapon_setup" or msg_type == "game_start_prepare" or msg_type == "game_start_time_ack" or msg_type == "client_game_scene_ready" or msg_type == "game_start_commit" or msg_type == "retry_wave_confirm" or msg_type == "retry_wave_state" or msg_type == "menu_scene_state" or msg_type == "run_page_action_sync" or msg_type == "quick_chat" or msg_type == "battle_reliable_events" or msg_type == "battle_snapshot" or msg_type == "battle_terminal_state" or msg_type == "selection_state" or msg_type == "battle_input" or msg_type == "damage_claim_batch" or msg_type == "player_hp_state" or msg_type == "player_state" or msg_type == "entity_kill_claim" or msg_type == "boss_damage_report" or msg_type == "pickup_claim" or msg_type == "battle_entity_resync_request" or msg_type == "upgrade_direct_action" or msg_type == "bo_mod_message"
+	return msg_type == "hello" or msg_type == "request_selection_state" or msg_type == "menu_focus" or msg_type == "select_character" or msg_type == "select_weapon" or msg_type == "select_difficulty" or msg_type == "select_zone" or msg_type == "host_character_setup" or msg_type == "host_weapon_setup" or msg_type == "game_start_prepare" or msg_type == "game_start_time_ack" or msg_type == "client_game_scene_ready" or msg_type == "game_start_commit" or msg_type == "retry_wave_confirm" or msg_type == "retry_wave_decline" or msg_type == "retry_wave_state" or msg_type == "retry_wave_end" or msg_type == "menu_scene_state" or msg_type == "run_page_action_sync" or msg_type == "quick_chat" or msg_type == "battle_reliable_events" or msg_type == "battle_snapshot" or msg_type == "battle_terminal_state" or msg_type == "selection_state" or msg_type == "battle_input" or msg_type == "damage_claim_batch" or msg_type == "player_hp_state" or msg_type == "player_state" or msg_type == "entity_kill_claim" or msg_type == "boss_damage_report" or msg_type == "pickup_claim" or msg_type == "battle_entity_resync_request" or msg_type == "upgrade_direct_action" or msg_type == "bo_mod_message"
 
 
 func _is_host_authoritative_message_type(msg_type: String) -> bool:
-	return msg_type == "host_character_setup" or msg_type == "host_weapon_setup" or msg_type == "game_start_prepare" or msg_type == "game_start_commit" or msg_type == "retry_wave_state" or msg_type == "menu_scene_state" or msg_type == "run_page_action_sync" or msg_type == "quick_chat" or msg_type == "battle_reliable_events" or msg_type == "battle_snapshot" or msg_type == "battle_terminal_state" or msg_type == "selection_state" or msg_type == "upgrade_direct_action"
+	return msg_type == "host_character_setup" or msg_type == "host_weapon_setup" or msg_type == "game_start_prepare" or msg_type == "game_start_commit" or msg_type == "retry_wave_state" or msg_type == "retry_wave_end" or msg_type == "menu_scene_state" or msg_type == "run_page_action_sync" or msg_type == "quick_chat" or msg_type == "battle_reliable_events" or msg_type == "battle_snapshot" or msg_type == "battle_terminal_state" or msg_type == "selection_state" or msg_type == "upgrade_direct_action"
 
 
 func _should_drop_p2p_message_for_session(from_steam_id: String, message: Dictionary) -> bool:
@@ -1831,6 +1814,12 @@ func _should_drop_p2p_message_for_session(from_steam_id: String, message: Dictio
 	if message_lobby_id != str(_lobby_id):
 		return true
 
+	# Client hello is sent only after Steam reports lobby_joined. The helper also
+	# queries Steam directly when the cached member list has not received its chat
+	# update yet, so normal joins are not rejected by a cache race.
+	if _is_game_host() and not _is_current_lobby_remote_member(from_steam_id):
+		return true
+
 	if not _is_game_host() and _is_host_authoritative_message_type(msg_type):
 		var host_id = _get_game_host_steam_id()
 		if host_id != "" and from_steam_id != host_id:
@@ -1840,7 +1829,7 @@ func _should_drop_p2p_message_for_session(from_steam_id: String, message: Dictio
 
 
 func _close_tracked_p2p_sessions() -> void:
-	if _steam == null or not _steam.has_method("closeSessionWithUser"):
+	if _steam == null or not _steam_has_method("closeSessionWithUser"):
 		return
 	var ids = []
 	for id_value in _accepted_p2p_sessions.keys():
@@ -1860,7 +1849,7 @@ func _close_tracked_p2p_sessions() -> void:
 func _drain_stale_p2p_packets() -> void:
 	if _steam == null or not _steam_ready:
 		return
-	if not _steam.has_method("receiveMessagesOnChannel"):
+	if not _steam_has_method("receiveMessagesOnChannel"):
 		return
 	for channel in [P2P_CHANNEL_MENU, P2P_CHANNEL_BATTLE]:
 		var _dropped = _receive_steam_messages_on_channel(channel, 128)
@@ -2031,7 +2020,7 @@ func _send_client_hello_to_host() -> void:
 		"role": "client",
 		"steam_id": _self_steam_id,
 		"mod": "six666-BrotatoOnline",
-		"mod_version": "1.1.0",
+		"mod_version": MOD_VERSION,
 		"content_capability": _build_client_content_capability_for_hello()
 	}, true)
 
@@ -2058,7 +2047,7 @@ func _poll_p2p_packets() -> void:
 	if _steam == null or not _steam_ready:
 		return
 
-	if not _steam.has_method("receiveMessagesOnChannel"):
+	if not _steam_has_method("receiveMessagesOnChannel"):
 		return
 
 	_poll_p2p_channel(P2P_CHANNEL_MENU, P2P_POLL_LIMIT_PER_FRAME)
@@ -2165,7 +2154,7 @@ func _handle_lobby_browser_ping_request(from_steam_id: String, message: Dictiona
 		return
 	_browser_ping_last_reply_msec_by_steam_id[from_steam_id] = now
 
-	if not _steam.has_method("sendMessageToUser"):
+	if not _steam_has_method("sendMessageToUser"):
 		return
 	_prepare_steam_messages_session_with_peer(from_steam_id, "lobby_browser_ping")
 	var response = {
@@ -2289,6 +2278,32 @@ func _get_host_setup_dedup_key(message: Dictionary) -> String:
 	return to_json(stable)
 
 
+func _host_setup_has_valid_local_slot(message: Dictionary) -> bool:
+	if _is_game_host():
+		return false
+	var target_client_steam_id = str(message.get("target_client_steam_id", message.get("client_steam_id", _self_steam_id)))
+	if target_client_steam_id == "":
+		target_client_steam_id = _self_steam_id
+	if _self_steam_id != "" and target_client_steam_id != "" and target_client_steam_id != _self_steam_id:
+		return false
+
+	var players = message.get("players", [])
+	if typeof(players) != TYPE_ARRAY or players.empty():
+		return false
+	var target_client_player_index = int(message.get("target_client_player_index", message.get("client_player_index", -1)))
+	var matched = 0
+	for player_data in players:
+		if typeof(player_data) != TYPE_DICTIONARY:
+			continue
+		var player_index = int(player_data.get("player_index", -1))
+		var steam_id = str(player_data.get("steam_id", ""))
+		if _self_steam_id != "" and steam_id == _self_steam_id:
+			matched += 1
+		elif steam_id == "" and target_client_player_index >= 0 and player_index == target_client_player_index:
+			matched += 1
+	return matched == 1
+
+
 func _should_ignore_duplicate_host_setup(from_steam_id: String, msg_type: String, message: Dictionary) -> bool:
 	if _is_game_host():
 		return false
@@ -2381,9 +2396,10 @@ func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 
 		menu_sync.receive_menu_message(from_steam_id, message)
 		if msg_type == "menu_focus":
-			# Focus changes are high-frequency UI deltas. They must not rebuild/resend
-			# host_character_setup, because that contains the full OnlineCatalog/DLC lock table.
-			_broadcast_selection_state(true)
+			# Focus changes can arrive every 50 ms. Do not immediately fan out a full
+			# four-player selection_state for every intermediate tile. The normal
+			# 250 ms selection poll broadcasts the latest authoritative focus, matching
+			# Host-local focus cadence and preventing reliable-packet/UI refresh storms.
 			return
 		_send_host_phase_messages_to_all(false)
 		_broadcast_selection_state(true)
@@ -2393,6 +2409,10 @@ func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 		if _is_game_host():
 			return
 		_stop_client_hello_retry("host_character_setup")
+		# Do not unlock a valid battle/shop mirror for an incomplete or misdirected
+		# setup packet. The next valid targeted setup/selection_state can recover it.
+		if not _host_setup_has_valid_local_slot(message):
+			return
 		if _should_ignore_duplicate_host_setup(from_steam_id, msg_type, message):
 			return
 		# A fresh character setup means Host has returned to mutable staging. Clear the
@@ -2412,6 +2432,8 @@ func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 		if _is_game_host():
 			return
 		_stop_client_hello_retry("host_weapon_setup")
+		if not _host_setup_has_valid_local_slot(message):
+			return
 		if _should_ignore_duplicate_host_setup(from_steam_id, msg_type, message):
 			return
 		_unlock_online_run_slots()
@@ -2451,9 +2473,19 @@ func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 			_handle_retry_wave_confirm_from_client(from_steam_id, message)
 		return
 
+	if msg_type == "retry_wave_decline":
+		if _is_game_host():
+			_handle_retry_wave_decline_from_client(from_steam_id, message)
+		return
+
 	if msg_type == "retry_wave_state":
 		if not _is_game_host():
 			_handle_retry_wave_state_from_host(message)
+		return
+
+	if msg_type == "retry_wave_end":
+		if not _is_game_host():
+			_handle_retry_wave_end_from_host(message)
 		return
 
 	if msg_type == "menu_scene_state":
@@ -2730,6 +2762,7 @@ func _clear_retry_wave_sync_state(reason: String = "") -> void:
 	_retry_wave_starting_context_key = ""
 	_retry_wave_last_started_context_key = ""
 	_retry_wave_host_context_key = ""
+	_retry_wave_ending_context_key = ""
 	if reason != "":
 		pass
 
@@ -2768,29 +2801,51 @@ func _poll_retry_wave_intercept() -> void:
 		_retry_wave_intercept_scene_id = 0
 		_retry_wave_intercept_node_id = 0
 		_retry_wave_intercept_button_id = 0
+		_retry_wave_intercept_cancel_button_id = 0
+		_retry_wave_intercept_ok_button_id = 0
 		return
 	var retry_wave = _get_retry_wave_node()
 	if not _is_live_node(retry_wave):
 		_retry_wave_intercept_node_id = 0
 		_retry_wave_intercept_button_id = 0
+		_retry_wave_intercept_cancel_button_id = 0
+		_retry_wave_intercept_ok_button_id = 0
 		return
+
 	var confirm_button = _get_retry_wave_confirm_button(retry_wave)
-	if not _is_live_node(confirm_button):
-		return
+	var cancel_button = _get_retry_wave_cancel_button(retry_wave)
+	var ok_button = _get_retry_wave_ok_button(retry_wave)
 	var scene = get_tree().current_scene
 	var scene_id = scene.get_instance_id() if _is_live_node(scene) else 0
 	var retry_id = retry_wave.get_instance_id()
-	var button_id = confirm_button.get_instance_id()
-	if scene_id == _retry_wave_intercept_scene_id and retry_id == _retry_wave_intercept_node_id and button_id == _retry_wave_intercept_button_id:
-		_poll_retry_wave_waiting_visual(retry_wave)
-		return
-	_retry_wave_intercept_scene_id = scene_id
-	_retry_wave_intercept_node_id = retry_id
-	_retry_wave_intercept_button_id = button_id
-	if confirm_button.is_connected("pressed", retry_wave, "_on_ConfirmButton_pressed"):
-		confirm_button.disconnect("pressed", retry_wave, "_on_ConfirmButton_pressed")
-	if not confirm_button.is_connected("pressed", self, "_on_online_retry_wave_confirm_pressed"):
-		confirm_button.connect("pressed", self, "_on_online_retry_wave_confirm_pressed")
+	var confirm_id = confirm_button.get_instance_id() if _is_live_node(confirm_button) else 0
+	var cancel_id = cancel_button.get_instance_id() if _is_live_node(cancel_button) else 0
+	var ok_id = ok_button.get_instance_id() if _is_live_node(ok_button) else 0
+	var same_nodes = scene_id == _retry_wave_intercept_scene_id and retry_id == _retry_wave_intercept_node_id and confirm_id == _retry_wave_intercept_button_id and cancel_id == _retry_wave_intercept_cancel_button_id and ok_id == _retry_wave_intercept_ok_button_id
+
+	if not same_nodes:
+		_retry_wave_intercept_scene_id = scene_id
+		_retry_wave_intercept_node_id = retry_id
+		_retry_wave_intercept_button_id = confirm_id
+		_retry_wave_intercept_cancel_button_id = cancel_id
+		_retry_wave_intercept_ok_button_id = ok_id
+		if _is_live_node(confirm_button):
+			if confirm_button.is_connected("pressed", retry_wave, "_on_ConfirmButton_pressed"):
+				confirm_button.disconnect("pressed", retry_wave, "_on_ConfirmButton_pressed")
+			if not confirm_button.is_connected("pressed", self, "_on_online_retry_wave_confirm_pressed"):
+				confirm_button.connect("pressed", self, "_on_online_retry_wave_confirm_pressed")
+		if _is_live_node(cancel_button):
+			if cancel_button.is_connected("pressed", retry_wave, "_on_CancelButton_pressed"):
+				cancel_button.disconnect("pressed", retry_wave, "_on_CancelButton_pressed")
+			if not cancel_button.is_connected("pressed", self, "_on_online_retry_wave_cancel_pressed"):
+				cancel_button.connect("pressed", self, "_on_online_retry_wave_cancel_pressed")
+		if _is_live_node(ok_button):
+			if ok_button.is_connected("pressed", retry_wave, "_on_CancelButton_pressed"):
+				ok_button.disconnect("pressed", retry_wave, "_on_CancelButton_pressed")
+			if not ok_button.is_connected("pressed", self, "_on_online_retry_wave_cancel_pressed"):
+				ok_button.connect("pressed", self, "_on_online_retry_wave_cancel_pressed")
+
+	_apply_retry_wave_policy_to_visible_node(retry_wave, bool(ProgressData.settings.retry_wave))
 	_poll_retry_wave_waiting_visual(retry_wave)
 
 
@@ -2829,8 +2884,176 @@ func _on_online_retry_wave_confirm_pressed() -> void:
 	send_menu_message_to_host(msg)
 
 
+func apply_host_retry_wave_setting(enabled: bool) -> void:
+	if _is_game_host():
+		return
+	if not _client_retry_wave_setting_override_active:
+		_client_retry_wave_setting_before_override = bool(ProgressData.settings.retry_wave)
+		_client_retry_wave_setting_override_active = true
+	ProgressData.settings.retry_wave = enabled
+	var retry_wave = _get_retry_wave_node()
+	if _is_live_node(retry_wave):
+		_apply_retry_wave_policy_to_visible_node(retry_wave, enabled)
+
+
+func _restore_client_retry_wave_setting_override() -> void:
+	if not _client_retry_wave_setting_override_active:
+		return
+	ProgressData.settings.retry_wave = _client_retry_wave_setting_before_override
+	_client_retry_wave_setting_override_active = false
+	_client_retry_wave_setting_before_override = false
+
+
+func _apply_retry_wave_policy_to_visible_node(retry_wave: Node, enabled: bool) -> void:
+	if not _is_live_node(retry_wave):
+		return
+	var retry_container = retry_wave.get_node_or_null("Menu/Retry_WaveContainer")
+	if not _is_live_node(retry_container):
+		retry_container = retry_wave.find_node("Retry_WaveContainer", true, false)
+	var ok_button = _get_retry_wave_ok_button(retry_wave)
+	var changed = false
+	if _is_live_node(retry_container) and retry_container is CanvasItem:
+		changed = changed or bool(retry_container.visible) != enabled
+		retry_container.visible = enabled
+	if _is_live_node(ok_button) and ok_button is CanvasItem:
+		changed = changed or bool(ok_button.visible) != (not enabled)
+		ok_button.visible = not enabled
+	if not changed or not _is_retry_wave_visible(retry_wave):
+		return
+	if enabled:
+		var confirm_button = _get_retry_wave_confirm_button(retry_wave)
+		if _is_live_node(confirm_button) and confirm_button is Control and not bool(confirm_button.get("disabled")):
+			confirm_button.call_deferred("grab_focus")
+	elif _is_live_node(ok_button) and ok_button is Control:
+		ok_button.call_deferred("grab_focus")
+
+
+func _on_online_retry_wave_cancel_pressed() -> void:
+	var retry_wave = _get_retry_wave_node()
+	if not _is_live_node(retry_wave):
+		return
+	if not _has_active_online_session():
+		_call_vanilla_retry_wave_cancel(retry_wave)
+		return
+	if not _is_retry_wave_visible(retry_wave):
+		return
+	var local_context_key = _get_retry_wave_network_context_key()
+	if local_context_key == "":
+		return
+	var context_key = local_context_key
+	if not _is_game_host():
+		context_key = _get_retry_wave_best_client_context_key(local_context_key)
+	_set_retry_wave_all_buttons_locked(retry_wave, true)
+	if _is_game_host():
+		_start_synced_retry_wave_end(context_key, "host_local_decline")
+		return
+	_retry_wave_ending_context_key = context_key
+	var msg = {
+		"msg_type": "retry_wave_decline",
+		"context_key": context_key,
+		"local_context_key": local_context_key,
+		"current_wave": int(RunData.current_wave),
+		"retries": int(RunData.retries),
+		"client_msec": OS.get_ticks_msec()
+	}
+	send_menu_message_to_host(msg)
+
+
+func _handle_retry_wave_decline_from_client(from_steam_id: String, message: Dictionary) -> void:
+	if not _is_game_host():
+		return
+	var retry_wave = _get_retry_wave_node()
+	if not _is_live_node(retry_wave) or not _is_retry_wave_visible(retry_wave):
+		return
+	_ensure_host_coop_slot_for_remote(from_steam_id)
+	var local_context_key = _get_retry_wave_network_context_key()
+	if local_context_key == "":
+		return
+	var client_context_key = str(message.get("context_key", ""))
+	var client_wave = int(message.get("current_wave", _get_retry_wave_context_wave(client_context_key)))
+	var client_retries = int(message.get("retries", RunData.retries))
+	if client_wave != int(RunData.current_wave) or client_retries != int(RunData.retries):
+		return
+	_start_synced_retry_wave_end(local_context_key, "client_decline:" + from_steam_id)
+
+
+func _start_synced_retry_wave_end(context_key: String, reason: String = "") -> void:
+	if not _is_game_host() or context_key == "":
+		return
+	if _retry_wave_ending_context_key == context_key:
+		return
+
+	# A decline wins while the retry restart is still in its prepare/ack phase. Once
+	# RunData has already been reset for the retry commit, returning to EndRun would
+	# display corrupted/empty run results, so a packet arriving that late is ignored.
+	if not _pending_host_game_start.empty() and str(_pending_host_game_start.get("start_kind", "")) == "retry_wave":
+		if bool(_pending_host_game_start.get("retry_run_data_reset_done", false)):
+			return
+		_pending_host_game_start = {}
+		_host_game_start_ack_by_steam_id.clear()
+		_host_game_start_ready_by_steam_id.clear()
+		_retry_wave_starting_context_key = ""
+
+	_retry_wave_ending_context_key = context_key
+
+	var msg = {
+		"msg_type": "retry_wave_end",
+		"context_key": context_key,
+		"current_wave": int(RunData.current_wave),
+		"retries": int(RunData.retries),
+		"reason": reason
+	}
+	for id_value in _get_retry_wave_expected_ids():
+		var steam_id = str(id_value)
+		if steam_id == "" or steam_id == _self_steam_id:
+			continue
+		_send_p2p_json(steam_id, msg, true)
+	call_deferred("_apply_synced_retry_wave_end", context_key)
+
+
+func _handle_retry_wave_end_from_host(message: Dictionary) -> void:
+	if _is_game_host():
+		return
+	var retry_wave = _get_retry_wave_node()
+	if not _is_live_node(retry_wave) or not _is_retry_wave_visible(retry_wave):
+		return
+	var context_key = str(message.get("context_key", ""))
+	if context_key == "":
+		return
+	var host_wave = int(message.get("current_wave", _get_retry_wave_context_wave(context_key)))
+	var host_retries = int(message.get("retries", RunData.retries))
+	if host_wave != int(RunData.current_wave) or host_retries != int(RunData.retries):
+		return
+	_retry_wave_ending_context_key = context_key
+	call_deferred("_apply_synced_retry_wave_end", context_key)
+
+
+func _apply_synced_retry_wave_end(context_key: String) -> void:
+	if context_key == "":
+		return
+	var retry_wave = _get_retry_wave_node()
+	if not _is_live_node(retry_wave) or not _is_retry_wave_visible(retry_wave):
+		return
+	_reset_game_start_sync_state()
+	var menu_sync = _get_menu_sync_manager()
+	if menu_sync != null and menu_sync.has_method("_end_game_start_guard"):
+		menu_sync._end_game_start_guard("retry_wave_declined")
+	_set_retry_wave_all_buttons_locked(retry_wave, true)
+	_call_vanilla_retry_wave_cancel(retry_wave)
+
+
+func _set_retry_wave_all_buttons_locked(retry_wave: Node, locked: bool) -> void:
+	for button in [_get_retry_wave_confirm_button(retry_wave), _get_retry_wave_cancel_button(retry_wave), _get_retry_wave_ok_button(retry_wave)]:
+		if not _is_live_node(button):
+			continue
+		button.set("disabled", locked)
+
+
 func _handle_retry_wave_confirm_from_client(from_steam_id: String, message: Dictionary) -> void:
 	if not _is_game_host():
+		return
+	var retry_wave = _get_retry_wave_node()
+	if not _is_live_node(retry_wave) or not _is_retry_wave_visible(retry_wave):
 		return
 	_ensure_host_coop_slot_for_remote(from_steam_id)
 	var client_context_key = str(message.get("context_key", ""))
@@ -2838,8 +3061,9 @@ func _handle_retry_wave_confirm_from_client(from_steam_id: String, message: Dict
 	if local_context_key == "":
 		return
 	var client_wave = int(message.get("current_wave", _get_retry_wave_context_wave(client_context_key)))
+	var client_retries = int(message.get("retries", RunData.retries))
 	var host_wave = int(RunData.current_wave)
-	if client_wave != host_wave:
+	if client_wave != host_wave or client_retries != int(RunData.retries):
 		return
 	if client_context_key != local_context_key:
 		pass
@@ -2849,6 +3073,8 @@ func _handle_retry_wave_confirm_from_client(from_steam_id: String, message: Dict
 
 
 func _handle_retry_wave_state_from_host(message: Dictionary) -> void:
+	if message.has("retry_wave_enabled"):
+		apply_host_retry_wave_setting(bool(message.get("retry_wave_enabled", false)))
 	var context_key = str(message.get("context_key", ""))
 	if context_key == "":
 		return
@@ -2863,6 +3089,9 @@ func _handle_retry_wave_state_from_host(message: Dictionary) -> void:
 	var ready_count = int(message.get("ready_count", 0))
 	var total_count = int(message.get("total_count", max(1, RunData.get_player_count())))
 	var starting = bool(message.get("starting", false))
+	if _retry_wave_contexts_exact(_retry_wave_ending_context_key, context_key):
+		_set_retry_wave_all_buttons_locked(retry_wave, true)
+		return
 	if self_ready or starting:
 		_set_retry_wave_confirm_locked(retry_wave, true)
 	else:
@@ -3015,7 +3244,8 @@ func _broadcast_retry_wave_state(force: bool = false) -> void:
 		"ready_count": _get_retry_wave_ready_count(),
 		"total_count": expected_ids.size(),
 		"ready_ids": ready_ids,
-		"starting": not _pending_host_game_start.empty() and str(_pending_host_game_start.get("start_kind", "")) == "retry_wave"
+		"starting": not _pending_host_game_start.empty() and str(_pending_host_game_start.get("start_kind", "")) == "retry_wave",
+		"retry_wave_enabled": bool(ProgressData.settings.retry_wave)
 	}
 	for id_value in expected_ids:
 		var steam_id = str(id_value)
@@ -3030,13 +3260,19 @@ func _poll_retry_wave_waiting_visual(retry_wave: Node) -> void:
 	var context_key = _get_retry_wave_network_context_key()
 	if context_key == "":
 		return
+	if not bool(ProgressData.settings.retry_wave):
+		if _is_game_host():
+			_broadcast_retry_wave_state(false)
+		return
 	if _is_game_host():
 		if _retry_wave_ready_context_key == context_key:
 			_update_retry_wave_waiting_visual(retry_wave, _retry_wave_ready_by_steam_id.has(_get_retry_wave_self_id()), _get_retry_wave_ready_count(), _get_retry_wave_expected_ids().size())
-			_broadcast_retry_wave_state(false)
 		else:
 			_set_retry_wave_confirm_locked(retry_wave, false)
 			_ensure_retry_wave_confirm_focus(retry_wave)
+		# Also carries the Host-authoritative retry_wave_enabled setting. Broadcasting
+		# while the prompt is open repairs any client that missed the earlier run config.
+		_broadcast_retry_wave_state(false)
 	else:
 		if _retry_wave_contexts_exact(_retry_wave_local_waiting_context_key, context_key) or _retry_wave_contexts_exact(_retry_wave_local_waiting_context_key, _retry_wave_host_context_key):
 			_set_retry_wave_confirm_locked(retry_wave, true)
@@ -3067,6 +3303,12 @@ func _set_retry_wave_confirm_locked(retry_wave: Node, locked: bool) -> void:
 	if not _is_live_node(button):
 		return
 	button.set("disabled", locked)
+	var cancel_button = _get_retry_wave_cancel_button(retry_wave)
+	if _is_live_node(cancel_button):
+		# Once this player has confirmed retry, keep the whole local choice fixed.
+		# Another player can still decline and make the Host end the run for everyone,
+		# but this prevents a late local reversal racing the retry commit.
+		cancel_button.set("disabled", locked)
 	if locked:
 		retry_wave.set("confirm_button_pressed", true)
 	else:
@@ -3109,6 +3351,11 @@ func _call_vanilla_retry_wave_confirm(retry_wave: Node) -> void:
 		retry_wave._on_ConfirmButton_pressed()
 
 
+func _call_vanilla_retry_wave_cancel(retry_wave: Node) -> void:
+	if _is_live_node(retry_wave) and retry_wave.has_method("_on_CancelButton_pressed"):
+		retry_wave._on_CancelButton_pressed()
+
+
 func _get_retry_wave_node() -> Node:
 	var scene = get_tree().current_scene
 	if not _is_live_node(scene):
@@ -3126,6 +3373,24 @@ func _get_retry_wave_confirm_button(retry_wave: Node) -> Node:
 	if _is_live_node(button):
 		return button
 	return retry_wave.find_node("ConfirmButton", true, false)
+
+
+func _get_retry_wave_cancel_button(retry_wave: Node) -> Node:
+	if not _is_live_node(retry_wave):
+		return null
+	var button = retry_wave.get_node_or_null("Menu/Retry_WaveContainer/CancelButton")
+	if _is_live_node(button):
+		return button
+	return retry_wave.find_node("CancelButton", true, false)
+
+
+func _get_retry_wave_ok_button(retry_wave: Node) -> Node:
+	if not _is_live_node(retry_wave):
+		return null
+	var button = retry_wave.get_node_or_null("Menu/OkButton")
+	if _is_live_node(button):
+		return button
+	return retry_wave.find_node("OkButton", true, false)
 
 
 func _is_retry_wave_visible(retry_wave: Node) -> bool:
@@ -3655,6 +3920,7 @@ func _build_game_start_run_config(difficulty_value: int, generate_difficulty_sch
 	run_config["is_coop_run"] = bool(RunData.is_coop_run)
 	run_config["is_endless_run"] = bool(RunData.is_endless_run)
 	run_config["endless_mode_toggled"] = bool(ProgressData.settings.endless_mode_toggled)
+	run_config["retry_wave_enabled"] = bool(ProgressData.settings.retry_wave)
 	_augment_run_config_with_host_zone(run_config)
 	if generate_difficulty_schedule:
 		_generate_host_difficulty_wave_schedule_into_run_config(run_config, difficulty_value)
@@ -4701,7 +4967,6 @@ func _maybe_log_battle_snapshot_tx(target_steam_id: String, snapshot: Dictionary
 	var now = OS.get_ticks_msec()
 	var compact = _safe_bool(snapshot.get("compact", false))
 	var entity_count = _safe_array_size(snapshot.get("e", [])) if compact else _safe_array_size(snapshot.get("entities", []))
-	var birth_count = _safe_array_size(snapshot.get("b", [])) if compact else _safe_array_size(snapshot.get("births", []))
 	var event_count = _safe_array_size(snapshot.get("events", []))
 	var player_count = _safe_array_size(snapshot.get("p", [])) if compact else _safe_array_size(snapshot.get("players", []))
 	if ok and now - _last_battle_snapshot_tx_log_msec < 5000:
@@ -4712,14 +4977,14 @@ func _maybe_log_battle_snapshot_tx(target_steam_id: String, snapshot: Dictionary
 
 func _make_battle_reliable_events_message(snapshot: Dictionary, pending_reliable: Dictionary) -> Dictionary:
 	var reliable_entities = []
-	var births = pending_reliable.get("entities", snapshot.get("reliable_birth_entities", []))
+	var births = pending_reliable.get("entities", [])
 	if typeof(births) == TYPE_ARRAY:
 		for entity in births:
 			if typeof(entity) == TYPE_DICTIONARY:
 				reliable_entities.append(_make_wire_entity_state(entity, false))
 
 	var reliable_birth_markers = []
-	var birth_markers = pending_reliable.get("births", snapshot.get("reliable_birth_markers", []))
+	var birth_markers = pending_reliable.get("births", [])
 	if typeof(birth_markers) == TYPE_ARRAY:
 		for birth in birth_markers:
 			if typeof(birth) == TYPE_DICTIONARY:
@@ -4999,11 +5264,8 @@ func _expand_compact_battle_snapshot(message: Dictionary) -> Dictionary:
 		"server_time_msec": server_time_msec,
 		"player_count": int(message.get("pc", 0)),
 		"players": [],
-		"enemies": [],
 		"entities": [],
-		"births": [],
 		"wave_timer_state": {},
-		"pickups": [],
 		"economy_state": {},
 		"progression_state": message.get("pr", {}),
 		"events": [],
@@ -5149,7 +5411,7 @@ func _handle_battle_snapshot_from_host(message: Dictionary) -> void:
 		var ghost_layer = _get_battle_ghost_layer()
 		if ghost_layer != null and ghost_layer.has_method("receive_battle_snapshot_from_host"):
 			ghost_layer.receive_battle_snapshot_from_host(expanded)
-	_bo_net_diag_cost("apply_battle_snapshot", t_apply, "tick=" + str(tick) + " players=" + str(_safe_array_size(expanded.get("players", []))) + " entities=" + str(_safe_array_size(expanded.get("entities", []))) + " births=" + str(_safe_array_size(expanded.get("births", []))) + " removed=" + str(_safe_array_size(expanded.get("removed", []))))
+	_bo_net_diag_cost("apply_battle_snapshot", t_apply, "tick=" + str(tick) + " players=" + str(_safe_array_size(expanded.get("players", []))) + " entities=" + str(_safe_array_size(expanded.get("entities", []))) + " removed=" + str(_safe_array_size(expanded.get("removed", []))))
 
 	var should_log = _client_battle_snapshot_rx_count <= CLIENT_BATTLE_SNAPSHOT_LOG_FIRST_COUNT
 	if now - _last_client_battle_snapshot_rx_log_msec >= CLIENT_BATTLE_SNAPSHOT_LOG_INTERVAL_MSEC:
@@ -5160,9 +5422,7 @@ func _handle_battle_snapshot_from_host(message: Dictionary) -> void:
 
 	_last_client_battle_snapshot_rx_log_msec = now
 	var players = expanded.get("players", [])
-	var enemies = expanded.get("enemies", [])
 	var entities = expanded.get("entities", [])
-	var births = expanded.get("births", [])
 	var removed = expanded.get("removed", [])
 	var events = expanded.get("events", [])
 	var progression = expanded.get("progression_state", {})
@@ -5692,7 +5952,7 @@ func _prepare_steam_messages_session_with_peer(steam_id: String, reason: String 
 		return
 	if _accepted_p2p_sessions.has(steam_id):
 		return
-	if not _steam.has_method("acceptSessionWithUser"):
+	if not _steam_has_method("acceptSessionWithUser"):
 		return
 	var ok = _steam.acceptSessionWithUser(int(steam_id))
 	_accepted_p2p_sessions[steam_id] = ok
@@ -5702,9 +5962,9 @@ func _reset_steam_messages_session_with_peer(steam_id: String, reason: String = 
 	if _steam == null or steam_id == "" or steam_id == "0" or steam_id == _self_steam_id:
 		return
 	_accepted_p2p_sessions.erase(steam_id)
-	if _steam.has_method("closeSessionWithUser"):
+	if _steam_has_method("closeSessionWithUser"):
 		var closed = _steam.closeSessionWithUser(int(steam_id))
-	if _steam.has_method("acceptSessionWithUser"):
+	if _steam_has_method("acceptSessionWithUser"):
 		var ok = _steam.acceptSessionWithUser(int(steam_id))
 		_accepted_p2p_sessions[steam_id] = ok
 
@@ -5716,7 +5976,7 @@ func _send_p2p_json(target_steam_id: String, message: Dictionary, reliable: bool
 	if target_steam_id == "" or target_steam_id == "0":
 		return false
 
-	if not _steam.has_method("sendMessageToUser"):
+	if not _steam_has_method("sendMessageToUser"):
 		return false
 
 	_prepare_steam_messages_session_with_peer(target_steam_id, "send")
@@ -5880,7 +6140,7 @@ func _poll_pending_p2p_chunk_sends() -> void:
 	if _pending_p2p_chunk_sends.empty():
 		return
 	var poll_start_usec = OS.get_ticks_usec()
-	if _steam == null or not _steam_ready or not _steam.has_method("sendMessageToUser"):
+	if _steam == null or not _steam_ready or not _steam_has_method("sendMessageToUser"):
 		return
 	var now = OS.get_ticks_msec()
 	var sent = 0
@@ -6118,7 +6378,7 @@ func _get_p2p_channel_for_message_type(msg_type: String) -> int:
 
 func _on_network_messages_session_request(remote_steam_id = 0) -> void:
 	var steam_id = _extract_steam_id_value(remote_steam_id)
-	if _steam != null and _steam.has_method("acceptSessionWithUser") and steam_id != "" and steam_id != "0":
+	if _steam != null and _steam_has_method("acceptSessionWithUser") and steam_id != "" and steam_id != "0":
 		var ok = _steam.acceptSessionWithUser(int(steam_id))
 		_accepted_p2p_sessions[steam_id] = ok
 
@@ -6176,6 +6436,84 @@ func _resend_host_phase_after_session_recovery(steam_id: String) -> void:
 	_send_selection_state_to_client(steam_id, true)
 
 
+func _poll_end_run_intercept() -> void:
+	if not _has_active_online_session() or not _is_in_end_run_scene():
+		_end_run_intercept_scene_id = 0
+		_end_run_intercept_restart_button_id = 0
+		_end_run_intercept_new_run_button_id = 0
+		_end_run_intercept_exit_button_id = 0
+		return
+	var scene = get_tree().current_scene
+	if not _is_live_node(scene):
+		return
+	var restart_button = _get_end_run_button(scene, "RestartButton")
+	var new_run_button = _get_end_run_button(scene, "NewRunButton")
+	var exit_button = _get_end_run_button(scene, "ExitButton")
+	var scene_id = scene.get_instance_id()
+	var restart_id = restart_button.get_instance_id() if _is_live_node(restart_button) else 0
+	var new_run_id = new_run_button.get_instance_id() if _is_live_node(new_run_button) else 0
+	var exit_id = exit_button.get_instance_id() if _is_live_node(exit_button) else 0
+	var changed = scene_id != _end_run_intercept_scene_id or restart_id != _end_run_intercept_restart_button_id or new_run_id != _end_run_intercept_new_run_button_id or exit_id != _end_run_intercept_exit_button_id
+	if changed:
+		_end_run_intercept_scene_id = scene_id
+		_end_run_intercept_restart_button_id = restart_id
+		_end_run_intercept_new_run_button_id = new_run_id
+		_end_run_intercept_exit_button_id = exit_id
+
+	# Restart repeats the same build without the synchronized character-selection
+	# handshake, so it is intentionally unavailable online. Host gets New Run and
+	# Return to Lobby; clients only get Return to Lobby.
+	if _is_live_node(restart_button):
+		restart_button.set("disabled", true)
+		if restart_button is CanvasItem:
+			restart_button.visible = false
+		if restart_button is Control:
+			restart_button.focus_mode = Control.FOCUS_NONE
+
+	if _is_live_node(new_run_button):
+		var host_can_start_new_run = _is_game_host()
+		new_run_button.set("disabled", not host_can_start_new_run)
+		if new_run_button is CanvasItem:
+			new_run_button.visible = host_can_start_new_run
+		if new_run_button is Control:
+			new_run_button.focus_mode = Control.FOCUS_ALL if host_can_start_new_run else Control.FOCUS_NONE
+
+	if _is_live_node(exit_button):
+		_disable_custom_button_auto_translation(exit_button)
+		exit_button.text = _ui_text("return_to_lobby")
+		exit_button.set("disabled", false)
+		if exit_button is CanvasItem:
+			exit_button.visible = true
+		if exit_button is Control:
+			exit_button.focus_mode = Control.FOCUS_ALL
+		if exit_button.is_connected("pressed", scene, "_on_ExitButton_pressed"):
+			exit_button.disconnect("pressed", scene, "_on_ExitButton_pressed")
+		if not exit_button.is_connected("pressed", self, "_on_online_end_run_exit_pressed"):
+			exit_button.connect("pressed", self, "_on_online_end_run_exit_pressed")
+
+	if changed and not _is_game_host() and _is_live_node(exit_button) and exit_button is Control:
+		exit_button.call_deferred("grab_focus")
+
+
+func _get_end_run_button(scene: Node, button_name: String) -> Node:
+	if not _is_live_node(scene):
+		return null
+	var button = scene.find_node(button_name, true, false)
+	return button if _is_live_node(button) else null
+
+
+func _on_online_end_run_exit_pressed() -> void:
+	var scene = get_tree().current_scene
+	if not _is_live_node(scene) or not _is_in_end_run_scene():
+		return
+	leave_lobby()
+	if _is_live_node(scene) and scene.has_method("_on_ExitButton_pressed"):
+		scene._on_ExitButton_pressed()
+		return
+	RunData.reset()
+	get_tree().change_scene(MenuData.title_screen_scene)
+
+
 func _poll_online_flow_lifecycle() -> void:
 	if _lobby_id == 0 or not _online_flow_started:
 		return
@@ -6187,6 +6525,12 @@ func _poll_online_flow_lifecycle() -> void:
 	var screen = str(menu_sync.get_current_menu_screen())
 	if _is_in_active_online_run_scene():
 		_lock_online_run_slots("active_run_scene")
+		_online_flow_left_since_msec = 0
+		return
+
+	if _is_in_end_run_scene():
+		# Results are still part of the online session. Keep the lobby alive so the Host
+		# can start a new run and restage all connected clients to character selection.
 		_online_flow_left_since_msec = 0
 		return
 
@@ -6316,7 +6660,7 @@ func _get_game_host_steam_id() -> String:
 
 
 func _read_lobby_game_host_steam_id() -> String:
-	if _steam == null or _lobby_id == 0 or not _steam.has_method("getLobbyData"):
+	if _steam == null or _lobby_id == 0 or not _steam_has_method("getLobbyData"):
 		return ""
 	var value = str(_steam.getLobbyData(_lobby_id, "host"))
 	if value == "0":
@@ -6416,6 +6760,17 @@ func _is_in_active_online_run_scene() -> bool:
 	return _is_in_game_scene() or (_is_in_shop_scene() and not _is_in_official_coop_resume_scene())
 
 
+func _is_in_end_run_scene() -> bool:
+	var current = get_tree().current_scene
+	if current == null:
+		return false
+	var filename = str(current.filename).to_lower()
+	var node_name = str(current.name).to_lower()
+	if filename.find("end_run") != -1 or filename.find("endrun") != -1:
+		return true
+	return node_name.find("endrun") != -1 or node_name.find("end_run") != -1
+
+
 func _is_scene_definitely_outside_online_run() -> bool:
 	var current = get_tree().current_scene
 	if current == null:
@@ -6506,7 +6861,9 @@ func _update_joining_overlay_state() -> void:
 
 
 func _should_show_joining_overlay() -> bool:
-	if _is_in_game_scene():
+	if _is_in_game_scene() or _is_in_end_run_scene():
+		# EndRun is a valid connected phase. Never cover its result controls with the
+		# join/reconnect blocker, even if a stale hello-retry timer is still active.
 		return false
 
 	# Host path: main-menu 好友联机 just changed to character-selection and is still
@@ -6546,6 +6903,8 @@ func _is_client_in_usable_online_scene() -> bool:
 	if filename.find("coop_resume") != -1 or node_name.find("coopresume") != -1 or node_name.find("coop_resume") != -1:
 		return true
 	if filename.find("shop") != -1 or node_name.find("shop") != -1:
+		return true
+	if _is_in_end_run_scene():
 		return true
 	return false
 
@@ -6678,34 +7037,33 @@ func _should_show_character_lobby_status_label() -> bool:
 
 
 func _get_lobby_status_text() -> String:
-	var zh = _get_ui_language_code() == "zh"
 	var creating = _lobby_toggle_pending_create and not _lobby_toggle_close_after_create
 	if creating and _lobby_id == 0:
-		return "正在创建 Steam 大厅…" if zh else "Creating Steam lobby..."
+		return _ui_text("status_creating_steam")
 
 	if _main_menu_online_start_pending and _lobby_id == 0:
-		return "正在准备联机大厅…" if zh else "Preparing online lobby..."
+		return _ui_text("status_preparing")
 
 	if _lobby_toggle_pending_create and _lobby_toggle_close_after_create:
-		return "大厅创建后将关闭" if zh else "Lobby will close after creation"
+		return _ui_text("status_close_after_creation")
 
 	if _lobby_id != 0:
 		var count = _members.size()
 		if count <= 0:
 			count = 1
-		var text = ("大厅已开启，可邀请好友加入 %d/%d" % [count, MAX_LOBBY_MEMBERS]) if zh else ("Lobby open, invite friends %d/%d" % [count, MAX_LOBBY_MEMBERS])
+		var text = _ui_text("status_open") % [count, MAX_LOBBY_MEMBERS]
 		if not _get_auto_join_host_player_enabled():
-			text += "\n自动 1 号位已关闭：房主必须先选完输入设备，其他人再进" if zh else "\nAuto Player 1 is off: host must choose an input device first, then others may join"
+			text += "\n" + _ui_text("status_auto_player_one_off")
 		return text
 
 	if _last_lobby_create_failed_result != 0:
 		if _last_lobby_create_failed_result == -1:
-			return "大厅创建失败：Steam 未就绪" if zh else "Failed to create lobby: Steam is not ready"
+			return _ui_text("status_failed_steam_not_ready")
 		if _last_lobby_create_failed_result == -2:
-			return "大厅创建失败：当前 Steam 接口不支持" if zh else "Failed to create lobby: Steam API unavailable"
-		return ("大厅创建失败，错误码 %d" % _last_lobby_create_failed_result) if zh else ("Failed to create lobby, code %d" % _last_lobby_create_failed_result)
+			return _ui_text("status_failed_api_unavailable")
+		return _ui_text("status_failed_code") % _last_lobby_create_failed_result
 
-	return "未开启大厅" if zh else "Lobby closed"
+	return _ui_text("status_closed")
 
 
 func _setup_lobby_status_label(label: Label, visual_source: Control = null) -> void:

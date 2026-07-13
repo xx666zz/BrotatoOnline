@@ -944,7 +944,6 @@ func _apply_latest_snapshot_if_needed() -> void:
 			_append_entity_sample(net_id, server_time_msec, pos, vel)
 
 	_apply_remote_player_states(snapshot, server_time_msec)
-	_apply_birth_markers(snapshot)
 	_apply_host_wave_timer_state(snapshot)
 	_apply_pickups(snapshot)
 	_apply_host_economy_state(snapshot)
@@ -2112,43 +2111,6 @@ func _clear_birth_markers(reason: String) -> void:
 	_birth_markers.clear()
 	_birth_marker_states.clear()
 
-
-func _apply_birth_markers(snapshot: Dictionary) -> void:
-	if not ENABLE_BIRTH_MARKERS:
-		_clear_birth_markers("disabled")
-		return
-	if not _snapshot_allows_birth_markers(snapshot):
-		_clear_birth_markers("host_battle_inactive")
-		return
-	# New packets do not repeat active birth markers in every battle_snapshot.
-	# Birth warnings are delivered once through battle_reliable_events and then
-	# advanced locally until their predicted spawn time. For compatibility with
-	# older hosts, still accept snapshot.births when it is actually populated.
-	var births = snapshot.get("births", [])
-	if typeof(births) != TYPE_ARRAY or births.empty():
-		return
-	var active = {}
-	for birth in births:
-		if typeof(birth) != TYPE_DICTIONARY:
-			continue
-		var id = str(birth.get("net_id", ""))
-		if id == "":
-			continue
-		active[id] = true
-		var state_copy = birth.duplicate(true)
-		state_copy["snapshot_server_time_msec"] = _get_snapshot_server_time_msec(snapshot, OS.get_ticks_msec())
-		_birth_marker_states[id] = state_copy
-		var marker = _get_or_create_birth_marker(id, state_copy)
-		if _is_valid_node(marker):
-			_sync_birth_marker_runtime(marker, state_copy)
-			marker.set_meta("brotato_online_birth_state", state_copy)
-	var to_remove = []
-	for id_value in _birth_markers.keys():
-		var id2 = str(id_value)
-		if not active.has(id2):
-			to_remove.append(id2)
-	for id3 in to_remove:
-		_remove_birth_marker(id3)
 
 func _apply_reliable_birth_marker_state(birth_state: Dictionary, server_time_msec: int) -> void:
 	if not ENABLE_BIRTH_MARKERS:

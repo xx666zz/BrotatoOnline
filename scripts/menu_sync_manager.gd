@@ -20,6 +20,13 @@ const ENDLESS_INCREMENTAL_ITEMS_ONLY_START_WAVE = 21
 const SHOP_ITEMS_RESYNC_REQUEST_COOLDOWN_MSEC = 1500
 const SHOP_CUSTOM_POPUP_BUTTON_ACTION = "shop_custom_popup_button"
 
+# ItemService.TierData indexes. The enum is internal to ItemService, so mirror only
+# the stable fields required to validate its unlocked pools before opening a shop.
+const ITEM_SERVICE_TIER_ITEMS = 1
+const ITEM_SERVICE_TIER_WEAPONS = 2
+const ITEM_SERVICE_TIER_CONSUMABLES = 3
+const ITEM_SERVICE_TIER_UPGRADES = 4
+
 const BO_UI_DIAG_ENABLED = true
 # Lag log policy: routine polls / focus / screen changes are silent.  Only a single
 # expensive call, repeated medium-cost calls, input storms, or backlog states are logged.
@@ -57,6 +64,12 @@ var _last_state_key = ""
 var _last_state_poll_msec = 0
 var _last_state_from_host = {}
 var _pending_state_from_host = {}
+# selection_state packets contain every player even when only one focus changed.
+# Cache the last applied component per player so clients do not rescan inventories
+# and rebuild all four detail panels for each remote cursor step.
+var _selection_apply_context_key = ""
+var _last_applied_selection_focus_key_by_player = {}
+var _last_applied_selection_selected_key_by_player = {}
 var _last_menu_scene_state_from_host = {}
 var _pending_menu_scene_state_from_host = {}
 var _last_client_scene_apply_key = ""
@@ -469,6 +482,9 @@ func reset_online_session_state(reason: String = "") -> void:
 	_last_state_key = ""
 	_last_state_from_host = {}
 	_pending_state_from_host = {}
+	_selection_apply_context_key = ""
+	_last_applied_selection_focus_key_by_player.clear()
+	_last_applied_selection_selected_key_by_player.clear()
 	_last_menu_scene_state_from_host = {}
 	_pending_menu_scene_state_from_host = {}
 	_last_client_scene_apply_key = ""
@@ -878,7 +894,8 @@ func receive_run_page_action_sync(from_steam_id: String, message: Dictionary, se
 
 		var ui = _find_progression_ui(true)
 		var host_state = _build_progression_visible_option(player_index, ui)
-		var all_states = _build_all_progression_visible_options(ui)
+		_attach_progression_marker_state(host_state, player_index, ui)
+		var all_states = _build_all_progression_visible_options(ui, true)
 		if not host_state.empty():
 			_last_local_run_page_state_key_by_player[player_index] = str(player_index) + ":" + to_json(host_state)
 			if not all_states.empty():
@@ -6209,6 +6226,9 @@ func _queue_progression_state_if_changed(player_index: int, ui: Node = null) -> 
 	var mode = str(visible.get("mode", "none"))
 	if mode == "none":
 		return
+	# Marker state belongs to the progression page only. Keep it out of focus packets,
+	# but include it in the first option state and every later authoritative state change.
+	_attach_progression_marker_state(visible, player_index, ui)
 	var key = str(player_index) + ":" + to_json(visible)
 	if str(_last_local_run_page_state_key_by_player.get(player_index, "")) == key:
 		return
@@ -6221,7 +6241,7 @@ func _queue_progression_state_if_changed(player_index: int, ui: Node = null) -> 
 		"state_after": visible,
 		"host_state_after": visible
 	}
-	var all_states = _build_all_progression_visible_options(ui)
+	var all_states = _build_all_progression_visible_options(ui, true)
 	if not all_states.empty():
 		msg["host_states_after"] = all_states
 	_queue_local_run_page_action(msg)
@@ -6547,6 +6567,103 @@ func _client_reduce_local_progression_marker(player_index: int, marker_type: Str
 		_rebuild_consumable_marker_counts(consumable_list, int(counts.get("item_box", 0)), int(counts.get("legendary_item_box", 0)))
 
 
+func _attach_progression_marker_state(visible: Dictionary, player_index: int, ui: Node = null) -> void:
+	if typeof(visible) != TYPE_DICTIONARY:
+		return
+	var marker_state = _build_progression_marker_state(player_index, ui)
+	if not marker_state.empty():
+		visible["progression_marker_state"] = marker_state
+
+
+func _build_progression_marker_state(player_index: int, ui: Node = null) -> Dictionary:
+	if not _is_valid_progression_ui_visible(ui):
+		ui = _find_progression_ui(true)
+	if not _is_valid_progression_ui_visible(ui):
+		return {}
+	var container = _get_progression_player_container(ui, player_index)
+	if not _is_live_ref(container):
+		return {}
+	var holder = _safe_get(container, "_things_to_process_container", null)
+	if not _is_live_ref(holder):
+		return {}
+	var upgrade_list = _safe_get(holder, "upgrades", null)
+	var consumable_list = _safe_get(holder, "consumables", null)
+	if not _is_live_ref(upgrade_list) or not _is_live_ref(consumable_list):
+		return {}
+	var upgrade_count = _get_ui_marker_count(upgrade_list)
+	var upgrade_level_hint = 0
+	var upgrade_elements = _safe_get(upgrade_list, "_elements", [])
+	if typeof(upgrade_elements) == TYPE_ARRAY and not upgrade_elements.empty():
+		upgrade_level_hint = int(upgrade_elements[0])
+	return {
+		"upgrade_count": upgrade_count,
+		"upgrade_level_hint": upgrade_level_hint,
+		# Preserve the Host marker queue exactly. The serialized consumable identity
+		# carries normal/legendary quality, and array order is the display/process order.
+		"item_box_queue": _serialize_progression_consumable_marker_queue(consumable_list)
+	}
+
+
+func _serialize_progression_consumable_marker_queue(consumable_list: Node) -> Array:
+	var queue = []
+	if not _is_live_ref(consumable_list):
+		return queue
+	var elements = _safe_get(consumable_list, "_elements", [])
+	if typeof(elements) == TYPE_ARRAY:
+		for consumable_data in elements:
+			var state = _serialize_item_parent_data(consumable_data)
+			if typeof(state) == TYPE_DICTIONARY and not state.empty():
+				queue.append(state)
+		return queue
+	# Safety fallback for unusual UI list implementations that do not expose _elements.
+	for child in consumable_list.get_children():
+		var child_consumable_data = _safe_get(child, "item_data", null) if child != null else null
+		var child_state = _serialize_item_parent_data(child_consumable_data)
+		if typeof(child_state) == TYPE_DICTIONARY and not child_state.empty():
+			queue.append(child_state)
+	return queue
+
+
+func _apply_progression_marker_state_to_container(container: Node, visible: Dictionary) -> void:
+	if not _is_live_ref(container):
+		return
+	var marker_state = visible.get("progression_marker_state", {})
+	if typeof(marker_state) != TYPE_DICTIONARY or marker_state.empty():
+		return
+	# Deliberately update only the upgrade-page marker holder. Battle HUD queues and
+	# RunData remain owned by the existing battle snapshot/progression flow.
+	var holder = _safe_get(container, "_things_to_process_container", null)
+	if not _is_live_ref(holder):
+		return
+	if marker_state.has("upgrade_count"):
+		var upgrade_list = _safe_get(holder, "upgrades", null)
+		if _is_live_ref(upgrade_list):
+			_rebuild_upgrade_marker_count(
+				upgrade_list,
+				max(0, int(marker_state.get("upgrade_count", 0))),
+				int(marker_state.get("upgrade_level_hint", visible.get("level", 0)))
+			)
+	if marker_state.has("item_box_queue"):
+		var consumable_list = _safe_get(holder, "consumables", null)
+		var item_box_queue = marker_state.get("item_box_queue", [])
+		if _is_live_ref(consumable_list) and typeof(item_box_queue) == TYPE_ARRAY:
+			_rebuild_consumable_marker_queue(consumable_list, item_box_queue)
+
+
+func _rebuild_consumable_marker_queue(consumable_list: Node, item_box_queue: Array) -> void:
+	_clear_ui_marker_list(consumable_list)
+	if not _is_live_ref(consumable_list):
+		return
+	for consumable_state in item_box_queue:
+		if typeof(consumable_state) != TYPE_DICTIONARY:
+			continue
+		var consumable_data = _resolve_item_parent_data(consumable_state)
+		if consumable_data == null:
+			continue
+		if consumable_list.has_method("add_element"):
+			consumable_list.add_element(consumable_data)
+
+
 func _get_things_to_process_holder_from_main(player_index: int):
 	var main = get_tree().current_scene
 	if not _is_live_ref(main):
@@ -6811,6 +6928,7 @@ func _apply_progression_visible_option_to_ui(player_index: int, visible: Diction
 	var container = _get_progression_player_container(ui, player_index)
 	if not _is_live_ref(container):
 		return false
+	_apply_progression_marker_state_to_container(container, visible)
 	var mode = str(visible.get("mode", "none"))
 	if mode == "upgrade":
 		_prepare_progression_ui_for_state(ui, container, player_index, visible)
@@ -7338,7 +7456,7 @@ func _resolve_run_page_action_player_index(origin_steam_id: String, from_steam_i
 	return int(message.get("player_index", -1))
 
 
-func _build_all_progression_visible_options(ui: Node = null) -> Array:
+func _build_all_progression_visible_options(ui: Node = null, include_marker_state: bool = false) -> Array:
 	var states = []
 	if not _is_live_ref(ui):
 		ui = _find_progression_ui(true)
@@ -7346,6 +7464,8 @@ func _build_all_progression_visible_options(ui: Node = null) -> Array:
 	for i in range(player_count):
 		var state = _build_progression_visible_option(i, ui)
 		if typeof(state) == TYPE_DICTIONARY and not state.empty():
+			if include_marker_state:
+				_attach_progression_marker_state(state, i, ui)
 			states.append(state)
 	return states
 
@@ -8079,6 +8199,7 @@ func _build_run_config_for_scene_sync(include_player_run_data: bool = true, held
 		"is_coop_run": bool(RunData.is_coop_run),
 		"is_endless_run": bool(RunData.is_endless_run),
 		"endless_mode_toggled": bool(ProgressData.settings.endless_mode_toggled),
+		"retry_wave_enabled": bool(ProgressData.settings.retry_wave),
 		"player_count": int(RunData.get_player_count()),
 		"current_zone": int(RunData.current_zone),
 		"current_difficulty": int(RunData.current_difficulty),
@@ -8127,6 +8248,13 @@ func _apply_run_config_before_client_scene_change(config: Dictionary, target_scr
 		ProgressData.settings.endless_mode_toggled = bool(config.get("endless_mode_toggled", endless_value))
 		_apply_endless_mode_to_current_ui(endless_value)
 
+	if config.has("retry_wave_enabled"):
+		var steam_lobby = _get_steam_lobby_manager()
+		if steam_lobby != null and steam_lobby.has_method("apply_host_retry_wave_setting"):
+			steam_lobby.apply_host_retry_wave_setting(bool(config.get("retry_wave_enabled", false)))
+		else:
+			ProgressData.settings.retry_wave = bool(config.get("retry_wave_enabled", false))
+
 	if config.has("current_zone"):
 		RunData.current_zone = int(config.get("current_zone", RunData.current_zone))
 	if config.has("current_difficulty"):
@@ -8166,11 +8294,68 @@ func _apply_run_config_before_client_scene_change(config: Dictionary, target_scr
 	if not applied_full_run_data:
 		_rebuild_run_data_from_selection_states(players, player_count, target_screen)
 
+	# Remote clients can enter CoopShop directly from Host scene synchronization and
+	# therefore do not always pass through RunData.reset(), which normally initializes
+	# ItemService._tiers_data. BaseShop generates its local placeholder items in _ready()
+	# before the authoritative Host shop state is applied; an empty tier pool can make
+	# that generation dereference an invalid random item and terminate the client.
+	if target_screen == SCREEN_SHOP or target_screen == "shop":
+		_ensure_item_service_tiers_ready_for_client_shop()
+
 	if target_screen == SCREEN_GAME and _should_apply_difficulty_start_for_client(config):
 		var difficulty_start_key = _build_difficulty_start_apply_key(config)
 		if difficulty_start_key == "" or difficulty_start_key != _last_applied_difficulty_start_key:
 			_apply_difficulty_start_for_client(config)
 			_last_applied_difficulty_start_key = difficulty_start_key
+
+
+func _ensure_item_service_tiers_ready_for_client_shop() -> void:
+	if _item_service_tiers_ready_for_client_shop():
+		return
+	if ItemService == null or not ItemService.has_method("init_unlocked_pool"):
+		return
+
+	ItemService.init_unlocked_pool()
+
+
+func _item_service_tiers_ready_for_client_shop() -> bool:
+	if ItemService == null:
+		return false
+
+	var tiers_data = ItemService.get("_tiers_data")
+	if typeof(tiers_data) != TYPE_ARRAY or tiers_data.empty():
+		return false
+
+	var has_items = false
+	var has_weapons = false
+	var has_consumables = false
+	var has_upgrades = false
+
+	for tier_data in tiers_data:
+		if typeof(tier_data) != TYPE_ARRAY:
+			return false
+
+		if tier_data.size() > ITEM_SERVICE_TIER_ITEMS:
+			var tier_items = tier_data[ITEM_SERVICE_TIER_ITEMS]
+			if typeof(tier_items) == TYPE_ARRAY and not tier_items.empty():
+				has_items = true
+
+		if tier_data.size() > ITEM_SERVICE_TIER_WEAPONS:
+			var tier_weapons = tier_data[ITEM_SERVICE_TIER_WEAPONS]
+			if typeof(tier_weapons) == TYPE_ARRAY and not tier_weapons.empty():
+				has_weapons = true
+
+		if tier_data.size() > ITEM_SERVICE_TIER_CONSUMABLES:
+			var tier_consumables = tier_data[ITEM_SERVICE_TIER_CONSUMABLES]
+			if typeof(tier_consumables) == TYPE_ARRAY and not tier_consumables.empty():
+				has_consumables = true
+
+		if tier_data.size() > ITEM_SERVICE_TIER_UPGRADES:
+			var tier_upgrades = tier_data[ITEM_SERVICE_TIER_UPGRADES]
+			if typeof(tier_upgrades) == TYPE_ARRAY and not tier_upgrades.empty():
+				has_upgrades = true
+
+	return has_items and has_weapons and has_consumables and has_upgrades
 
 
 func _run_config_has_serialized_player_run_data(players: Array) -> bool:
@@ -8811,6 +8996,11 @@ func _store_host_catalog(screen: String, catalog: Dictionary) -> void:
 	_host_catalog_player_key_by_screen[screen] = _build_catalog_player_key_map(catalog)
 	_last_applied_catalog_key_by_screen.erase(screen)
 	_clear_applied_catalog_player_keys_for_screen(screen)
+	# Catalog changes can rebuild inventory controls without changing the scene node.
+	# Force one complete selection-state application against the new controls.
+	_selection_apply_context_key = ""
+	_last_applied_selection_focus_key_by_player.clear()
+	_last_applied_selection_selected_key_by_player.clear()
 
 
 func _make_catalog_stable_key(catalog: Dictionary) -> String:
@@ -9643,6 +9833,15 @@ func _apply_host_selection_state_to_current_ui(state: Dictionary) -> bool:
 		# Host 已进入另一个菜单时，后续会做 scene transition 同步；当前先不要在错误界面强行应用。
 		return false
 
+	# A scene/player-count change can rebuild inventories and panels while keeping the
+	# same authoritative values. Invalidate the component cache in that case so the
+	# new controls receive one complete state application.
+	var apply_context_key = str(selection.get_instance_id()) + ":" + current_screen + ":" + str(RunData.get_player_count())
+	if apply_context_key != _selection_apply_context_key:
+		_selection_apply_context_key = apply_context_key
+		_last_applied_selection_focus_key_by_player.clear()
+		_last_applied_selection_selected_key_by_player.clear()
+
 	if current_screen == "difficulty_selection":
 		_disable_selection_buttons(selection, true)
 		_apply_host_difficulty_focus(selection, state)
@@ -9667,27 +9866,40 @@ func _apply_host_selection_state_to_current_ui(state: Dictionary) -> bool:
 		var ready = bool(player_state.get("ready", false))
 		var player_steam_id = str(player_state.get("steam_id", ""))
 		var is_local_self = _local_client_steam_id != "" and player_steam_id == _local_client_steam_id
+		var focus_key = player_steam_id + "|" + to_json(focus_state)
+		var selected_key = player_steam_id + "|" + str(ready) + "|" + to_json(selected_state)
+		var focus_changed = str(_last_applied_selection_focus_key_by_player.get(player_index, "")) != focus_key
+		var selected_changed = str(_last_applied_selection_selected_key_by_player.get(player_index, "")) != selected_key
 
 		# 本地玩家自己的 hover/locked 显示交给原版 UI。否则 Host 回声会把“未解锁条件窗口”覆盖成角色详情窗口。
 		# ready 的视觉仍然可以吃 Host 回包，因为 Host 才是确认选择是否成立的权威。
 		if is_local_self:
-			var local_selected_element = _find_element_by_state(selection, player_index, selected_state, true)
-			_apply_selected_visual_only(selection, player_index, local_selected_element, ready, selected_state)
-			if not ready:
-				_reset_local_select_dedup_for_player(player_index)
+			if selected_changed:
+				var local_selected_element = _find_element_by_state(selection, player_index, selected_state, true)
+				_apply_selected_visual_only(selection, player_index, local_selected_element, ready, selected_state)
+				_last_applied_selection_selected_key_by_player[player_index] = selected_key
+				if not ready:
+					_reset_local_select_dedup_for_player(player_index)
+			# Local focus is never mirrored from Host, but mark this packet component as
+			# observed so later full states remain O(changed players).
+			_last_applied_selection_focus_key_by_player[player_index] = focus_key
 			continue
 
-		# Client display must allow locked characters/weapons. The client may not have unlocked
-		# the same content as the host, but it still has the data resource in most cases.
-		# Local input/select paths remain strict; this relaxed lookup is only for host-authoritative display.
-		var focus_element = _find_element_by_state(selection, player_index, focus_state, true)
-		if focus_element != null:
-			_apply_focus_element_for_host_display(selection, player_index, focus_element, focus_state)
-		else:
-			_apply_item_state_to_panel(selection, player_index, focus_state)
+		# Client display must allow locked characters/weapons. Only resolve and apply a
+		# component whose serialized value changed; a full four-player packet normally
+		# contains three unchanged players.
+		if focus_changed:
+			var focus_element = _find_element_by_state(selection, player_index, focus_state, true)
+			if focus_element != null:
+				_apply_focus_element_for_host_display(selection, player_index, focus_element, focus_state)
+			else:
+				_apply_item_state_to_panel(selection, player_index, focus_state)
+			_last_applied_selection_focus_key_by_player[player_index] = focus_key
 
-		var selected_element = _find_element_by_state(selection, player_index, selected_state, true)
-		_apply_selected_visual_only(selection, player_index, selected_element, ready, selected_state)
+		if selected_changed:
+			var selected_element = _find_element_by_state(selection, player_index, selected_state, true)
+			_apply_selected_visual_only(selection, player_index, selected_element, ready, selected_state)
+			_last_applied_selection_selected_key_by_player[player_index] = selected_key
 
 	return true
 

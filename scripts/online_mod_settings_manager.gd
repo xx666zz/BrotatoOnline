@@ -10,9 +10,6 @@ const META_AUTO_JOIN_HOST_PLAYER = "brotato_online_auto_join_host_player"
 
 const SETTINGS_BUTTON_NAME = "BrotatoOnlineSettingsButton"
 const SETTINGS_OVERLAY_NAME = "BrotatoOnlineSettingsOverlay"
-const TRANSLATION_FILE_PREFIX = "brotato_online_"
-const TRANSLATION_FILE_EXTENSION = ".txt"
-
 const META_LOCAL_OUTLINE_COLOR = "brotato_online_local_outline_color"
 const META_LOCAL_OUTLINE_OWNED = "brotato_online_local_outline_owned"
 
@@ -29,12 +26,10 @@ var _title_label = null
 var _description_label = null
 var _back_button = null
 var _last_focus_owner = null
-var _file_translations = {}
 var _i18n = null
 
 
 func _ready() -> void:
-	_load_i18n()
 	_load_settings()
 	_publish_settings_meta()
 	set_process(true)
@@ -110,144 +105,20 @@ func get_local_player_index() -> int:
 	return -1
 
 
-func _get_mod_root_path() -> String:
-	var script_res = get_script()
-	if script_res != null and str(script_res.resource_path) != "":
-		return str(script_res.resource_path).get_base_dir().get_base_dir()
-	return "res://mods-unpacked/six666-BrotatoOnline"
-
-
-func _get_translation_dir_path() -> String:
-	return _get_mod_root_path().plus_file("translations")
-
-
-func _load_i18n() -> void:
-	_i18n = null
-	var script_path = _get_mod_root_path().plus_file("scripts/online_mod_settings_i18n.gd")
-	var file = File.new()
-	if not file.file_exists(script_path):
-		return
-	var script_res = load(script_path)
-	if script_res != null:
-		_i18n = script_res.new()
-
-
-func _load_file_translations() -> void:
-	_file_translations.clear()
-
-	var dir_path = _get_translation_dir_path()
-	var dir = Directory.new()
-	if dir.open(dir_path) != OK:
-		return
-
-	dir.list_dir_begin(true, true)
-	while true:
-		var file_name = dir.get_next()
-		if file_name == "":
-			break
-		if not file_name.ends_with(TRANSLATION_FILE_EXTENSION):
-			continue
-		var locale = _locale_from_translation_file_name(file_name)
-		if locale == "":
-			continue
-		_load_one_translation_file(locale, dir_path.plus_file(file_name))
-	dir.list_dir_end()
-
-
-func _locale_from_translation_file_name(file_name: String) -> String:
-	var base_name = file_name.get_basename()
-	if not base_name.begins_with(TRANSLATION_FILE_PREFIX):
-		return ""
-	var locale = base_name.substr(TRANSLATION_FILE_PREFIX.length(), base_name.length() - TRANSLATION_FILE_PREFIX.length())
-	return _normalize_locale(locale)
-
-
-func _load_one_translation_file(locale: String, file_path: String) -> void:
-	var file = File.new()
-	if file.open(file_path, File.READ) != OK:
-		return
-
-	if not _file_translations.has(locale):
-		_file_translations[locale] = {}
-
-	var line_index = 0
-	while not file.eof_reached():
-		var row = file.get_csv_line(",")
-		line_index += 1
-		if row.size() < 2:
-			continue
-		var key = str(row[0]).strip_edges()
-		if key == "" or (line_index == 1 and key.to_lower() == "key"):
-			continue
-		_file_translations[locale][key] = str(row[1])
-
-	file.close()
+func _get_i18n_manager():
+	if _i18n != null and is_instance_valid(_i18n):
+		return _i18n
+	var parent = get_parent()
+	if parent != null:
+		_i18n = parent.get_node_or_null("BrotatoOnlineI18n")
+	return _i18n
 
 
 func _txt(key: String) -> String:
-	var translated = ""
-	if _i18n != null and _i18n.has_method("translate"):
-		translated = str(_i18n.call("translate", key))
-		if translated != "" and translated != key:
-			return translated
-
-	translated = _translate_from_file(key)
-	if translated != "" and translated != key:
-		return translated
-
-	translated = tr(key)
-	if translated != "" and translated != key:
-		return translated
-
-	translated = TranslationServer.translate(key)
-	if translated != "" and translated != key:
-		return translated
-
+	var i18n = _get_i18n_manager()
+	if i18n != null and i18n.has_method("get_text"):
+		return str(i18n.call("get_text", key))
 	return key
-
-
-func _translate_from_file(key: String) -> String:
-	if _file_translations.empty():
-		return ""
-
-	for locale in _get_locale_candidates(TranslationServer.get_locale()):
-		if not _file_translations.has(locale):
-			continue
-		var locale_messages = _file_translations[locale]
-		if locale_messages.has(key):
-			return str(locale_messages[key])
-
-	return ""
-
-
-func _normalize_locale(locale: String) -> String:
-	return locale.replace("-", "_").strip_edges()
-
-
-func _get_locale_candidates(locale: String) -> Array:
-	var normalized = _normalize_locale(locale)
-	var candidates = []
-
-	if normalized != "" and not candidates.has(normalized):
-		candidates.append(normalized)
-
-	if normalized.begins_with("zh_TW") or normalized.begins_with("zh_HK") or normalized.begins_with("zh_Hant"):
-		if not candidates.has("zh_TW"):
-			candidates.append("zh_TW")
-		if not candidates.has("zh"):
-			candidates.append("zh")
-	elif normalized.begins_with("zh"):
-		if not candidates.has("zh"):
-			candidates.append("zh")
-
-	var base = normalized.split("_")[0] if normalized.find("_") != -1 else normalized
-	if base != "" and not candidates.has(base):
-		candidates.append(base)
-
-	if not candidates.has("en"):
-		candidates.append("en")
-
-	return candidates
 
 
 func _load_settings() -> void:

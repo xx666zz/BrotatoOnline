@@ -34,12 +34,6 @@ func get_text(key: String) -> String:
 
 func get_language_code() -> String:
 	var language = str(TranslationServer.get_locale())
-	# ProgressData may not be initialized while the mod tree is entering the game.
-	# Only consult it after it exposes a settings dictionary.
-	if ProgressData != null and typeof(ProgressData.settings) == TYPE_DICTIONARY:
-		var configured_language = str(ProgressData.settings.get("language", ""))
-		if configured_language != "":
-			language = configured_language
 	language = language.replace("-", "_").strip_edges().to_lower()
 	return "zh" if language.begins_with("zh") else "en"
 

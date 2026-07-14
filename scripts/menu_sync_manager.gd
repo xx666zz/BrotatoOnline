@@ -9,8 +9,6 @@ const RUN_PAGE_CONSUME_SCAN_INTERVAL_MSEC = 120
 const PROGRESSION_UI_RECURSIVE_SCAN_INTERVAL_MSEC = 1000
 const RUN_PAGE_GAME_START_GUARD_MSEC = 10000
 const MENU_SCENE_CHANGE_IN_FLIGHT_MSEC = 12000
-const CLIENT_SHOP_PREDICTION_HOLD_MSEC = 3000
-const SHOP_DELTA_STATE_INTERVAL_MSEC = 1000
 const SHOP_RUN_DATA_ITEMS_COMPACT_VERSION = 1
 const SHOP_RUN_DATA_ID_ONLY_VERSION = 1
 const SHOP_HELD_ITEMS_SYNC_COMPACT = "compact"
@@ -118,10 +116,6 @@ var _processed_run_page_action_ids = {}
 var _last_run_page_action_seq_by_origin = {}
 var _applying_remote_run_page_action = false
 var _last_progression_options_processed_key = ""
-var _last_shop_state_key = ""
-var _last_shop_full_state_msec = 0
-var _host_shop_initial_full_sent_instance_id = 0
-var _host_shop_state_key_by_player = {}
 var _last_local_shop_focus_key = {}
 var _last_shop_focus_target_by_player = {}
 var _last_host_shop_focus_repair_msec = 0
@@ -138,14 +132,10 @@ var _recent_mutating_run_page_action_keys = {}
 var _pending_synced_shop_start_id = 0
 var _client_shop_direct_lock_probe_seq = 0
 var _client_shop_lock_state_by_slot_key = {}
+var _host_shop_lock_state_by_slot_key = {}
 var _last_client_shop_lock_poll_key = ""
 var _last_applied_shop_gear_key_by_player = {}
 var _last_applied_shop_state_key_by_player = {}
-var _client_shop_prediction_seq = 0
-var _client_shop_prediction_until_by_player = {}
-var _client_shop_prediction_token_by_player = {}
-var _client_shop_prediction_key_by_player = {}
-var _client_shop_prediction_action_by_player = {}
 var _shop_state_cache_instance_id = 0
 var _host_shop_run_data_key_by_player = {}
 var _host_shop_run_data_cache_by_player = {}
@@ -443,8 +433,6 @@ func _reset_run_page_runtime_state_for_game_start(clear_queued_actions: bool = t
 	_pending_shop_states_from_host.clear()
 	_local_shop_go_pending_until_by_player.clear()
 	_last_local_shop_focus_key.clear()
-	_last_shop_state_key = ""
-	_last_shop_full_state_msec = 0
 	_last_shop_focus_target_by_player.clear()
 	_client_shop_intercept_key = ""
 	_host_shop_go_intercept_key.clear()
@@ -454,6 +442,7 @@ func _reset_run_page_runtime_state_for_game_start(clear_queued_actions: bool = t
 	_shop_input_guard_wait_release = false
 	_client_shop_direct_lock_probe_seq = 0
 	_client_shop_lock_state_by_slot_key.clear()
+	_host_shop_lock_state_by_slot_key.clear()
 	_last_client_shop_lock_poll_key = ""
 	_last_applied_shop_gear_key_by_player.clear()
 	_last_applied_shop_state_key_by_player.clear()
@@ -468,7 +457,6 @@ func _reset_run_page_runtime_state_for_game_start(clear_queued_actions: bool = t
 	_shop_state_cache_instance_id = 0
 	_missing_host_item_placeholder_cache.clear()
 	_reset_shop_inventory_custom_button_runtime_state()
-	_clear_all_client_shop_predictions()
 	_client_progression_intercept_container_id = 0
 	_last_local_run_page_focus_key.clear()
 	_last_local_run_page_state_key_by_player.clear()
@@ -523,8 +511,6 @@ func reset_online_session_state(reason: String = "") -> void:
 	_host_shop_run_data_sent_key_by_player.clear()
 	_host_shop_run_data_stamp_by_player.clear()
 	_host_shop_run_data_dirty_by_player.clear()
-	_host_shop_initial_full_sent_instance_id = 0
-	_host_shop_state_key_by_player.clear()
 	_last_applied_shop_slots_key_by_player.clear()
 	_last_applied_shop_run_data_key_by_player.clear()
 	_missing_host_item_placeholder_cache.clear()
@@ -823,8 +809,14 @@ func receive_run_page_action_sync(from_steam_id: String, message: Dictionary, se
 	elif action_type == "shop_buy":
 		if _is_game_host():
 			applied = _apply_shop_buy_action(player_index, message)
+		elif bool(message.get("shop_buy_event", false)):
+			applied = _apply_shop_buy_action(player_index, message)
 		else:
+			# The purchasing Client already ran the real vanilla mutation. A success
+			# response is acknowledgement-only; a failure carries a full correction below.
 			applied = true
+		if not _is_game_host() and bool(message.get("steal", false)):
+			_apply_authoritative_shop_steal_outcome(player_index, message)
 	elif action_type == "shop_combine_weapon":
 		if _is_game_host():
 			applied = _apply_shop_combine_weapon_action(player_index, message)
@@ -860,6 +852,26 @@ func receive_run_page_action_sync(from_steam_id: String, message: Dictionary, se
 	_applying_remote_run_page_action = false
 
 	if _is_game_host():
+		if action_type == "shop_buy":
+			var result = {
+				"shop_buy_protocol": true,
+				"shop_buy_result": "success" if applied else "failure",
+				"host_applied": applied
+			}
+			if applied:
+				_mark_host_shop_run_data_dirty(player_index)
+				if bool(message.get("steal", false)):
+					result["steal_extra_enemies_next_wave"] = _get_shop_steal_extra_enemies_next_wave(player_index)
+			else:
+				var correction = _build_shop_player_state(player_index, _find_shop_node(), false, false)
+				if not correction.empty():
+					_append_forced_shop_run_data_repair_to_delta_state(correction, player_index, "shop_buy_failed")
+					correction["full_snapshot"] = true
+					correction["delta_snapshot"] = false
+					correction["shop_delta"] = false
+					correction["host_applied"] = false
+				result["full_sync"] = correction
+			return result
 		if action_type == SHOP_CUSTOM_POPUP_BUTTON_ACTION:
 			# Third-party inventory popup buttons are replayed as local UI presses only.
 			# Do not attach a shop_state payload to this generic compatibility packet.
@@ -944,8 +956,6 @@ func _poll_shop_page_state_and_intercepts() -> void:
 	var shop = _find_shop_node()
 	if not _is_valid_shop_node(shop):
 		_reset_shop_state_diff_cache()
-		_last_shop_state_key = ""
-		_last_shop_full_state_msec = 0
 		_last_local_shop_focus_key.clear()
 		_client_shop_intercept_key = ""
 		_host_shop_go_intercept_key.clear()
@@ -954,11 +964,11 @@ func _poll_shop_page_state_and_intercepts() -> void:
 		_shop_input_guard_until_msec = 0
 		_shop_input_guard_wait_release = false
 		_client_shop_lock_state_by_slot_key.clear()
+		_host_shop_lock_state_by_slot_key.clear()
 		_last_client_shop_lock_poll_key = ""
 		_last_applied_shop_gear_key_by_player.clear()
 		_last_applied_shop_state_key_by_player.clear()
 		_reset_shop_inventory_custom_button_runtime_state()
-		_clear_all_client_shop_predictions()
 		return
 
 	_ensure_shop_state_diff_cache_for_instance(shop)
@@ -972,12 +982,12 @@ func _poll_shop_page_state_and_intercepts() -> void:
 		_pending_shop_states_from_host = []
 		var host_player_indices = _get_host_local_player_indices()
 		_configure_online_focus_emulator_input_owners(host_player_indices, "shop_host")
+		_install_host_shop_go_sync_intercept(shop)
+		_install_host_shop_local_mutation_observer(shop)
 		for host_player_index in host_player_indices:
 			_ensure_shop_inventory_popup_wiring_for_player(shop, int(host_player_index), false)
 			_queue_shop_focus_if_changed(int(host_player_index))
-		_install_host_shop_go_sync_intercept(shop)
-		_install_host_shop_local_mutation_observer(shop)
-		_queue_shop_state_if_changed()
+			_poll_host_shop_lock_state_changes(shop, int(host_player_index))
 		_debug_host_shop_focus_snapshot(shop)
 		return
 
@@ -1038,17 +1048,14 @@ func _reset_shop_state_diff_cache() -> void:
 	_host_shop_run_data_sent_key_by_player.clear()
 	_host_shop_run_data_stamp_by_player.clear()
 	_host_shop_run_data_dirty_by_player.clear()
-	_host_shop_initial_full_sent_instance_id = 0
-	_host_shop_state_key_by_player.clear()
 	_last_applied_shop_slots_key_by_player.clear()
 	_last_applied_shop_run_data_key_by_player.clear()
 	_last_applied_shop_gear_key_by_player.clear()
 	_last_applied_shop_state_key_by_player.clear()
+	_host_shop_lock_state_by_slot_key.clear()
 	_reset_shop_inventory_custom_button_runtime_state(false)
 	if not preserve_pending_shop_state:
 		_pending_shop_states_from_host = []
-	_last_shop_state_key = ""
-	_last_shop_full_state_msec = 0
 
 
 func _should_preserve_pending_shop_state_for_scene_transition() -> bool:
@@ -1085,72 +1092,14 @@ func _ensure_shop_state_diff_cache_for_instance(shop: Node) -> void:
 	_host_shop_run_data_sent_key_by_player.clear()
 	_host_shop_run_data_stamp_by_player.clear()
 	_host_shop_run_data_dirty_by_player.clear()
-	_host_shop_initial_full_sent_instance_id = 0
-	_host_shop_state_key_by_player.clear()
 	_last_applied_shop_slots_key_by_player.clear()
 	_last_applied_shop_run_data_key_by_player.clear()
 	_last_applied_shop_gear_key_by_player.clear()
 	_last_applied_shop_state_key_by_player.clear()
+	_host_shop_lock_state_by_slot_key.clear()
 	_reset_shop_inventory_custom_button_runtime_state(false)
 	if not preserve_pending_shop_state:
 		_pending_shop_states_from_host = []
-	_last_shop_state_key = ""
-	_last_shop_full_state_msec = 0
-
-
-func _record_host_shop_state_baselines_from_states(states: Array) -> void:
-	if not _is_game_host() or typeof(states) != TYPE_ARRAY:
-		return
-	for state in states:
-		if typeof(state) == TYPE_DICTIONARY:
-			_record_host_shop_state_baseline_from_state(state)
-
-
-func _record_host_shop_state_baseline_from_state(state: Dictionary) -> void:
-	if not _is_game_host() or typeof(state) != TYPE_DICTIONARY or state.empty():
-		return
-	var player_index = int(state.get("player_index", -1))
-	if player_index < 0:
-		return
-	var key = _build_shop_state_prediction_key_from_state(state)
-	if key != "":
-		_host_shop_state_key_by_player[player_index] = key
-
-
-func _record_host_shop_player_state_baseline(player_index: int, shop: Node = null) -> void:
-	if not _is_game_host() or player_index < 0:
-		return
-	if shop == null:
-		shop = _find_shop_node()
-	if not _is_valid_shop_node(shop):
-		return
-	var state = _build_shop_player_state(player_index, shop, false)
-	if typeof(state) == TYPE_DICTIONARY and not state.empty():
-		_record_host_shop_state_baseline_from_state(state)
-
-
-func mark_menu_scene_shop_state_sent(scene_state: Dictionary = {}) -> void:
-	# menu_scene_state already carried the initial full shop UI state for this CoopShop
-	# instance. Mark it as the initial snapshot so the later polling path only sends
-	# compact deltas, avoiding a second large run_page_action_sync right after scene entry.
-	if not _is_game_host():
-		return
-	var shop = _find_shop_node()
-	if not _is_valid_shop_node(shop):
-		return
-	var shop_instance_id = int(shop.get_instance_id())
-	_host_shop_initial_full_sent_instance_id = shop_instance_id
-	_last_shop_full_state_msec = OS.get_ticks_msec()
-	var shop_state = scene_state.get("shop_state", {}) if typeof(scene_state) == TYPE_DICTIONARY else {}
-	var states = []
-	if typeof(shop_state) == TYPE_DICTIONARY:
-		var players = shop_state.get("players", [])
-		if typeof(players) == TYPE_ARRAY:
-			states = players
-	if states.empty():
-		states = _build_all_shop_player_states(false)
-	_last_shop_state_key = to_json(states)
-	_record_host_shop_state_baselines_from_states(states)
 
 
 func _strip_run_data_from_shop_states_for_menu_scene(states: Array) -> Array:
@@ -1169,91 +1118,6 @@ func _strip_run_data_from_shop_states_for_menu_scene(states: Array) -> Array:
 		slim["run_data_source"] = "run_config"
 		result.append(slim)
 	return result
-
-
-func _queue_shop_state_if_changed() -> void:
-	# Full shop snapshots are sent only as the initial shop payload (menu_scene_state).
-	# After that, this polling path emits compact per-player delta snapshots only when
-	# the Host-visible shop state actually changes. This prevents the old 600KB+ reliable
-	# full shop_state from being queued every few seconds on high-wave runs.
-	if not _is_game_host():
-		return
-	var shop = _find_shop_node()
-	if not _is_valid_shop_node(shop):
-		return
-
-	var now = OS.get_ticks_msec()
-	var shop_instance_id = int(shop.get_instance_id())
-	if _host_shop_initial_full_sent_instance_id != shop_instance_id:
-		if _should_use_endless_incremental_items_only_shop_sync():
-			# The scene transition already carried shop slots plus incremental/runtime run data.
-			# From endless wave 21 onward do not build a separate initial full shop_state.
-			_host_shop_initial_full_sent_instance_id = shop_instance_id
-			_last_shop_full_state_msec = now
-			_last_shop_state_key = "late_endless_incremental_only:" + str(shop_instance_id)
-			return
-		var initial_states = _build_all_shop_player_states(true)
-		if initial_states.empty():
-			return
-		for state in initial_states:
-			if typeof(state) == TYPE_DICTIONARY:
-				state["full_snapshot"] = true
-				state["delta_snapshot"] = false
-				state["shop_delta"] = false
-		_host_shop_initial_full_sent_instance_id = shop_instance_id
-		_last_shop_full_state_msec = now
-		_last_shop_state_key = to_json(initial_states)
-		_record_host_shop_state_baselines_from_states(initial_states)
-		# Do not also broadcast a separate initial full shop_state here.
-		# The scene transition packet already carries shop_state slots/scalars, and
-		# run_config carries the authoritative run data. Sending both was a 400KB+
-		# duplicate reliable packet before every shop.
-		return
-
-	if _should_use_endless_incremental_items_only_shop_sync():
-		# Late endless uses explicit action deltas only. This avoids rebuilding per-player
-		# shop state and comparing held-item/run-data keys every second inside the shop.
-		return
-
-	if _last_shop_full_state_msec > 0 and now - int(_last_shop_full_state_msec) < SHOP_DELTA_STATE_INTERVAL_MSEC:
-		return
-	_last_shop_full_state_msec = now
-
-	var changed_states = []
-	var changed_players = []
-	for player_index in range(_get_run_player_count()):
-		var state = _build_shop_player_state(player_index, shop, false)
-		if typeof(state) != TYPE_DICTIONARY or state.empty():
-			continue
-		var key = _build_shop_state_prediction_key_from_state(state)
-		if key == "":
-			continue
-		var prev_key = str(_host_shop_state_key_by_player.get(player_index, ""))
-		if prev_key == "":
-			_host_shop_state_key_by_player[player_index] = key
-			continue
-		if key == prev_key:
-			continue
-		_host_shop_state_key_by_player[player_index] = key
-		state["full_snapshot"] = false
-		state["delta_snapshot"] = true
-		changed_states.append(state)
-		changed_players.append(player_index)
-
-	if changed_states.empty():
-		return
-
-	_last_shop_state_key = to_json(changed_states)
-	_queue_local_run_page_action({
-		"msg_type": "run_page_action_sync",
-		"action_type": "shop_state",
-		"screen": "shop",
-		"player_index": 0,
-		"host_states_after": changed_states,
-		"state_after": {"mode": "shop", "players": changed_states, "delta_snapshot": true},
-		"delta_snapshot": true,
-		"full_snapshot": false
-	})
 
 
 func _queue_shop_focus_if_changed(player_index: int) -> void:
@@ -1284,18 +1148,43 @@ func _install_host_shop_go_sync_intercept(shop: Node) -> void:
 		var player_index = int(raw_player_index)
 		if player_index < 0:
 			continue
-		var go_button = shop._get_go_button(player_index) if shop.has_method("_get_go_button") else null
-		if not _is_live_ref(go_button):
-			continue
 		var key = str(shop.get_instance_id()) + ":" + str(player_index)
-		if key == str(_host_shop_go_intercept_key.get(player_index, "")):
-			continue
-		_host_shop_go_intercept_key[player_index] = key
-		if go_button.is_connected("pressed", shop, "_on_GoButton_pressed"):
-			go_button.disconnect("pressed", shop, "_on_GoButton_pressed")
-		if not go_button.is_connected("pressed", self, "_on_host_shop_go_pressed"):
-			go_button.connect("pressed", self, "_on_host_shop_go_pressed", [player_index])
+		var install_primary_buttons = key != str(_host_shop_go_intercept_key.get(player_index, ""))
+		if install_primary_buttons:
+			_host_shop_go_intercept_key[player_index] = key
 
+			var go_button = shop._get_go_button(player_index) if shop.has_method("_get_go_button") else null
+			if _is_live_ref(go_button):
+				if go_button.is_connected("pressed", shop, "_on_GoButton_pressed"):
+					go_button.disconnect("pressed", shop, "_on_GoButton_pressed")
+				if not go_button.is_connected("pressed", self, "_on_host_shop_go_pressed"):
+					go_button.connect("pressed", self, "_on_host_shop_go_pressed", [player_index])
+
+			var reroll_button = shop._get_reroll_button(player_index) if shop.has_method("_get_reroll_button") else null
+			if _is_live_ref(reroll_button):
+				if reroll_button.is_connected("pressed", shop, "_on_RerollButton_pressed"):
+					reroll_button.disconnect("pressed", shop, "_on_RerollButton_pressed")
+				if not reroll_button.is_connected("pressed", self, "_on_host_shop_reroll_pressed"):
+					reroll_button.connect("pressed", self, "_on_host_shop_reroll_pressed", [player_index])
+
+		# Keep the Host's vanilla lock callback connected. BaseShop can toggle a focused
+		# item directly from its _input() path without emitting LockButton.toggled, so Host
+		# lock synchronization is detected by the lightweight visible-slot poll below.
+		# Replacing the vanilla callback here made mouse/button locks use a different path
+		# from keyboard/controller locks and caused Host changes to remain local-only.
+		var container = shop._get_shop_items_container(player_index) if shop.has_method("_get_shop_items_container") else null
+		var shop_items = _safe_get(container, "_shop_items", []) if _is_live_ref(container) else []
+		if typeof(shop_items) == TYPE_ARRAY:
+			for shop_item in shop_items:
+				if not _is_live_ref(shop_item):
+					continue
+				var lock_button = _safe_get(shop_item, "_lock_button", null)
+				if not _is_live_ref(lock_button):
+					continue
+				if lock_button.is_connected("toggled", self, "_on_host_shop_item_lock_toggled"):
+					lock_button.disconnect("toggled", self, "_on_host_shop_item_lock_toggled")
+				if not lock_button.is_connected("toggled", shop_item, "_on_LockButton_toggled"):
+					lock_button.connect("toggled", shop_item, "_on_LockButton_toggled")
 
 func _on_host_shop_go_pressed(player_index: int) -> void:
 	if not _is_game_host() or _applying_remote_run_page_action:
@@ -1309,6 +1198,26 @@ func _on_host_shop_go_pressed(player_index: int) -> void:
 		"shop_index": -1
 	}
 	_apply_host_local_shop_action(msg, "go")
+
+
+func _on_host_shop_reroll_pressed(player_index: int) -> void:
+	if not _is_game_host() or _applying_remote_run_page_action:
+		return
+	_apply_host_local_shop_action({
+		"msg_type": "run_page_action_sync",
+		"action_type": "shop_reroll",
+		"screen": "shop",
+		"player_index": player_index
+	}, "reroll")
+
+
+func _on_host_shop_item_lock_toggled(button_pressed: bool, shop_item, player_index: int) -> void:
+	if not _is_game_host() or _applying_remote_run_page_action:
+		return
+	var msg = _build_client_shop_item_action("shop_lock", shop_item, player_index)
+	msg["ban"] = false
+	msg["desired_locked"] = bool(button_pressed)
+	_apply_host_local_shop_action(msg, "lock")
 
 
 func _install_host_shop_local_mutation_observer(shop: Node) -> void:
@@ -1329,6 +1238,8 @@ func _install_host_shop_local_mutation_observer(shop: Node) -> void:
 				container.connect("shop_item_bought", self, "_on_host_shop_item_bought_observed", [player_index])
 			if not container.is_connected("shop_item_stolen", self, "_on_host_shop_item_stolen_observed"):
 				container.connect("shop_item_stolen", self, "_on_host_shop_item_stolen_observed", [player_index])
+			if not container.is_connected("shop_item_banned", self, "_on_host_shop_item_banned_observed"):
+				container.connect("shop_item_banned", self, "_on_host_shop_item_banned_observed", [player_index])
 
 		# Combine/discard also mutate Host-local RunData. Observing them is cheap and keeps
 		# the remote gear panel current without taking over vanilla Host shop behavior.
@@ -1345,7 +1256,7 @@ func _on_host_shop_item_bought_observed(shop_item, player_index: int) -> void:
 		return
 	var item_data = _safe_get(shop_item, "item_data", null) if _is_live_ref(shop_item) else null
 	var slot_index = _get_shop_item_index(shop_item, player_index) if _is_live_ref(shop_item) else -1
-	_schedule_host_local_shop_state_sync(player_index, "shop_buy", "host_buy", _get_item_id_for_log(item_data), _serialize_item_parent_data(item_data), slot_index)
+	_schedule_host_local_shop_state_sync(player_index, "shop_buy", "host_buy", _get_item_id_for_log(item_data), _serialize_item_parent_identity_for_action(item_data), slot_index)
 
 
 func _on_host_shop_item_stolen_observed(shop_item, player_index: int) -> void:
@@ -1353,7 +1264,15 @@ func _on_host_shop_item_stolen_observed(shop_item, player_index: int) -> void:
 		return
 	var item_data = _safe_get(shop_item, "item_data", null) if _is_live_ref(shop_item) else null
 	var slot_index = _get_shop_item_index(shop_item, player_index) if _is_live_ref(shop_item) else -1
-	_schedule_host_local_shop_state_sync(player_index, "shop_buy", "host_steal", _get_item_id_for_log(item_data), _serialize_item_parent_data(item_data), slot_index)
+	_schedule_host_local_shop_state_sync(player_index, "shop_buy", "host_steal", _get_item_id_for_log(item_data), _serialize_item_parent_identity_for_action(item_data), slot_index)
+
+
+func _on_host_shop_item_banned_observed(shop_item, player_index: int) -> void:
+	if not _is_game_host() or _applying_remote_run_page_action:
+		return
+	var item_data = _safe_get(shop_item, "item_data", null) if _is_live_ref(shop_item) else null
+	var slot_index = _get_shop_item_index(shop_item, player_index) if _is_live_ref(shop_item) else -1
+	_schedule_host_local_shop_state_sync(player_index, "shop_lock", "host_ban", _get_item_id_for_log(item_data), _serialize_item_parent_identity_for_action(item_data), slot_index)
 
 
 func _on_host_shop_inventory_mutation_observed(_item_data, player_index: int, action_type: String) -> void:
@@ -1375,12 +1294,47 @@ func _deferred_broadcast_host_local_shop_state(player_index: int, source_action_
 	if not _is_valid_shop_node(shop) or player_index < 0:
 		return
 
-	# Host-local vanilla mutations are already applied locally; broadcast only the
-	# authoritative compact delta now. The 2s periodic shop_state is the full RunData
-	# repair path, so this no longer serializes every player's inventory per action.
-	if source_action_type == "shop_buy" or source_action_type == "shop_combine_weapon" or source_action_type == "shop_discard_weapon":
+	if source_action_type == "shop_buy":
 		_mark_host_shop_run_data_dirty(player_index)
-	_last_shop_state_key = ""
+		# The purchase event performs the real vanilla mutation on remote Clients. Attach
+		# only the Host's post-purchase visible slot layout (item + slot_index) so the
+		# receiver can apply the purchase first, then correct sold/remaining item display
+		# without replaying an inventory delta and adding the bought item twice.
+		var shop_items_after_purchase = _build_shop_slot_entries_for_player(shop, player_index, -1)
+		var purchase_display_state = {
+			"mode": "shop",
+			"shop_delta": true,
+			"delta_action": "shop_buy_display",
+			"host_applied": true,
+			"player_index": player_index,
+			"shop_items": shop_items_after_purchase,
+			"shop_items_full": true
+		}
+		var buy_event = {
+			"msg_type": "run_page_action_sync",
+			"action_type": "shop_buy",
+			"screen": "shop",
+			"player_index": player_index,
+			"target": "item_" + str(slot_index),
+			"shop_index": slot_index,
+			"item": item_state,
+			"item_id_hash": int(item_state.get("my_id_hash", 0)),
+			"item_key": "",
+			"item_log": item_log,
+			"steal": reason == "host_steal",
+			"shop_buy_event": true,
+			"host_applied": true,
+			"shop_items_after_purchase": shop_items_after_purchase,
+			"host_state_after": purchase_display_state,
+			"state_after": purchase_display_state
+		}
+		if reason == "host_steal":
+			buy_event["steal_extra_enemies_next_wave"] = _get_shop_steal_extra_enemies_next_wave(player_index)
+		_queue_local_run_page_action(buy_event)
+		return
+
+	if source_action_type == "shop_combine_weapon" or source_action_type == "shop_discard_weapon":
+		_mark_host_shop_run_data_dirty(player_index)
 	var synthetic = {
 		"action_type": source_action_type,
 		"player_index": player_index,
@@ -1389,7 +1343,8 @@ func _deferred_broadcast_host_local_shop_state(player_index: int, source_action_
 		"resolved_item": item_state,
 		"item": item_state,
 		"item_log": item_log,
-		"steal": reason == "host_steal"
+		"steal": reason == "host_steal",
+		"ban": reason == "host_ban"
 	}
 	var state_after = _build_shop_action_delta_state(player_index, source_action_type, synthetic, true)
 	if state_after.empty():
@@ -1404,7 +1359,6 @@ func _deferred_broadcast_host_local_shop_state(player_index: int, source_action_
 		"source_action_type": source_action_type,
 		"item_log": item_log
 	})
-
 
 func _apply_shop_focus_visual_action(player_index: int, message: Dictionary) -> bool:
 	var shop = _find_shop_node()
@@ -1468,9 +1422,9 @@ func _install_client_shop_intercepts(shop: Node, player_index: int) -> void:
 
 	var container = shop._get_shop_items_container(player_index) if shop.has_method("_get_shop_items_container") else null
 	if _is_live_ref(container):
-		# Disconnect container -> shop mutations, then also intercept ShopItem -> container
-		# button signals so the Client does not locally deactivate/repack shop items
-		# before the Host confirms the operation. This avoids post-buy index drift.
+		# Disconnect container -> shop mutations and route ShopItem button signals through
+		# this manager. Purchases now execute the same BaseShop mutation immediately on the
+		# Client; other mutating actions retain their existing event/prediction handling.
 		if container.is_connected("shop_item_bought", shop, "on_shop_item_bought"):
 			container.disconnect("shop_item_bought", shop, "on_shop_item_bought")
 		if not container.is_connected("shop_item_bought", self, "_on_client_shop_item_bought"):
@@ -1498,6 +1452,61 @@ func _install_client_shop_intercepts(shop: Node, player_index: int) -> void:
 			item_popup.connect("item_discard_button_pressed", self, "_on_client_shop_discard_weapon_pressed", [player_index])
 
 	_seed_client_shop_lock_state_baseline(shop, player_index)
+
+
+func _poll_host_shop_lock_state_changes(shop: Node, player_index: int) -> void:
+	if not _is_game_host() or _applying_remote_run_page_action:
+		return
+	if not _is_valid_shop_node(shop) or player_index < 0:
+		return
+	var container = shop._get_shop_items_container(player_index) if shop.has_method("_get_shop_items_container") else null
+	if not _is_live_ref(container):
+		return
+	var shop_item_nodes = _safe_get(container, "_shop_items", [])
+	if typeof(shop_item_nodes) != TYPE_ARRAY:
+		return
+
+	var live_keys = {}
+	for slot_index in range(shop_item_nodes.size()):
+		var shop_item = shop_item_nodes[slot_index]
+		if not _is_live_ref(shop_item):
+			continue
+		if not bool(_safe_get(shop_item, "active", false)):
+			continue
+		var item_data = _safe_get(shop_item, "item_data", null)
+		if item_data == null or not bool(_safe_get(item_data, "is_lockable", true)):
+			continue
+		var slot_key = _build_client_shop_lock_slot_key(shop, player_index, slot_index, item_data)
+		if slot_key == "":
+			continue
+		live_keys[slot_key] = true
+		var locked = bool(_safe_get(shop_item, "locked", false))
+		if not _host_shop_lock_state_by_slot_key.has(slot_key):
+			_host_shop_lock_state_by_slot_key[slot_key] = locked
+			continue
+		var previous_locked = bool(_host_shop_lock_state_by_slot_key[slot_key])
+		if previous_locked == locked:
+			continue
+
+		_host_shop_lock_state_by_slot_key[slot_key] = locked
+		var message = _build_client_shop_item_action("shop_lock", shop_item, player_index)
+		message["ban"] = false
+		message["desired_locked"] = locked
+		message["host_applied"] = true
+		message["resolved_shop_index"] = slot_index
+		var state_after = _build_shop_action_delta_state(player_index, "shop_lock", message, true)
+		if not state_after.empty():
+			message["host_state_after"] = state_after
+			message["state_after"] = state_after
+		_queue_local_run_page_action(message)
+
+	var cleanup = []
+	var player_prefix = str(shop.get_instance_id()) + ":" + str(player_index) + ":"
+	for key in _host_shop_lock_state_by_slot_key.keys():
+		if not live_keys.has(key) and str(key).begins_with(player_prefix):
+			cleanup.append(key)
+	for key in cleanup:
+		_host_shop_lock_state_by_slot_key.erase(key)
 
 
 func _seed_client_shop_lock_state_baseline(shop: Node, player_index: int) -> void:
@@ -1900,18 +1909,37 @@ func _submit_local_shop_action(message: Dictionary, player_index: int, label: St
 		return
 	if _is_game_host():
 		_apply_host_local_shop_action(message, label)
+		return
+
+	var action_type = str(message.get("action_type", ""))
+	if action_type == "shop_buy":
+		if not _apply_client_local_shop_purchase(message, player_index):
+			return
 	else:
-		var predicted = _apply_client_local_shop_prediction(message, player_index, label)
-		var outbound = _build_client_shop_action_outbound_message(message)
-		_queue_local_run_page_action(outbound)
+		_apply_client_local_shop_prediction(message, player_index, label)
+	var outbound = _build_client_shop_action_outbound_message(message)
+	_queue_local_run_page_action(outbound)
+
+func _apply_client_local_shop_purchase(message: Dictionary, player_index: int) -> bool:
+	if _is_game_host() or _applying_remote_run_page_action:
+		return false
+	var shop = _find_shop_node()
+	if not _is_valid_shop_node(shop) or player_index < 0:
+		return false
+	_applying_remote_run_page_action = true
+	var applied = _apply_shop_buy_action(player_index, message)
+	_applying_remote_run_page_action = false
+	# BaseShop.on_shop_item_bought/on_shop_item_stolen already updates gear, stats,
+	# reroll price, gold and button state. Rebuilding the full gear container here would
+	# re-walk every owned item and recreate the original high-item-count stall.
+	return applied
 
 
 func _build_client_shop_action_outbound_message(message: Dictionary) -> Dictionary:
 	var outbound = message.duplicate(true)
-	# _apply_shop_buy_action() adds resolved_item for local prediction / Host-side delta
-	# building. It is the full serialized resource and can make a tiny buy request huge.
-	# The Host already owns the authoritative shop slot, so keep only identity fields
-	# such as shop_index, item_id_hash, item_key and item_log for cross-DLC validation.
+	# _apply_shop_buy_action() adds resolved identity for local execution. The Host already
+	# owns the authoritative shop slot, so the network request keeps only the original
+	# identity fields such as shop_index, item_id_hash, item_key and item_log.
 	outbound.erase("resolved_item")
 	outbound.erase("resolved_shop_index")
 	return outbound
@@ -1921,7 +1949,6 @@ func _is_client_shop_predictable_action(action_type: String) -> bool:
 	# Reroll creates a new random shop pool and must remain Host-authoritative.
 	# Predict only deterministic local display mutations.
 	return [
-		"shop_buy",
 		"shop_combine_weapon",
 		"shop_discard_weapon",
 		"shop_lock"
@@ -1938,7 +1965,6 @@ func _apply_client_local_shop_prediction(message: Dictionary, player_index: int,
 	if not _is_valid_shop_node(shop) or player_index < 0:
 		return false
 
-	_prepare_client_shop_prediction_message(message, player_index)
 	_applying_remote_run_page_action = true
 	var applied = false
 	if action_type == "shop_buy":
@@ -1957,11 +1983,9 @@ func _apply_client_local_shop_prediction(message: Dictionary, player_index: int,
 	_applying_remote_run_page_action = false
 
 	if applied:
-		_record_client_shop_prediction(player_index, message)
+		# Keep the immediate local result, but never install a hold/skip guard over
+		# later Host shop states. Host deltas are authoritative and idempotent here.
 		_refresh_client_local_shop_after_prediction(shop, player_index, action_type)
-	else:
-		message.erase("client_prediction_token")
-		message.erase("client_predicted_key")
 	return applied
 
 
@@ -1995,26 +2019,6 @@ func _apply_client_shop_lock_prediction_visual_only(shop: Node, player_index: in
 	return true
 
 
-func _prepare_client_shop_prediction_message(message: Dictionary, player_index: int) -> void:
-	if str(message.get("client_prediction_token", "")) == "":
-		_client_shop_prediction_seq += 1
-		message["client_prediction_token"] = _get_self_steam_id() + ":shop_pred:" + str(_client_shop_prediction_seq)
-	message["client_predicted_player_index"] = player_index
-	message["client_predicted_at_msec"] = OS.get_ticks_msec()
-
-
-func _record_client_shop_prediction(player_index: int, message: Dictionary) -> void:
-	var state = _build_shop_player_state(player_index)
-	var key = _build_shop_state_prediction_key_from_state(state)
-	var token = str(message.get("client_prediction_token", ""))
-	_client_shop_prediction_until_by_player[player_index] = OS.get_ticks_msec() + CLIENT_SHOP_PREDICTION_HOLD_MSEC
-	_client_shop_prediction_token_by_player[player_index] = token
-	_client_shop_prediction_key_by_player[player_index] = key
-	_client_shop_prediction_action_by_player[player_index] = str(message.get("action_type", ""))
-	_last_applied_shop_state_key_by_player[player_index] = key
-	message["client_predicted_key"] = key
-
-
 func _refresh_client_local_shop_after_prediction(shop: Node, player_index: int, action_type: String = "") -> void:
 	if not _is_valid_shop_node(shop):
 		return
@@ -2031,66 +2035,6 @@ func _refresh_client_local_shop_after_prediction(shop: Node, player_index: int, 
 		var gear_container = shop._get_gear_container(player_index) if shop.has_method("_get_gear_container") else null
 		if _is_live_ref(gear_container):
 			_force_rebuild_shop_gear_container(shop, player_index)
-
-
-func _should_skip_client_predicted_own_shop_state(state: Dictionary, context: Dictionary = {}) -> bool:
-	if _is_game_host():
-		return false
-	var local_player_index = _get_local_client_player_index()
-	var player_index = int(state.get("player_index", -1))
-	if local_player_index < 0 or player_index != local_player_index:
-		return false
-	if bool(state.get("force_run_data_repair", false)):
-		return false
-	var until_msec = int(_client_shop_prediction_until_by_player.get(player_index, 0))
-	if until_msec <= 0:
-		return false
-	var now = OS.get_ticks_msec()
-	if now > until_msec:
-		_clear_client_shop_prediction(player_index)
-		return false
-
-	var incoming_token = str(context.get("client_prediction_token", ""))
-	var expected_token = str(_client_shop_prediction_token_by_player.get(player_index, ""))
-	if incoming_token != "":
-		if incoming_token == expected_token:
-			var predicted_key = str(_client_shop_prediction_key_by_player.get(player_index, ""))
-			# Compact action deltas are echoes for a locally predicted mutation. The local
-			# client already ran vanilla logic, so applying an inventory add delta would
-			# duplicate the item/weapon. Trust the echo only when the Host applied it and
-			# the packet still carries the predicted key generated before send. Periodic
-			# full snapshots remain the correction path if the prediction was wrong.
-			if bool(state.get("shop_delta", false)) and bool(state.get("host_applied", true)) and str(context.get("client_predicted_key", "")) == predicted_key:
-				_clear_client_shop_prediction(player_index)
-				return true
-			var incoming_key = _build_shop_state_prediction_key_from_state(state)
-			if incoming_key == predicted_key:
-				_clear_client_shop_prediction(player_index)
-				return true
-			_clear_client_shop_prediction(player_index)
-			return false
-		# An older echo can arrive after a newer local prediction. Do not roll the local
-		# player's panel backward; the newest prediction will either match or be corrected.
-		return true
-
-	# Generic Host shop_state can be older than the local command because reliable P2P
-	# still preserves per-sender order, not cross-sender action/order with the Client UI.
-	# Hold only this Client's own panel; states for other players are still applied.
-	return true
-
-
-func _clear_client_shop_prediction(player_index: int) -> void:
-	_client_shop_prediction_until_by_player.erase(player_index)
-	_client_shop_prediction_token_by_player.erase(player_index)
-	_client_shop_prediction_key_by_player.erase(player_index)
-	_client_shop_prediction_action_by_player.erase(player_index)
-
-
-func _clear_all_client_shop_predictions() -> void:
-	_client_shop_prediction_until_by_player.clear()
-	_client_shop_prediction_token_by_player.clear()
-	_client_shop_prediction_key_by_player.clear()
-	_client_shop_prediction_action_by_player.clear()
 
 
 func _get_next_shop_wave_number_for_item_sync() -> int:
@@ -2244,7 +2188,6 @@ func _apply_host_local_shop_action(message: Dictionary, label: String = "") -> v
 	broadcast["host_state_after"] = state_after
 	broadcast["state_after"] = state_after
 	_queue_local_run_page_action(broadcast)
-	_last_shop_state_key = ""
 
 
 func _can_shop_buy_action_pass_local_rules(player_index: int, shop_item, container: Node, steal: bool) -> bool:
@@ -2336,43 +2279,94 @@ func _apply_shop_buy_action(player_index: int, message: Dictionary) -> bool:
 	var resolved_item_data = _safe_get(shop_item, "item_data", null)
 	message["resolved_shop_index"] = _get_shop_item_index(shop_item, player_index)
 	if typeof(message.get("resolved_item", {})) != TYPE_DICTIONARY or message.get("resolved_item", {}).empty():
-		message["resolved_item"] = _serialize_item_parent_data(resolved_item_data)
+		message["resolved_item"] = _serialize_item_parent_identity_for_action(resolved_item_data)
 	var steal = bool(message.get("steal", false))
 	if not _can_shop_buy_action_pass_local_rules(player_index, shop_item, container, steal):
 		if _is_live_ref(container) and container.has_method("update_buttons_color"):
 			container.update_buttons_color()
 		return false
 
-	# If the vanilla container->shop signal is still connected, let vanilla perform its
-	# normal checks and mutation. If we installed the local network-style intercept, the
-	# signal is disconnected, so call the authoritative shop mutation directly.
-	var container_can_mutate_shop = false
-	if _is_live_ref(container):
-		if steal:
-			container_can_mutate_shop = container.is_connected("shop_item_stolen", shop, "on_shop_item_stolen")
-		else:
-			container_can_mutate_shop = container.is_connected("shop_item_bought", shop, "on_shop_item_bought")
-	if steal and container_can_mutate_shop and container.has_method("on_shop_item_steal_button_pressed"):
-		container.on_shop_item_steal_button_pressed(shop_item)
-		return true
-	if not steal and container_can_mutate_shop and container.has_method("on_shop_item_buy_button_pressed"):
-		container.on_shop_item_buy_button_pressed(shop_item)
-		return true
-
-	if steal and shop.has_method("on_shop_item_stolen"):
-		shop.on_shop_item_stolen(shop_item, player_index)
-	elif not steal and shop.has_method("on_shop_item_bought"):
-		var value = int(_safe_get(shop_item, "value", 0))
-		if RunData.has_method("get_player_currency") and RunData.get_player_currency(player_index) < value:
-			return false
-		shop.on_shop_item_bought(shop_item, player_index)
-	else:
+	# Execute the mutation immediately rather than calling ShopItemsContainer's button
+	# handler, whose local 50ms input-delay timer can reject a valid queued network action.
+	# On the Host, emit the original container signal when BaseShop is still connected so
+	# third-party listeners keep seeing the same purchase event.
+	if steal and int(_get_node_array_value(shop, "_item_steals", player_index, 0)) <= 0:
 		return false
+	var mutation_emitted = false
+	# Theft has random persistent side effects (extra enemy groups and a random elite).
+	# Only the Host may roll those. Clients perform the real zero-cost purchase now,
+	# then apply the Host's authoritative extra-enemy list when confirmation arrives.
+	if steal and not _is_game_host():
+		mutation_emitted = _apply_client_deterministic_shop_steal(shop, shop_item, container, player_index)
+	elif _is_live_ref(container):
+		if steal and container.is_connected("shop_item_stolen", shop, "on_shop_item_stolen"):
+			container.emit_signal("shop_item_stolen", shop_item)
+			mutation_emitted = true
+		elif not steal and container.is_connected("shop_item_bought", shop, "on_shop_item_bought"):
+			container.emit_signal("shop_item_bought", shop_item)
+			mutation_emitted = true
+	if not mutation_emitted:
+		if steal and shop.has_method("on_shop_item_stolen"):
+			shop.on_shop_item_stolen(shop_item, player_index)
+		elif not steal and shop.has_method("on_shop_item_bought"):
+			var value = int(_safe_get(shop_item, "value", 0))
+			if RunData.has_method("get_player_currency") and RunData.get_player_currency(player_index) < value:
+				return false
+			shop.on_shop_item_bought(shop_item, player_index)
+		else:
+			return false
 	if shop_item.has_method("deactivate"):
 		shop_item.deactivate()
 	if _is_live_ref(container) and container.has_method("update_buttons_color"):
 		container.update_buttons_color()
 	return true
+
+
+func _apply_client_deterministic_shop_steal(shop: Node, shop_item, container, player_index: int) -> bool:
+	if _is_game_host() or not _is_valid_shop_node(shop) or not _is_live_ref(shop_item):
+		return false
+	if not shop.has_method("on_shop_item_bought"):
+		return false
+	var steals_left = int(_get_node_array_value(shop, "_item_steals", player_index, 0))
+	if steals_left <= 0:
+		return false
+	steals_left -= 1
+	_set_node_array_value(shop, "_item_steals", player_index, steals_left)
+	if _is_live_ref(container):
+		container.item_steals = steals_left
+	var item_popup = shop._get_item_popup(player_index) if shop.has_method("_get_item_popup") else null
+	if _is_live_ref(item_popup):
+		item_popup.item_steals = steals_left
+
+	# Deterministic part of BaseShop.on_shop_item_stolen(). The Host runs the full
+	# vanilla method, including all chance rolls, and sends the resulting persistent list.
+	shop_item.value = 0
+	shop.on_shop_item_bought(shop_item, player_index)
+	return true
+
+
+func _get_shop_steal_extra_enemies_next_wave(player_index: int) -> Array:
+	if player_index < 0 or RunData == null or not RunData.has_method("get_player_effects"):
+		return []
+	var effects = RunData.get_player_effects(player_index)
+	if typeof(effects) != TYPE_DICTIONARY:
+		return []
+	var extra_enemies = effects.get(Keys.extra_enemies_next_wave_hash, [])
+	if typeof(extra_enemies) != TYPE_ARRAY:
+		return []
+	return extra_enemies.duplicate(true)
+
+
+func _apply_authoritative_shop_steal_outcome(player_index: int, message: Dictionary) -> void:
+	if player_index < 0 or not message.has("steal_extra_enemies_next_wave"):
+		return
+	var authoritative = message.get("steal_extra_enemies_next_wave", [])
+	if typeof(authoritative) != TYPE_ARRAY or RunData == null or not RunData.has_method("get_player_effects"):
+		return
+	var effects = RunData.get_player_effects(player_index)
+	if typeof(effects) != TYPE_DICTIONARY:
+		return
+	effects[Keys.extra_enemies_next_wave_hash] = authoritative.duplicate(true)
 
 
 func _apply_shop_combine_weapon_action(player_index: int, message: Dictionary) -> bool:
@@ -2689,25 +2683,21 @@ func _try_apply_pending_shop_state() -> void:
 		_pending_shop_states_from_host = []
 
 
-func _apply_all_shop_states_to_ui(states: Array, context: Dictionary = {}) -> bool:
+func _apply_all_shop_states_to_ui(states: Array, _context: Dictionary = {}) -> bool:
 	var shop = _find_shop_node()
 	if not _is_valid_shop_node(shop):
 		return false
 	var applied = false
-	var consumed = false
 	_applying_remote_run_page_action = true
 	for state in states:
 		if typeof(state) != TYPE_DICTIONARY:
 			continue
-		if _should_skip_client_predicted_own_shop_state(state, context):
-			consumed = true
-			continue
 		if _apply_shop_player_state_to_ui(shop, state):
 			applied = true
 	_applying_remote_run_page_action = false
-	if (applied or consumed) and shop.has_method("update_go_next_button_text"):
+	if applied and shop.has_method("update_go_next_button_text"):
 		shop.update_go_next_button_text()
-	return applied or consumed
+	return applied
 
 
 func _set_player_gold_from_shop_state(player_index: int, gold_value: int) -> void:
@@ -2750,7 +2740,6 @@ func _build_shop_action_delta_state(player_index: int, action_type: String, mess
 		correction["full_snapshot"] = true
 		correction["delta_action"] = action_type
 		correction["host_applied"] = false
-		_record_host_shop_state_baseline_from_state(correction)
 		return correction
 
 	var state = {
@@ -2771,9 +2760,7 @@ func _build_shop_action_delta_state(player_index: int, action_type: String, mess
 		state["shop_items_full"] = false
 		var inventory_delta = _build_shop_buy_inventory_delta_from_message(player_index, message)
 		state["inventory_delta"] = inventory_delta
-		if bool(inventory_delta.get("mirror_buy_requires_full_run_data", false)):
-			_append_forced_shop_run_data_repair_to_delta_state(state, player_index, "mirror_buy")
-		elif bool(inventory_delta.get("replace_weapons", false)) and _should_use_endless_incremental_items_only_shop_sync():
+		if bool(inventory_delta.get("replace_weapons", false)) and _should_use_endless_incremental_items_only_shop_sync():
 			_append_incremental_shop_runtime_state_to_delta_state(state, player_index, "weapon_buy")
 	elif action_type == "shop_lock":
 		var lock_slot_index = int(message.get("resolved_shop_index", message.get("shop_index", -1)))
@@ -2791,10 +2778,6 @@ func _build_shop_action_delta_state(player_index: int, action_type: String, mess
 	elif action_type == "shop_go":
 		state["pressed_go"] = bool(_get_node_array_value(shop, "_player_pressed_go_button", player_index, false))
 
-	if _should_use_endless_incremental_items_only_shop_sync():
-		_record_host_shop_state_baseline_from_state(state)
-	else:
-		_record_host_shop_player_state_baseline(player_index, shop)
 	return state
 
 
@@ -2880,29 +2863,7 @@ func _build_shop_buy_inventory_delta_from_message(player_index: int, message: Di
 			"replace_weapons": true,
 			"weapons": _serialize_inventory_data_list(RunData.get_player_weapons(player_index))
 		}
-	if _is_mirror_item_state(item_state):
-		# Mirror consumes an existing duplicate_item source and may add multiple copies of
-		# the bought item. A simple items_added delta can desync PlayerRunData.items from
-		# PlayerRunData.effects[duplicate_item], so ship a full RunData repair with it.
-		return {
-			"mirror_buy_requires_full_run_data": true,
-			"replace_items": true,
-			"items": _serialize_inventory_data_list(RunData.get_player_items(player_index))
-		}
 	return {"items_added": [item_state]}
-
-
-func _is_mirror_item_state(item_state: Dictionary) -> bool:
-	if typeof(item_state) != TYPE_DICTIONARY or item_state.empty():
-		return false
-	if str(item_state.get("my_id", "")) == "item_mirror":
-		return true
-	var mirror_hash = int(_safe_get(Keys, "item_mirror_hash", 0))
-	if mirror_hash != 0 and int(item_state.get("my_id_hash", 0)) == mirror_hash:
-		return true
-	var resource_path = str(item_state.get("resource_path", ""))
-	return resource_path.find("/items/mirror/") != -1 or resource_path.find("/items/mirror_data.tres") != -1
-
 
 func _append_forced_shop_run_data_repair_to_delta_state(state: Dictionary, player_index: int, reason: String) -> void:
 	var run_data_sync = _build_forced_full_shop_run_data_repair_state(player_index, reason)
@@ -2982,8 +2943,6 @@ func _apply_shop_delta_state_to_ui(shop: Node, state: Dictionary) -> bool:
 				_apply_missing_host_inventory_placeholders_from_serialized_state(player_index, _expand_compact_player_run_data_from_shop_sync(player_index, run_data_state))
 				_last_applied_shop_gear_key_by_player.erase(shop_player_key)
 				inventory_changed = true
-				if bool(state.get("force_run_data_repair", false)) and not _is_game_host() and player_index == _get_local_client_player_index():
-					_clear_client_shop_prediction(player_index)
 				if run_data_key != "":
 					_last_applied_shop_run_data_key_by_player[player_index] = run_data_key
 
@@ -3176,12 +3135,13 @@ func _apply_shop_player_state_to_ui(shop: Node, state: Dictionary) -> bool:
 	if bool(state.get("shop_delta", false)):
 		return _apply_shop_delta_state_to_ui(shop, state)
 
+	var force_run_data_repair = bool(state.get("force_run_data_repair", false))
 	var incoming_state_key = _build_shop_state_prediction_key_from_state(state)
 	var applied_key = str(_last_applied_shop_state_key_by_player.get(player_index, ""))
-	if incoming_state_key != "" and incoming_state_key == applied_key:
+	if not force_run_data_repair and incoming_state_key != "" and incoming_state_key == applied_key:
 		# Accept duplicate authoritative states without rebuilding ShopItem/gear UI.
-		# Still re-assert reroll price because vanilla can rewrite it to 0 from stale
-		# local free-reroll flags after the authoritative state was applied.
+		# A failed optimistic purchase is explicitly marked force_run_data_repair and
+		# must bypass this shortcut even when it restores the exact entry-shop state.
 		_force_shop_reroll_price_from_host(shop, player_index, state)
 		return true
 
@@ -3192,7 +3152,7 @@ func _apply_shop_player_state_to_ui(shop: Node, state: Dictionary) -> bool:
 	var run_data_state = state.get("run_data", {})
 	if typeof(run_data_state) == TYPE_DICTIONARY and not run_data_state.empty():
 		var last_run_data_key = str(_last_applied_shop_run_data_key_by_player.get(player_index, ""))
-		if run_data_key == "" or run_data_key != last_run_data_key:
+		if force_run_data_repair or run_data_key == "" or run_data_key != last_run_data_key:
 			if _apply_one_serialized_player_run_data(player_index, run_data_state):
 				_apply_missing_host_inventory_placeholders_from_serialized_state(player_index, _expand_compact_player_run_data_from_shop_sync(player_index, run_data_state))
 				_last_applied_shop_gear_key_by_player.erase(str(shop.get_instance_id()) + ":" + str(player_index))
@@ -4019,8 +3979,6 @@ func _sanitize_host_shop_items_for_client_content(shop: Node) -> bool:
 			var container = shop._get_shop_items_container(player_index) if shop.has_method("_get_shop_items_container") else null
 			if _is_live_ref(container):
 				_apply_common_shop_items_to_host_container(container, new_items)
-	if changed_any:
-		_last_shop_state_key = ""
 	return changed_any
 
 
@@ -4234,7 +4192,7 @@ func _compact_player_run_data_for_shop_sync(player_index: int, run_data_state, h
 	if held_items_mode == SHOP_HELD_ITEMS_SYNC_INCREMENTAL_ONLY:
 		# Endless wave 21+ can have hundreds of held items. Do not build a full compact
 		# list and do not calculate the held-items hash. Clients preserve their local
-		# item list and receive only action deltas (buy/steal/mirror/etc.) plus runtime
+		# item list and receive only explicit action deltas plus runtime
 		# fields such as weapons/effects/active sets.
 		compact_state["items"] = []
 		compact_state["items_compact"] = false
@@ -8156,6 +8114,11 @@ func _apply_menu_scene_state_from_host(state: Dictionary) -> bool:
 
 func _repair_client_slot_layout_before_scene_change(target_screen: String) -> void:
 	if _is_game_host():
+		return
+	# Battle and shop share the slot/device topology created during lobby staging.
+	# Rebuilding it on each run-scene transition emits connected_players_updated and
+	# makes vanilla recreate input/focus state multiple times per wave.
+	if target_screen == SCREEN_GAME or target_screen == SCREEN_SHOP:
 		return
 	var slot_manager = _get_slot_manager()
 	if slot_manager != null and slot_manager.has_method("repair_mirrored_layout_now"):

@@ -3,7 +3,7 @@ extends Node
 
 const BROTATO_APP_ID = 1942280
 const MAX_LOBBY_MEMBERS = 4
-const MOD_VERSION = "1.1.0"
+const MOD_VERSION = "4.0.0"
 const META_AUTO_JOIN_HOST_PLAYER = "brotato_online_auto_join_host_player"
 const META_PUBLIC_LOBBY_ENABLED = "brotato_online_public_lobby_enabled"
 
@@ -1566,9 +1566,12 @@ func _handle_run_page_action_sync(from_steam_id: String, message: Dictionary) ->
 	var menu_sync_host = _get_menu_sync_manager()
 	if menu_sync_host != null and menu_sync_host.has_method("receive_run_page_action_sync"):
 		var corrected_state = menu_sync_host.receive_run_page_action_sync(from_steam_id, message, _self_steam_id)
+		if incoming_action_type == "shop_buy":
+			_route_host_shop_buy_result(from_steam_id, message, corrected_state)
+			return
 		if typeof(corrected_state) == TYPE_DICTIONARY and not corrected_state.empty():
 			# resolved_item is only an internal Host helper for building state_after.
-			# Do not echo it back, or a tiny shop_buy can become a 60KB+ packet.
+			# Do not echo it back, or a tiny action can become a large packet.
 			message.erase("resolved_item")
 			var state_for_action = corrected_state.duplicate(true)
 			var all_states = state_for_action.get("all_player_states", [])
@@ -1578,6 +1581,52 @@ func _handle_run_page_action_sync(from_steam_id: String, message: Dictionary) ->
 			message["host_state_after"] = state_for_action
 			message["state_after"] = state_for_action
 	_broadcast_run_page_action_sync(message, "")
+
+
+func _route_host_shop_buy_result(from_steam_id: String, request: Dictionary, result) -> void:
+	if not _is_game_host() or from_steam_id == "":
+		return
+	if typeof(result) != TYPE_DICTIONARY or not bool(result.get("shop_buy_protocol", false)):
+		return
+
+	var base = request.duplicate(true)
+	# Host-side execution may attach a resolved item for local use. Network purchase
+	# packets stay identity-only.
+	base.erase("resolved_item")
+	base.erase("resolved_shop_index")
+	base.erase("host_state_after")
+	base.erase("state_after")
+	base.erase("host_states_after")
+	if result.has("steal_extra_enemies_next_wave"):
+		base["steal_extra_enemies_next_wave"] = result.get("steal_extra_enemies_next_wave", []).duplicate(true)
+
+	if bool(result.get("host_applied", false)):
+		# The requester already executed the real purchase. Send only an acknowledgement
+		# to it, then replay the purchase event on every other Client.
+		var acknowledgement = base.duplicate(true)
+		acknowledgement["shop_buy_result"] = "success"
+		acknowledgement["shop_buy_event"] = false
+		acknowledgement["host_applied"] = true
+		_send_p2p_json(from_steam_id, acknowledgement, true)
+
+		var purchase_event = base.duplicate(true)
+		purchase_event.erase("shop_buy_result")
+		purchase_event["shop_buy_event"] = true
+		purchase_event["host_applied"] = true
+		_broadcast_run_page_action_sync(purchase_event, from_steam_id)
+		return
+
+	# Failure is private to the requester. It receives an explicit failure plus the
+	# authoritative full player/shop state; unrelated Clients receive nothing.
+	var failure = base.duplicate(true)
+	failure["shop_buy_result"] = "failure"
+	failure["shop_buy_event"] = false
+	failure["host_applied"] = false
+	var full_sync = result.get("full_sync", {})
+	if typeof(full_sync) == TYPE_DICTIONARY and not full_sync.empty():
+		failure["host_state_after"] = full_sync
+		failure["state_after"] = full_sync
+	_send_p2p_json(from_steam_id, failure, true)
 
 
 func _broadcast_run_page_action_sync(message: Dictionary, except_steam_id: String = "") -> void:
@@ -4175,7 +4224,8 @@ func _handle_game_start_commit_from_host(message: Dictionary) -> void:
 	_apply_host_zone_sync_for_client(message, "game_start_commit")
 	_online_flow_started = true
 	_online_flow_left_since_msec = 0
-	_repair_client_mirrored_slots("client_game_start_commit")
+	# Slot/device topology is established while staging the lobby and must stay fixed
+	# for the whole run. Do not rebuild it again when every wave enters battle.
 	_lock_online_run_slots("client_game_start_commit")
 	_sync_slot_manager_lock_flag()
 
@@ -4256,7 +4306,9 @@ func _apply_client_game_start_commit_now(commit: Dictionary) -> void:
 	_notify_menu_sync_game_start_guard(int(commit.get("start_id", _last_client_game_start_commit_id)), "client_apply_commit")
 	if bool(commit.get("force_scene_reload", false)):
 		_reset_battle_transient_caches_for_scene_restart("client_force_game_reload")
-	_repair_client_mirrored_slots("apply_client_game_start_commit")
+	# The mirrored slot layout is already authoritative from lobby/selection staging.
+	# Re-applying it here emits connected_players_updated during scene creation and can
+	# recreate FocusEmulator/input ownership several times in one wave transition.
 	menu_sync.receive_menu_scene_state_from_host(state, _self_steam_id, _get_game_host_steam_id())
 	_pending_client_game_scene_ready_start_id = int(commit.get("start_id", 0))
 
@@ -5828,8 +5880,6 @@ func _send_host_scene_transition_to_client(steam_id: String, force: bool = false
 		_sent_scene_transition_key_by_steam_id[steam_id] = key
 		if force_full_item_list:
 			_clear_full_item_list_scene_sync_requirement_for_client(steam_id)
-		if screen == "shop" and menu_sync.has_method("mark_menu_scene_shop_state_sent"):
-			menu_sync.mark_menu_scene_shop_state_sent(state)
 	else:
 		_sent_scene_transition_key_by_steam_id.erase(steam_id)
 
@@ -8020,15 +8070,6 @@ func _get_online_input_manager() -> Node:
 	if parent == null:
 		return null
 	return parent.get_node_or_null("BrotatoOnlineOnlineInputManager")
-
-
-func _repair_client_mirrored_slots(reason: String) -> void:
-	if _is_game_host():
-		return
-	var slot_manager = _get_slot_manager()
-	if slot_manager != null and slot_manager.has_method("repair_mirrored_layout_now"):
-		slot_manager.repair_mirrored_layout_now(reason)
-
 
 
 func _get_brotato_online_api() -> Node:

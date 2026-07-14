@@ -4,7 +4,7 @@ extends Node
 # path. The SteamLobbyManager remains the single owner of lobby join/leave state.
 
 const MOD_ID = "six666-BrotatoOnline"
-const MOD_VERSION = "1.1.0"
+const MOD_VERSION = "4.0.0"
 const GAME_VERSION = "1.1.15.4"
 const META_PUBLIC_LOBBY_ENABLED = "brotato_online_public_lobby_enabled"
 const SETTINGS_FILE_PATH = "user://brotato_online_settings.cfg"

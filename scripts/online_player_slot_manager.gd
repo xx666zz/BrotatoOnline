@@ -391,8 +391,8 @@ func get_player_index_for_steam_id(steam_id: String) -> int:
 
 func apply_host_selection_layout(selection_state: Dictionary, self_steam_id: String, host_steam_id: String = "") -> void:
 	var t_apply_layout = OS.get_ticks_usec()
-	if _is_slot_mutation_locked() and _local_mirrored_player_index >= 0 and not _mirrored_connected_players.empty():
-		_bo_slot_diag_log("APPLY_HOST_LAYOUT_SKIP", "reason=locked_existing_mirror self=" + self_steam_id + " host=" + host_steam_id + " players=" + _bo_slot_diag_players() + " maps=" + _bo_slot_diag_maps())
+	if _is_slot_mutation_locked():
+		_bo_slot_diag_log("APPLY_HOST_LAYOUT_SKIP", "reason=locked_run_topology self=" + self_steam_id + " host=" + host_steam_id + " players=" + _bo_slot_diag_players() + " maps=" + _bo_slot_diag_maps())
 		return
 	# Client 侧使用：根据 Host 广播的 selection_state 重建本地 COOP 槽位布局。
 	# 目标是让客户端 UI 的 player_index 与 Host 一致：Host P0 仍显示为 P0，自己如果是 P1 就显示为 P1。
@@ -810,16 +810,19 @@ func _maybe_replace_local_mirrored_keyboard_slot_with_gamepad() -> bool:
 func _restore_tracked_coop_players_if_needed() -> void:
 	if not _is_online_session_active():
 		return
-	# Client mirror layouts must survive vanilla scene transitions.  Some Brotato menus
-	# rebuild CoopService.connected_players while changing scenes; if we only restore
-	# remote placeholders, the local client slot can disappear before main.tscn spawns
-	# players, producing one-player scenes and stale/dead player nodes.
+	# Once battle/shop starts, the online slot and input-device layout is immutable.
+	# Scene transitions must not trigger the periodic mirror repair, otherwise a single
+	# wave can emit connected_players_updated repeatedly and rebuild input ownership.
+	# CoopResume is intentionally excluded by _is_slot_mutation_locked(), so Continue
+	# can still restore/reinsert players while reconnecting.
+	if _is_slot_mutation_locked():
+		return
+	# While still in unlocked lobby/menu staging, retain the last authoritative mirror.
+	# This remains useful for character/weapon selection UI rebuilds, but is deliberately
+	# disabled after the run topology has been locked above.
 	if _local_mirrored_player_index >= 0 and not _mirrored_connected_players.empty():
 		_maybe_replace_local_mirrored_keyboard_slot_with_gamepad()
 		repair_mirrored_layout_now("periodic_guard")
-		return
-
-	if _is_slot_mutation_locked():
 		return
 	if not RunData.is_coop_run:
 		return

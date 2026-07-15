@@ -468,6 +468,11 @@ func _process(delta: float) -> void:
 
 
 	if not _last_scene_was_game:
+		# A Client can press ESC while ready and carry SceneTree.paused into main.tscn.
+		# This manager processes while paused, so clear the stale menu pause exactly when
+		# the Client enters/re-enters a battle scene. Do not intercept ESC itself.
+		if get_tree().paused:
+			get_tree().paused = false
 		_last_scene_was_game = true
 		_last_game_scene_instance_id = scene_instance_id
 		_reset_snapshot_gate_for_scene(scene_instance_id, "client_enter_game_scene")

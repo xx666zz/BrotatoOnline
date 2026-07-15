@@ -18,7 +18,6 @@ func _init() -> void:
 	_install_stats_manager_safe_queues_extension()
 	_install_focus_emulator_safe_disconnect_extension()
 	_install_pause_menu_focus_safe_extension()
-	_install_coop_shop_online_ready_cancel_safe_extension()
 
 
 
@@ -96,13 +95,6 @@ func _install_focus_emulator_safe_disconnect_extension() -> void:
 
 func _install_pause_menu_focus_safe_extension() -> void:
 	var extension_path = mod_dir_path.plus_file("extensions/pause_menu_focus_safe.gd")
-	var file = File.new()
-	if file.file_exists(extension_path):
-		ModLoaderMod.install_script_extension(extension_path)
-
-
-func _install_coop_shop_online_ready_cancel_safe_extension() -> void:
-	var extension_path = mod_dir_path.plus_file("extensions/coop_shop_online_ready_cancel_safe.gd")
 	var file = File.new()
 	if file.file_exists(extension_path):
 		ModLoaderMod.install_script_extension(extension_path)

@@ -5,6 +5,27 @@ extends "res://ui/menus/ingame/pause_menu.gd"
 # this machine's physical controller count when deciding pause-menu ownership.
 
 
+func pause(player_index: int) -> void:
+	# In an online Client shop, Escape first means "cancel ready". The same physical
+	# key release is also mapped to ui_pause by vanilla BaseShop. Suppress only that
+	# paired release; ordinary pause requests continue through the original method.
+	if _brotato_online_should_suppress_shop_pause(player_index):
+		return
+	.pause(player_index)
+
+
+func _brotato_online_should_suppress_shop_pause(player_index: int) -> bool:
+	var tree = get_tree()
+	if tree == null or tree.root == null:
+		return false
+	var manager = tree.root.get_node_or_null(
+		"ModLoader/six666-BrotatoOnline/BrotatoOnlineMenuSyncManager"
+	)
+	if manager == null or not manager.has_method("should_suppress_client_shop_pause"):
+		return false
+	return bool(manager.should_suppress_client_shop_pause(player_index))
+
+
 func on_game_lost_focus() -> void:
 	var tree = get_tree()
 	if tree == null:

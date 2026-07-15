@@ -17,6 +17,7 @@ const SHOP_HELD_ITEMS_SYNC_INCREMENTAL_ONLY = "incremental_only"
 const ENDLESS_INCREMENTAL_ITEMS_ONLY_START_WAVE = 21
 const SHOP_ITEMS_RESYNC_REQUEST_COOLDOWN_MSEC = 1500
 const SHOP_CUSTOM_POPUP_BUTTON_ACTION = "shop_custom_popup_button"
+const CLIENT_SHOP_CANCEL_PAUSE_GUARD_MSEC = 5000
 
 # ItemService.TierData indexes. The enum is internal to ItemService, so mirror only
 # the stable fields required to validate its unlocked pools before opening a shop.
@@ -125,6 +126,8 @@ var _shop_input_guard_wait_release = false
 var _client_shop_intercept_key = ""
 var _pending_shop_states_from_host = []
 var _local_shop_go_pending_until_by_player = {}
+var _client_shop_requested_go_state_by_player = {}
+var _client_shop_cancel_pause_guard_until_by_player = {}
 var _host_shop_go_intercept_key = {}
 var _host_shop_item_observer_key = {}
 var _next_local_run_page_action_seq = 1
@@ -432,6 +435,7 @@ func _reset_run_page_runtime_state_for_game_start(clear_queued_actions: bool = t
 		_queued_local_run_page_action_messages.clear()
 	_pending_shop_states_from_host.clear()
 	_local_shop_go_pending_until_by_player.clear()
+	_client_shop_requested_go_state_by_player.clear()
 	_last_local_shop_focus_key.clear()
 	_last_shop_focus_target_by_player.clear()
 	_client_shop_intercept_key = ""
@@ -1733,17 +1737,24 @@ func _on_client_shop_go_pressed(player_index: int) -> void:
 	if _is_valid_shop_node(shop):
 		was_pressed = bool(_get_node_array_value(shop, "_player_pressed_go_button", player_index, false))
 	var desired_pressed = not was_pressed
+	_submit_client_shop_go_desired_state(player_index, desired_pressed, "go")
+	# Do not enter the transition guard from a speculative local ready press.
+	# Host may still receive a cancel/focus-exit before it commits the start. The
+	# authoritative game_start_prepare packet is the only point that may arm the
+	# client transition guard.
 
-	# Client does not execute the vanilla Go action locally, but the player should
-	# immediately see their own ready/cancel state while waiting for Host confirmation.
-	if not _is_game_host():
-		_force_shop_go_visual_state_for_player(player_index, desired_pressed)
-		if desired_pressed:
-			# Keep the optimistic ready mark through one delayed stale shop_state.
-			_local_shop_go_pending_until_by_player[player_index] = OS.get_ticks_msec() + 1500
-		else:
-			# Cancel must not be masked by the optimistic-ready grace window.
-			_local_shop_go_pending_until_by_player.erase(player_index)
+
+func _submit_client_shop_go_desired_state(player_index: int, desired_pressed: bool, source: String) -> void:
+	if _is_game_host() or player_index < 0:
+		return
+	_client_shop_requested_go_state_by_player[player_index] = desired_pressed
+	_force_shop_go_visual_state_for_player(player_index, desired_pressed)
+	if desired_pressed:
+		# Keep the optimistic ready mark through one delayed stale shop_state.
+		_local_shop_go_pending_until_by_player[player_index] = OS.get_ticks_msec() + 1500
+	else:
+		# Cancel must not be masked by the optimistic-ready grace window.
+		_local_shop_go_pending_until_by_player.erase(player_index)
 	var msg = {
 		"msg_type": "run_page_action_sync",
 		"action_type": "shop_go",
@@ -1751,11 +1762,49 @@ func _on_client_shop_go_pressed(player_index: int) -> void:
 		"player_index": player_index,
 		"desired_pressed": desired_pressed
 	}
-	_submit_local_shop_action(msg, player_index, "go")
-	# Do not enter the transition guard from a speculative local ready press.
-	# Host may still receive a cancel/focus-exit before it commits the start. The
-	# authoritative game_start_prepare packet is the only point that may arm the
-	# client transition guard.
+	_submit_local_shop_action(msg, player_index, source)
+
+
+func handle_client_shop_ready_cancel_input(event: InputEvent) -> bool:
+	if _is_game_host() or _get_current_menu_screen_fast() != SCREEN_SHOP:
+		return false
+	var player_index = _get_local_client_player_index()
+	if player_index < 0 or not Utils.is_player_cancel_pressed(event, player_index):
+		return false
+	var shop = _find_shop_node()
+	var local_pressed = false
+	if _is_valid_shop_node(shop):
+		local_pressed = bool(_get_node_array_value(shop, "_player_pressed_go_button", player_index, false))
+	var requested_pressed = bool(_client_shop_requested_go_state_by_player.get(player_index, local_pressed))
+	if not local_pressed and not requested_pressed:
+		return false
+
+	# Escape is both ui_cancel (pressed) and ui_pause (released) in Brotato. Vanilla
+	# clears the ready flag on press, then opens PauseMenu on release. If Host commits
+	# the wave during that interval, the paused SceneTree survives change_scene() and
+	# the new battle has no active PauseMenu capable of unpausing it. Mark the matching
+	# release for suppression and send an explicit authoritative cancel to Host.
+	_client_shop_cancel_pause_guard_until_by_player[player_index] = OS.get_ticks_msec() + CLIENT_SHOP_CANCEL_PAUSE_GUARD_MSEC
+	if not _is_game_start_guard_active():
+		_submit_client_shop_go_desired_state(player_index, false, "cancel_input")
+	else:
+		_force_shop_go_visual_state_for_player(player_index, false)
+	get_tree().set_input_as_handled()
+	return true
+
+
+func should_suppress_client_shop_pause(player_index: int) -> bool:
+	if _is_game_host() or not _is_online_session_active() or _get_current_menu_screen_fast() != SCREEN_SHOP:
+		return false
+	var local_player_index = _get_local_client_player_index()
+	if local_player_index < 0 or player_index != local_player_index:
+		return false
+	var guard_until = int(_client_shop_cancel_pause_guard_until_by_player.get(player_index, 0))
+	if guard_until <= 0 or OS.get_ticks_msec() > guard_until:
+		_client_shop_cancel_pause_guard_until_by_player.erase(player_index)
+		return false
+	_client_shop_cancel_pause_guard_until_by_player.erase(player_index)
+	return true
 
 
 func _would_shop_go_press_start_game(shop: Node, player_index: int, desired_pressed: bool) -> bool:
@@ -2506,12 +2555,23 @@ func _apply_shop_reroll_action(player_index: int, _message: Dictionary) -> bool:
 	return false
 
 
-func _apply_shop_go_action(player_index: int, _message: Dictionary) -> bool:
+func _apply_shop_go_action(player_index: int, message: Dictionary) -> bool:
 	var shop = _find_shop_node()
 	if not _is_valid_shop_node(shop):
 		return false
 	if not shop.has_method("_on_GoButton_pressed"):
 		return false
+
+	# Client packets carry the desired ready state, not merely a toggle. Applying it
+	# idempotently prevents duplicate/racing Escape cancellation packets from turning
+	# a cancelled player ready again. Host-local button presses omit this field and
+	# retain normal toggle behaviour.
+	var currently_pressed = bool(_get_node_array_value(shop, "_player_pressed_go_button", player_index, false))
+	var has_desired_state = message.has("desired_pressed")
+	var desired_pressed = bool(message.get("desired_pressed", not currently_pressed))
+	if has_desired_state and desired_pressed == currently_pressed:
+		_force_shop_go_visual_state(shop, player_index, desired_pressed)
+		return true
 
 	# Once the synchronized shop start handshake has begun, its ready snapshot is
 	# authoritative. Host-local Go presses used to bypass SteamLobbyManager's
@@ -3203,6 +3263,8 @@ func _apply_shop_player_state_to_ui(shop: Node, state: Dictionary) -> bool:
 	# optimistic ready visual briefly until the authoritative shop_go/shop_state lands.
 	if not pressed_go and int(_local_shop_go_pending_until_by_player.get(player_index, 0)) > OS.get_ticks_msec():
 		pressed_go = true
+	if not _is_game_host() and player_index == _get_local_client_player_index():
+		_client_shop_requested_go_state_by_player[player_index] = pressed_go
 	_set_node_array_value(shop, "_player_pressed_go_button", player_index, pressed_go)
 
 	var container = shop._get_shop_items_container(player_index) if shop.has_method("_get_shop_items_container") else null
@@ -10691,6 +10753,10 @@ func _get_slot_manager() -> Node:
 
 func _input(event: InputEvent) -> void:
 	if not _is_online_session_active():
+		return
+	# Handle ready-cancel before the transition guard. Even after Host has started the
+	# handshake, the matching Escape release must not pause the outgoing shop scene.
+	if handle_client_shop_ready_cancel_input(event):
 		return
 	if _is_game_start_guard_active():
 		return

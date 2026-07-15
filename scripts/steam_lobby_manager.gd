@@ -4299,6 +4299,7 @@ func _apply_queued_client_game_start_commit() -> void:
 
 
 func _apply_client_game_start_commit_now(commit: Dictionary) -> void:
+	_force_unpause_before_online_scene_transition("client_game_start_commit")
 	var menu_sync = _get_menu_sync_manager()
 	if menu_sync == null or not menu_sync.has_method("receive_menu_scene_state_from_host"):
 		return
@@ -4362,9 +4363,28 @@ func _poll_client_game_scene_ready() -> void:
 	send_menu_message_to_host(msg)
 
 
+func _force_unpause_before_online_scene_transition(_reason: String) -> void:
+	var tree = get_tree()
+	if tree == null or not tree.paused:
+		return
+	var scene = tree.current_scene
+	var pause_menu = null
+	if _is_live_node(scene):
+		pause_menu = scene.get_node_or_null("PauseMenu")
+		if pause_menu == null:
+			pause_menu = scene.get_node_or_null("UI/PauseMenu")
+	if _is_live_node(pause_menu) and pause_menu.has_method("unpause"):
+		pause_menu.unpause()
+	else:
+		# SceneTree.paused is global and survives change_scene(). Never let an outgoing
+		# shop pause freeze the newly-created battle when its PauseMenu starts hidden.
+		tree.paused = false
+
+
 func _execute_pending_host_game_start() -> void:
 	if _pending_host_game_start.empty():
 		return
+	_force_unpause_before_online_scene_transition("host_game_start_execute")
 	var start_kind = str(_pending_host_game_start.get("start_kind", "difficulty"))
 	var selection = _pending_host_game_start.get("selection", null)
 	var element = _pending_host_game_start.get("element", null)

@@ -36,6 +36,11 @@ var _host_player_joined_by_manager = false
 var _local_mirrored_steam_id = ""
 var _local_mirrored_player_index = -1
 var _online_run_slots_locked = false
+# Exact CoopService layout captured when the current online run is locked for the
+# first time. Vanilla may rebuild connected_players during scene transitions; keep
+# this immutable snapshot for the whole run and restore only when the live layout
+# actually differs.
+var _online_run_connected_players_snapshot = []
 var _mirrored_connected_players = []
 var _last_mirror_restore_log_msec = 0
 var _bo_resume_emit_scene_id = 0
@@ -61,7 +66,7 @@ func _bo_slot_diag_players() -> String:
 
 
 func _bo_slot_diag_maps() -> String:
-	return "remote_by_dev=" + str(_remote_steam_id_by_device) + " device_by_steam=" + str(_device_by_remote_steam_id) + " remote_devices=" + str(_remote_devices) + " mirror_idx=" + str(_local_mirrored_player_index) + " mirror=" + str(_mirrored_connected_players)
+	return "remote_by_dev=" + str(_remote_steam_id_by_device) + " device_by_steam=" + str(_device_by_remote_steam_id) + " remote_devices=" + str(_remote_devices) + " mirror_idx=" + str(_local_mirrored_player_index) + " mirror=" + str(_mirrored_connected_players) + " run_snapshot=" + str(_online_run_connected_players_snapshot)
 
 
 func _bo_slot_diag_context(extra: String = "") -> String:
@@ -235,9 +240,21 @@ func _process(_delta: float) -> void:
 
 
 func set_online_run_slots_locked(locked: bool) -> void:
-	if _online_run_slots_locked == locked:
+	if locked:
+		if not _online_run_slots_locked:
+			_online_run_slots_locked = true
+			_capture_online_run_slot_snapshot("first_lock")
+		else:
+			# Repeated lock requests happen before later wave/shop scene transitions.
+			# They must not rebuild a healthy layout, but are a useful synchronous fence
+			# if vanilla changed connected_players since the previous scene.
+			restore_online_run_slot_snapshot_now("repeat_lock")
 		return
-	_online_run_slots_locked = locked
+
+	if not _online_run_slots_locked and _online_run_connected_players_snapshot.empty():
+		return
+	_online_run_slots_locked = false
+	_online_run_connected_players_snapshot.clear()
 
 
 func are_online_run_slots_locked() -> bool:
@@ -301,6 +318,7 @@ func online_sync_remote_steam_ids(remote_steam_ids: Array) -> void:
 
 
 func online_clear_remote_players() -> void:
+	_online_run_connected_players_snapshot.clear()
 	_mirrored_connected_players.clear()
 	_local_mirrored_player_index = -1
 	_local_mirrored_steam_id = ""
@@ -320,6 +338,7 @@ func online_reset_to_offline(reason: String = "") -> void:
 	# or dead input until the periodic guard repairs it.
 	var was_tracking_online_slots = _host_player_joined_by_manager or not _remote_devices.empty() or _local_mirrored_player_index >= 0 or not _mirrored_connected_players.empty()
 	_online_run_slots_locked = false
+	_online_run_connected_players_snapshot.clear()
 	_mirrored_connected_players.clear()
 	_local_mirrored_player_index = -1
 	_local_mirrored_steam_id = ""
@@ -530,6 +549,64 @@ func repair_mirrored_layout_now(reason: String = "") -> void:
 		if now - _last_mirror_restore_log_msec >= 1000:
 			_last_mirror_restore_log_msec = now
 			dump_slots()
+
+
+func _capture_online_run_slot_snapshot(reason: String = "") -> bool:
+	if not _online_run_connected_players_snapshot.empty():
+		return true
+
+	# Clients already retain the final Host-authoritative staging layout. Prefer it
+	# over the live array in case vanilla changed connected_players immediately before
+	# the first game-start lock. Hosts do not have a mirrored client layout and capture
+	# their current local+remote topology directly.
+	var source = CoopService.connected_players
+	if _local_mirrored_player_index >= 0 and not _mirrored_connected_players.empty():
+		source = _mirrored_connected_players
+	if source.empty():
+		_bo_slot_diag_log("RUN_SNAPSHOT_SKIP", "reason=" + reason + " empty_connected_players")
+		return false
+
+	var snapshot = _duplicate_connected_players(source)
+	if snapshot.size() != source.size():
+		_bo_slot_diag_log("RUN_SNAPSHOT_SKIP", "reason=" + reason + " invalid_layout=" + str(source))
+		return false
+
+	_online_run_connected_players_snapshot = snapshot
+	_bo_slot_diag_log("RUN_SNAPSHOT_CAPTURE", "reason=" + reason + " snapshot=" + str(_online_run_connected_players_snapshot))
+	_restore_online_run_slot_snapshot_if_needed("capture:" + reason)
+	return true
+
+
+func get_online_run_slot_snapshot_count() -> int:
+	if _online_run_connected_players_snapshot.empty():
+		return -1
+	return int(_online_run_connected_players_snapshot.size())
+
+
+func restore_online_run_slot_snapshot_now(reason: String = "") -> bool:
+	if not _is_online_session_active():
+		return false
+	if _online_run_connected_players_snapshot.empty():
+		return false
+	return _restore_online_run_slot_snapshot_if_needed(reason)
+
+
+func _restore_online_run_slot_snapshot_if_needed(reason: String = "") -> bool:
+	if _online_run_connected_players_snapshot.empty():
+		return false
+	if _connected_players_match(_online_run_connected_players_snapshot):
+		return false
+
+	_bo_slot_diag_log("RESTORE_RUN_SNAPSHOT", "reason=" + reason + " before=" + _bo_slot_diag_players() + " snapshot=" + str(_online_run_connected_players_snapshot))
+	CoopService.connected_players.clear()
+	for player in _online_run_connected_players_snapshot:
+		if typeof(player) == TYPE_ARRAY and player.size() >= 2:
+			CoopService.connected_players.append([int(player[0]), int(player[1])])
+
+	_sync_run_data_player_count()
+	_bo_emit_connected_players_updated("restore_run_snapshot:" + reason)
+	_refresh_current_character_selection_layout()
+	return true
 
 
 func _duplicate_connected_players(source: Array) -> Array:
@@ -810,16 +887,19 @@ func _maybe_replace_local_mirrored_keyboard_slot_with_gamepad() -> bool:
 func _restore_tracked_coop_players_if_needed() -> void:
 	if not _is_online_session_active():
 		return
-	# Once battle/shop starts, the online slot and input-device layout is immutable.
-	# Scene transitions must not trigger the periodic mirror repair, otherwise a single
-	# wave can emit connected_players_updated repeatedly and rebuild input ownership.
-	# CoopResume is intentionally excluded by _is_slot_mutation_locked(), so Continue
-	# can still restore/reinsert players while reconnecting.
+
+	# During a locked run, compare against the one snapshot captured at the initial
+	# normal/Continue entry. A healthy layout is untouched; only a real vanilla-side
+	# mutation is restored. This avoids per-wave rebuilding while still preventing a
+	# transient one-player layout from becoming permanent.
+	if not _online_run_connected_players_snapshot.empty():
+		_restore_online_run_slot_snapshot_if_needed("periodic_run_guard")
+		return
+
 	if _is_slot_mutation_locked():
 		return
-	# While still in unlocked lobby/menu staging, retain the last authoritative mirror.
-	# This remains useful for character/weapon selection UI rebuilds, but is deliberately
-	# disabled after the run topology has been locked above.
+	# Before the run is locked, retain the latest authoritative client mirror while
+	# character/weapon selection or CoopResume is still assembling the topology.
 	if _local_mirrored_player_index >= 0 and not _mirrored_connected_players.empty():
 		_maybe_replace_local_mirrored_keyboard_slot_with_gamepad()
 		repair_mirrored_layout_now("periodic_guard")

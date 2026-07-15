@@ -17,6 +17,7 @@ func _init() -> void:
 	_install_player_projectile_safe_speed_extension()
 	_install_stats_manager_safe_queues_extension()
 	_install_focus_emulator_safe_disconnect_extension()
+	_install_pause_menu_focus_safe_extension()
 
 
 
@@ -90,6 +91,14 @@ func _install_focus_emulator_safe_disconnect_extension() -> void:
 		ModLoaderMod.install_script_extension(extension_path)
 	else:
 		pass
+
+
+func _install_pause_menu_focus_safe_extension() -> void:
+	var extension_path = mod_dir_path.plus_file("extensions/pause_menu_focus_safe.gd")
+	var file = File.new()
+	if file.file_exists(extension_path):
+		ModLoaderMod.install_script_extension(extension_path)
+
 
 
 func _install_player_local_outline_extension() -> void:

@@ -2838,10 +2838,6 @@ func _should_drop_stale_retry_battle_packet(message: Dictionary) -> bool:
 		var packet_context = str(message.get("battle_retry_context_key", ""))
 		if expected_context != "" and packet_context != "" and packet_context != expected_context:
 			return true
-	if message.has("r"):
-		var packet_retries = int(message.get("r", RunData.retries))
-		if packet_retries < int(RunData.retries):
-			return true
 	return false
 
 
@@ -2922,12 +2918,14 @@ func _on_online_retry_wave_confirm_pressed() -> void:
 	_retry_wave_local_waiting_context_key = context_key
 	_set_retry_wave_confirm_locked(retry_wave, true)
 	_update_retry_wave_waiting_visual(retry_wave, true, 1, max(1, RunData.get_player_count()))
+	var context_wave = _get_retry_wave_context_wave(context_key)
+	var context_retries = _get_retry_wave_context_retries(context_key)
 	var msg = {
 		"msg_type": "retry_wave_confirm",
 		"context_key": context_key,
 		"local_context_key": local_context_key,
-		"current_wave": int(RunData.current_wave),
-		"retries": int(RunData.retries),
+		"current_wave": context_wave if context_wave != -999999 else int(RunData.current_wave),
+		"retries": context_retries if context_retries != -999999 else int(RunData.retries),
 		"client_msec": OS.get_ticks_msec()
 	}
 	send_menu_message_to_host(msg)
@@ -2997,12 +2995,14 @@ func _on_online_retry_wave_cancel_pressed() -> void:
 		_start_synced_retry_wave_end(context_key, "host_local_decline")
 		return
 	_retry_wave_ending_context_key = context_key
+	var context_wave = _get_retry_wave_context_wave(context_key)
+	var context_retries = _get_retry_wave_context_retries(context_key)
 	var msg = {
 		"msg_type": "retry_wave_decline",
 		"context_key": context_key,
 		"local_context_key": local_context_key,
-		"current_wave": int(RunData.current_wave),
-		"retries": int(RunData.retries),
+		"current_wave": context_wave if context_wave != -999999 else int(RunData.current_wave),
+		"retries": context_retries if context_retries != -999999 else int(RunData.retries),
 		"client_msec": OS.get_ticks_msec()
 	}
 	send_menu_message_to_host(msg)
@@ -3019,9 +3019,10 @@ func _handle_retry_wave_decline_from_client(from_steam_id: String, message: Dict
 	if local_context_key == "":
 		return
 	var client_context_key = str(message.get("context_key", ""))
-	var client_wave = int(message.get("current_wave", _get_retry_wave_context_wave(client_context_key)))
-	var client_retries = int(message.get("retries", RunData.retries))
-	if client_wave != int(RunData.current_wave) or client_retries != int(RunData.retries):
+	# context_key is the Host-issued retry generation. The client's local RunData.retries
+	# can legitimately be stale after joining/continuing, so never reject a valid choice
+	# because of the redundant client-side counters.
+	if client_context_key != local_context_key:
 		return
 	_start_synced_retry_wave_end(local_context_key, "client_decline:" + from_steam_id)
 
@@ -3069,10 +3070,14 @@ func _handle_retry_wave_end_from_host(message: Dictionary) -> void:
 	var context_key = str(message.get("context_key", ""))
 	if context_key == "":
 		return
-	var host_wave = int(message.get("current_wave", _get_retry_wave_context_wave(context_key)))
-	var host_retries = int(message.get("retries", RunData.retries))
-	if host_wave != int(RunData.current_wave) or host_retries != int(RunData.retries):
+	if _retry_wave_host_context_key != "" and context_key != _retry_wave_host_context_key:
 		return
+	var host_wave = _get_retry_wave_context_wave(context_key)
+	var host_retries = _get_retry_wave_context_retries(context_key)
+	if host_wave != -999999:
+		RunData.current_wave = host_wave
+	if host_retries != -999999:
+		RunData.retries = host_retries
 	_retry_wave_ending_context_key = context_key
 	call_deferred("_apply_synced_retry_wave_end", context_key)
 
@@ -3109,13 +3114,10 @@ func _handle_retry_wave_confirm_from_client(from_steam_id: String, message: Dict
 	var local_context_key = _get_retry_wave_network_context_key()
 	if local_context_key == "":
 		return
-	var client_wave = int(message.get("current_wave", _get_retry_wave_context_wave(client_context_key)))
-	var client_retries = int(message.get("retries", RunData.retries))
-	var host_wave = int(RunData.current_wave)
-	if client_wave != host_wave or client_retries != int(RunData.retries):
-		return
+	# The Host context is authoritative. A client may still carry a retry count from
+	# another local/continued run; accepting an exact context prevents the 1/2 deadlock.
 	if client_context_key != local_context_key:
-		pass
+		return
 	_mark_retry_wave_ready(from_steam_id, local_context_key, "client")
 	_broadcast_retry_wave_state(true)
 	_try_start_retry_wave_if_all_ready()
@@ -3128,6 +3130,12 @@ func _handle_retry_wave_state_from_host(message: Dictionary) -> void:
 	if context_key == "":
 		return
 	_retry_wave_host_context_key = context_key
+	var host_wave = _get_retry_wave_context_wave(context_key)
+	var host_retries = _get_retry_wave_context_retries(context_key)
+	if host_wave != -999999:
+		RunData.current_wave = host_wave
+	if host_retries != -999999:
+		RunData.retries = host_retries
 	var retry_wave = _get_retry_wave_node()
 	if not _is_live_node(retry_wave):
 		return
@@ -3472,6 +3480,18 @@ func _get_retry_wave_context_wave(context_key: String) -> int:
 	if not wave_str.is_valid_integer():
 		return -999999
 	return int(wave_str)
+
+
+func _get_retry_wave_context_retries(context_key: String) -> int:
+	if context_key == "":
+		return -999999
+	var parts = context_key.split(":")
+	if parts.size() < 2:
+		return -999999
+	var retries_str = str(parts[1])
+	if not retries_str.is_valid_integer():
+		return -999999
+	return int(retries_str)
 
 
 func _retry_wave_contexts_exact(a: String, b: String) -> bool:
@@ -5429,6 +5449,7 @@ func _expand_compact_battle_snapshot(message: Dictionary) -> Dictionary:
 
 
 func _handle_battle_terminal_state_from_host(message: Dictionary) -> void:
+	_apply_host_retry_count_from_battle_message(message)
 	var replica_manager = _get_battle_replica_manager()
 	if replica_manager != null and replica_manager.has_method("receive_battle_terminal_state_from_host"):
 		replica_manager.receive_battle_terminal_state_from_host(message)
@@ -5448,6 +5469,7 @@ func _handle_battle_reliable_events_from_host(message: Dictionary) -> void:
 func _handle_battle_snapshot_from_host(message: Dictionary) -> void:
 	# the transport boundary so BattleReplicaManager can keep its normal schema.
 	var now = OS.get_ticks_msec()
+	_apply_host_retry_count_from_battle_message(message)
 	var t_expand = OS.get_ticks_usec()
 	var expanded = _expand_compact_battle_snapshot(message) if _safe_bool(message.get("compact", false)) else message
 	_bo_net_diag_cost("expand_battle_snapshot", t_expand, "compact=" + str(message.get("compact", false)) + " tick=" + str(expanded.get("tick", message.get("t", 0))))
@@ -5484,6 +5506,16 @@ func _handle_battle_snapshot_from_host(message: Dictionary) -> void:
 	var counts = expanded.get("counts", {})
 	var delta_tick = tick - int(_last_client_battle_snapshot_rx_tick)
 	_last_client_battle_snapshot_rx_tick = tick
+
+
+func _apply_host_retry_count_from_battle_message(message: Dictionary) -> void:
+	if typeof(message) != TYPE_DICTIONARY:
+		return
+	if message.has("r"):
+		RunData.retries = int(message.get("r", RunData.retries))
+	elif message.has("retries"):
+		RunData.retries = int(message.get("retries", RunData.retries))
+
 
 func _safe_bool(value) -> bool:
 	if typeof(value) == TYPE_BOOL:

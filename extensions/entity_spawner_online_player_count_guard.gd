@@ -44,6 +44,16 @@ func _brotato_online_get_steam_lobby_manager() -> Node:
 	return _brotato_online_find_node_named(tree.root, "BrotatoOnlineSteamLobbyManager", 0)
 
 
+func _brotato_online_get_slot_manager() -> Node:
+	var tree = get_tree()
+	if tree == null or tree.root == null:
+		return null
+	var direct = tree.root.get_node_or_null("ModLoader/six666-BrotatoOnline/BrotatoOnlineOnlinePlayerSlotManager")
+	if direct != null and is_instance_valid(direct):
+		return direct
+	return _brotato_online_find_node_named(tree.root, "BrotatoOnlineOnlinePlayerSlotManager", 0)
+
+
 func _brotato_online_is_online_client() -> bool:
 	if not _brotato_online_is_online_session_active():
 		return false
@@ -56,6 +66,20 @@ func _brotato_online_is_online_client() -> bool:
 func _brotato_online_get_authoritative_online_player_count() -> int:
 	if not _brotato_online_is_online_session_active():
 		return -1
+
+	# Vanilla can rebuild connected_players during main.tscn construction, after the
+	# previous scene's pre-change guard but before EntitySpawner.init(). Restore the
+	# immutable run snapshot synchronously here so both vanilla player spawning and the
+	# RunData count below observe the original online topology.
+	var slot_manager = _brotato_online_get_slot_manager()
+	if slot_manager != null:
+		if slot_manager.has_method("restore_online_run_slot_snapshot_now"):
+			slot_manager.restore_online_run_slot_snapshot_now("entity_spawner_init")
+		if slot_manager.has_method("get_online_run_slot_snapshot_count"):
+			var snapshot_count = int(slot_manager.get_online_run_slot_snapshot_count())
+			if snapshot_count > 0:
+				return int(clamp(snapshot_count, 1, 4))
+
 	if CoopService == null:
 		return -1
 	var coop_count = int(CoopService.connected_players.size())

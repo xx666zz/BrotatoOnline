@@ -8115,13 +8115,21 @@ func _apply_menu_scene_state_from_host(state: Dictionary) -> bool:
 func _repair_client_slot_layout_before_scene_change(target_screen: String) -> void:
 	if _is_game_host():
 		return
-	# Battle and shop share the slot/device topology created during lobby staging.
-	# Rebuilding it on each run-scene transition emits connected_players_updated and
-	# makes vanilla recreate input/focus state multiple times per wave.
-	if target_screen == SCREEN_GAME or target_screen == SCREEN_SHOP:
-		return
 	var slot_manager = _get_slot_manager()
-	if slot_manager != null and slot_manager.has_method("repair_mirrored_layout_now"):
+	if slot_manager == null:
+		return
+
+	# Battle/shop use the immutable snapshot captured at the first run lock. This is a
+	# comparison-only fast path when the layout is healthy and restores only if vanilla
+	# changed the device/player array during the previous scene lifecycle.
+	if target_screen == SCREEN_GAME or target_screen == SCREEN_SHOP:
+		if slot_manager.has_method("restore_online_run_slot_snapshot_now"):
+			slot_manager.restore_online_run_slot_snapshot_now("before_client_scene_change:" + target_screen)
+		return
+
+	# Lobby/staging screens are still allowed to follow the newest Host layout before
+	# the run snapshot is captured.
+	if slot_manager.has_method("repair_mirrored_layout_now"):
 		slot_manager.repair_mirrored_layout_now("before_client_scene_change:" + target_screen)
 
 
@@ -8167,6 +8175,7 @@ func _build_run_config_for_scene_sync(include_player_run_data: bool = true, held
 		"current_zone": int(RunData.current_zone),
 		"current_difficulty": int(RunData.current_difficulty),
 		"current_wave": int(RunData.current_wave),
+		"retries": int(RunData.retries),
 		"full_item_list_for_scene_sync": bool(force_full_held_items),
 		"zone_selected": int(ProgressData.settings.zone_selected),
 		"zone_is_random": bool(ProgressData.settings.zone_is_random),

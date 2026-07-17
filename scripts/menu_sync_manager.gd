@@ -6975,6 +6975,8 @@ func _apply_upgrade_options_to_progression_container(container: Node, player_ind
 		container.set("_reroll_discount", int(visible.get("reroll_discount", container.get("_reroll_discount"))))
 	if container.get("_old_upgrades") != null:
 		container.set("_old_upgrades", upgrades.duplicate())
+	if visible.has("gold"):
+		_set_player_gold_from_shop_state(player_index, int(visible.get("gold", RunData.get_player_gold(player_index))))
 	var upgrade_uis = []
 	if container.has_method("_get_upgrade_uis"):
 		upgrade_uis = container._get_upgrade_uis()
@@ -7131,6 +7133,7 @@ func _build_progression_visible_option(player_index: int, ui: Node = null) -> Di
 		return {
 			"mode": "upgrade",
 			"player_index": player_index,
+			"gold": int(RunData.get_player_gold(player_index)),
 			"level": int(_safe_get(container, "_level", 0)),
 			"reroll_price": int(_safe_get(container, "_reroll_price", 0)),
 			"reroll_count": int(_safe_get(container, "_reroll_count", 0)),

@@ -100,6 +100,11 @@ var _self_steam_id = ""
 var _members = []
 var _open_invite_overlay_after_create = false
 var _last_key_time = 0
+# Steam may deliver a join request while Brotato is still running its boot-time
+# data/language initialization. Keep that request separate from the normal join
+# state until the vanilla main menu has appeared once.
+var _startup_main_menu_ready = false
+var _startup_pending_join_lobby_id = 0
 var _pending_join_lobby_id = 0
 var _client_join_requested_lobby_id = 0
 var _client_join_request_started_msec = 0
@@ -382,6 +387,8 @@ func _process(_delta: float) -> void:
 	# Steam callbacks and F6/join handling must keep running even before a lobby exists.
 	var t_boot = OS.get_ticks_usec()
 	_run_steam_callbacks()
+	_poll_startup_main_menu_ready()
+	_consume_startup_join_if_ready()
 	_consume_pending_join_if_ready()
 	_poll_join_request_timeout()
 	_handle_shortcuts()
@@ -540,6 +547,13 @@ func join_lobby(lobby_id) -> void:
 		_show_join_failure(_ui_text("join_failed_invalid"))
 		return
 
+	# Only the first boot is gated. After the vanilla main menu has appeared once,
+	# Steam Join continues to work from character selection, shop, battle, or any
+	# other screen exactly as before.
+	if not _startup_main_menu_ready:
+		_startup_pending_join_lobby_id = target_lobby_id
+		return
+
 	if _client_join_request_started_msec == 0:
 		_client_join_request_started_msec = OS.get_ticks_msec()
 
@@ -601,6 +615,7 @@ func leave_lobby() -> void:
 	_online_flow_started = false
 	_online_flow_left_since_msec = 0
 	_members.clear()
+	_startup_pending_join_lobby_id = 0
 	_pending_join_lobby_id = 0
 	_client_join_requested_lobby_id = 0
 	_client_join_request_started_msec = 0
@@ -972,6 +987,7 @@ func _on_lobby_joined(lobby_id = 0, permissions = 0, locked = false, response = 
 
 
 func _clear_pending_join_request() -> void:
+	_startup_pending_join_lobby_id = 0
 	_pending_join_lobby_id = 0
 	_client_join_requested_lobby_id = 0
 	_client_join_request_started_msec = 0
@@ -5857,6 +5873,36 @@ func _get_menu_scene_state_stable_key(state: Dictionary) -> String:
 	return to_json(stable)
 
 
+func _is_complete_shop_scene_transition_state(state: Dictionary) -> bool:
+	if str(state.get("screen", "")) != "shop":
+		return true
+	var shop_state = state.get("shop_state", {})
+	if typeof(shop_state) != TYPE_DICTIONARY:
+		return false
+	var players = shop_state.get("players", [])
+	if typeof(players) != TYPE_ARRAY:
+		return false
+	var run_config = state.get("run_config", {})
+	var expected_player_count = 0
+	if typeof(run_config) == TYPE_DICTIONARY:
+		expected_player_count = int(run_config.get("player_count", 0))
+	if expected_player_count <= 0 or players.size() < expected_player_count:
+		return false
+	var expected_shop_slot_count = int(ItemService.NB_SHOP_ITEMS)
+	for player_index in range(expected_player_count):
+		var player_state = players[player_index]
+		if typeof(player_state) != TYPE_DICTIONARY:
+			return false
+		var shop_items = player_state.get("shop_items", [])
+		if typeof(shop_items) != TYPE_ARRAY:
+			return false
+		if shop_items.size() < expected_shop_slot_count:
+			return false
+		if int(player_state.get("shop_slot_count", shop_items.size())) < expected_shop_slot_count:
+			return false
+	return true
+
+
 func _send_host_scene_transition_to_client(steam_id: String, force: bool = false) -> void:
 	var menu_sync = _get_menu_sync_manager()
 	if menu_sync == null or not menu_sync.has_method("build_menu_scene_state"):
@@ -5892,8 +5938,10 @@ func _send_host_scene_transition_to_client(steam_id: String, force: bool = false
 
 	var full_payload_cache_key = screen + "|" + key + "|full_items=" + str(force_full_item_list)
 	var now = OS.get_ticks_msec()
+	var loaded_from_payload_cache = false
 	if not force and _host_scene_transition_payload_cache_key == full_payload_cache_key and now - int(_host_scene_transition_payload_cache_msec) <= MENU_SCENE_BROADCAST_INTERVAL_MSEC and typeof(_host_scene_transition_payload_cache_state) == TYPE_DICTIONARY and not _host_scene_transition_payload_cache_state.empty():
 		state = _host_scene_transition_payload_cache_state.duplicate(true)
+		loaded_from_payload_cache = true
 	else:
 		state = menu_sync.build_menu_scene_state(screen == "shop", true, force_full_item_list)
 		_augment_host_zone_sync_payload(state)
@@ -5902,10 +5950,21 @@ func _send_host_scene_transition_to_client(steam_id: String, force: bool = false
 			_copy_current_host_wave_schedule_into_run_config(send_run_config)
 			state["run_config"] = send_run_config
 		state.erase("availability")
-		if not force:
-			_host_scene_transition_payload_cache_key = full_payload_cache_key
-			_host_scene_transition_payload_cache_msec = now
-			_host_scene_transition_payload_cache_state = state.duplicate(true)
+
+	# CoopShop can already be detected as the current screen before every player's
+	# visual sale slots have finished initializing. Do not send, cache, or mark this
+	# transition as delivered until the authoritative shop_items arrays are complete.
+	if screen == "shop" and not _is_complete_shop_scene_transition_state(state):
+		if loaded_from_payload_cache:
+			_host_scene_transition_payload_cache_key = ""
+			_host_scene_transition_payload_cache_msec = 0
+			_host_scene_transition_payload_cache_state = {}
+		return
+
+	if not force and not loaded_from_payload_cache:
+		_host_scene_transition_payload_cache_key = full_payload_cache_key
+		_host_scene_transition_payload_cache_msec = now
+		_host_scene_transition_payload_cache_state = state.duplicate(true)
 
 	var send_ok = _send_p2p_json(steam_id, state, true)
 	if send_ok:
@@ -8003,8 +8062,39 @@ func _check_launch_join_args() -> void:
 	if parsed_lobby_id == 0:
 		return
 
-	_pending_join_lobby_id = parsed_lobby_id
-	_consume_pending_join_if_ready()
+	join_lobby(parsed_lobby_id)
+
+
+func _poll_startup_main_menu_ready() -> void:
+	if _startup_main_menu_ready:
+		return
+
+	var tree = get_tree()
+	if tree == null:
+		return
+	var current = tree.current_scene
+	if current == null:
+		return
+
+	var start_button = _find_node_recursive(current, "StartButton")
+	if start_button == null or not is_instance_valid(start_button):
+		return
+	var parent = start_button.get_parent()
+	if parent == null or str(parent.name) != "ButtonsLeft":
+		return
+
+	# This is a one-way boot barrier. Do not close it again when leaving the main
+	# menu, otherwise an invite received from another game screen would be blocked.
+	_startup_main_menu_ready = true
+
+
+func _consume_startup_join_if_ready() -> void:
+	if not _startup_main_menu_ready or _startup_pending_join_lobby_id == 0:
+		return
+
+	var lobby_to_join = _startup_pending_join_lobby_id
+	_startup_pending_join_lobby_id = 0
+	join_lobby(lobby_to_join)
 
 
 func _consume_pending_join_if_ready() -> void:

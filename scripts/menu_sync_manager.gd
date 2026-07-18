@@ -831,7 +831,19 @@ func receive_run_page_action_sync(from_steam_id: String, message: Dictionary, se
 		if _is_game_host():
 			applied = _apply_shop_reroll_action(player_index, message)
 		else:
-			applied = true
+			# The Host remains authoritative for whether the reroll succeeded and for
+			# the resulting shop slots. Once success is confirmed, replay the real
+			# vanilla reroll locally first so item/stat side effects and UI markers run,
+			# then the existing shop_state application below replaces the random slots
+			# with the Host's authoritative sale items.
+			var reroll_state_after = message.get("host_shop_state_after", message.get("host_state_after", message.get("state_after", {})))
+			var host_applied_reroll = true
+			if typeof(reroll_state_after) == TYPE_DICTIONARY and reroll_state_after.has("host_applied"):
+				host_applied_reroll = bool(reroll_state_after.get("host_applied", true))
+			if host_applied_reroll:
+				applied = _apply_shop_reroll_action(player_index, message)
+			else:
+				applied = true
 	elif action_type == "shop_go":
 		if _is_game_host():
 			applied = _apply_shop_go_action(player_index, message)

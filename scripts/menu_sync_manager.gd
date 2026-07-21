@@ -568,7 +568,6 @@ func _process(_delta: float) -> void:
 	if _is_selection_like_screen_fast(fast_screen):
 		var t_selection = OS.get_ticks_usec()
 		_enforce_focus_change_cancels_ready_on_current_selection()
-		_poll_selection_state_change()
 		_try_apply_online_catalog_to_current_selection()
 		_try_apply_host_dlc_gate_to_current_selection(fast_screen)
 		_try_apply_pending_client_prime_focus()
@@ -10198,19 +10197,6 @@ func build_selection_state() -> Dictionary:
 		result["host_focus"] = _element_to_state(_get_latest_focused_element(selection, 0))
 
 	return result
-
-func _poll_selection_state_change() -> void:
-	var state = build_selection_state()
-	if str(state.get("screen", "")) == "none":
-		_last_state_key = ""
-		return
-
-	var key = to_json(state)
-	if key == _last_state_key:
-		return
-
-	_last_state_key = key
-
 
 func _compact_players_state(state: Dictionary) -> String:
 	var parts = []

@@ -19,6 +19,14 @@ const P2P_CHANNEL_BATTLE = 1
 const P2P_CHANNEL_LOBBY_BROWSER = 2
 const P2P_POLL_LIMIT_PER_FRAME = 32
 const P2P_BATTLE_POLL_LIMIT_PER_FRAME = 64
+# Decouple Steam/network polling from render FPS. At very high uncapped FPS the
+# old per-frame polling spent several milliseconds repeatedly entering GDScript
+# and GodotSteam even when no packets or state changes existed.
+const STEAM_CALLBACK_INTERVAL_USEC = 8333 # ~120 Hz
+const P2P_BATTLE_POLL_INTERVAL_USEC = 8333 # ~120 Hz
+const P2P_MENU_POLL_INTERVAL_USEC = 40000 # 25 Hz
+const MENU_ACTION_POLL_INTERVAL_USEC = 50000 # 20 Hz
+const MENU_PHASE_SELECTION_POLL_INTERVAL_USEC = 125000 # 8 Hz
 const SELECTION_BROADCAST_INTERVAL_MSEC = 250
 const MENU_SCENE_BROADCAST_INTERVAL_MSEC = 250
 const CLIENT_MENU_INPUT_POLL_INTERVAL_MSEC = 50
@@ -114,6 +122,13 @@ var _checked_launch_args = false
 var _last_selection_broadcast_msec = 0
 var _last_broadcast_selection_key = ""
 var _last_client_menu_input_poll_msec = 0
+var _last_steam_callback_poll_usec = 0
+var _last_p2p_battle_poll_usec = 0
+var _last_p2p_menu_poll_usec = 0
+var _last_menu_action_poll_usec = 0
+var _last_menu_phase_selection_poll_usec = 0
+var _cached_in_game_scene = false
+var _cached_in_normal_shop_scene = false
 var _accepted_p2p_sessions = {}
 var _online_flow_started = false
 var _online_flow_left_since_msec = 0
@@ -384,75 +399,110 @@ func _input(_event: InputEvent) -> void:
 
 func _process(_delta: float) -> void:
 	var process_start_usec = OS.get_ticks_usec()
-	# Steam callbacks and F6/join handling must keep running even before a lobby exists.
-	var t_boot = OS.get_ticks_usec()
-	_run_steam_callbacks()
-	_poll_startup_main_menu_ready()
-	_consume_startup_join_if_ready()
-	_consume_pending_join_if_ready()
-	_poll_join_request_timeout()
-	_handle_shortcuts()
-	_bo_net_diag_cost("steam_callbacks_and_shortcuts", t_boot)
+	var now_usec = process_start_usec
 
-	# Button injection belongs to menu scenes only. In main.tscn these polls fall back
-	# to recursive scene-tree searches for RunOptionsPanel / StartButton / invite nodes.
-	# Keep Steam/P2P running, but do not scan menu UI during battle.
-	var in_game_scene = _is_in_game_scene()
-	var in_normal_shop_scene = _is_in_shop_scene() and not _is_in_official_coop_resume_scene()
-	if not in_game_scene and not in_normal_shop_scene:
-		var t_ui = OS.get_ticks_usec()
-		_poll_lobby_toggle_button()
-		_poll_character_invite_button()
-		_poll_continue_invite_button()
-		_poll_main_menu_online_button()
-		_poll_main_menu_online_start_pending()
-		_poll_official_continue_auto_lobby()
-		_poll_joining_overlay()
-		_bo_net_diag_cost("menu_button_poll", t_ui)
-	else:
-		_clear_non_game_ui_button_refs()
-		_remove_joining_overlay()
-	_update_online_session_runtime_flag()
+	# Steam callbacks remain responsive, but no longer scale with uncapped render FPS.
+	var callback_poll_due = _last_steam_callback_poll_usec == 0 or now_usec - _last_steam_callback_poll_usec >= STEAM_CALLBACK_INTERVAL_USEC
+	if callback_poll_due:
+		_last_steam_callback_poll_usec = now_usec
+		var t_callbacks = OS.get_ticks_usec()
+		_run_steam_callbacks()
+		_bo_net_diag_cost("steam_callbacks", t_callbacks)
+
+	# Scene/UI/phase discovery is deliberately slow. These paths perform node searches,
+	# construct state dictionaries, and do not need render-frame latency.
+	var slow_poll_due = _last_menu_phase_selection_poll_usec == 0 or now_usec - _last_menu_phase_selection_poll_usec >= MENU_PHASE_SELECTION_POLL_INTERVAL_USEC
+	if slow_poll_due:
+		_last_menu_phase_selection_poll_usec = now_usec
+		var t_boot = OS.get_ticks_usec()
+		_poll_startup_main_menu_ready()
+		_consume_startup_join_if_ready()
+		_consume_pending_join_if_ready()
+		_poll_join_request_timeout()
+		_handle_shortcuts()
+		_bo_net_diag_cost("startup_join_and_shortcuts", t_boot)
+
+		# Button injection is routed by the current menu scene. Do not run every menu
+		# poll and let each one search for UI that cannot exist on this screen.
+		_cached_in_game_scene = _is_in_game_scene()
+		_cached_in_normal_shop_scene = _is_in_shop_scene() and not _is_in_official_coop_resume_scene()
+		if not _cached_in_game_scene and not _cached_in_normal_shop_scene:
+			var t_ui = OS.get_ticks_usec()
+			var current_menu_scene = get_tree().current_scene
+			if _is_character_selection_scene():
+				_poll_lobby_toggle_button()
+				_poll_character_invite_button()
+				_poll_main_menu_online_start_pending()
+			elif _is_in_official_coop_resume_scene():
+				_poll_continue_invite_button()
+				_poll_official_continue_auto_lobby()
+			elif _get_main_menu_root(current_menu_scene) != null:
+				_poll_main_menu_online_button()
+			_poll_joining_overlay()
+			_bo_net_diag_cost("menu_button_poll", t_ui)
+		else:
+			_clear_non_game_ui_button_refs()
+			_remove_joining_overlay()
+		_update_online_session_runtime_flag()
 
 	# Offline/single-player must be a no-op for the online sync layer.
-	# The previous flow kept polling menu/battle sync with _lobby_id == 0;
-	# downstream managers then interpreted "not host" as "client", which broke solo waves.
 	if not _has_active_online_session():
 		_bo_net_diag_cost("steam_process_offline_total", process_start_usec)
 		return
 
-	var t_retry = OS.get_ticks_usec()
-	_poll_retry_wave_intercept()
-	_poll_end_run_intercept()
-	_bo_net_diag_cost("poll_retry_wave_intercept", t_retry)
-	var t_start = OS.get_ticks_usec()
-	_poll_host_difficulty_start_intercept()
-	_poll_host_game_start_sync()
-	_poll_client_game_start_commit()
-	_poll_client_game_scene_ready()
-	_poll_client_hello_retry()
-	_bo_net_diag_cost("poll_game_start_sync", t_start)
-	var t_p2p = OS.get_ticks_usec()
-	_poll_p2p_packets()
-	_bo_net_diag_cost("poll_p2p_packets", t_p2p, "pending_chunks=" + str(_pending_p2p_chunk_sends.size()))
+	if slow_poll_due:
+		var t_retry = OS.get_ticks_usec()
+		_poll_retry_wave_intercept()
+		_poll_end_run_intercept()
+		_bo_net_diag_cost("poll_retry_wave_intercept", t_retry)
+		var t_start = OS.get_ticks_usec()
+		_poll_host_difficulty_start_intercept()
+		_poll_host_game_start_sync()
+		_poll_client_game_start_commit()
+		_poll_client_game_scene_ready()
+		_poll_client_hello_retry()
+		_bo_net_diag_cost("poll_game_start_sync", t_start)
+
+	# Receive menu and battle traffic independently. Browser probes share the menu
+	# cadence because they are only used outside active combat.
+	var menu_receive_due = _last_p2p_menu_poll_usec == 0 or now_usec - _last_p2p_menu_poll_usec >= P2P_MENU_POLL_INTERVAL_USEC
+	var battle_receive_due = _last_p2p_battle_poll_usec == 0 or now_usec - _last_p2p_battle_poll_usec >= P2P_BATTLE_POLL_INTERVAL_USEC
+	if menu_receive_due or battle_receive_due:
+		if menu_receive_due:
+			_last_p2p_menu_poll_usec = now_usec
+		if battle_receive_due:
+			_last_p2p_battle_poll_usec = now_usec
+		var t_p2p = OS.get_ticks_usec()
+		_poll_p2p_packets(menu_receive_due, battle_receive_due)
+		_bo_net_diag_cost("poll_p2p_packets", t_p2p, "menu=" + str(menu_receive_due) + " battle=" + str(battle_receive_due) + " pending_chunks=" + str(_pending_p2p_chunk_sends.size()))
+
 	var t_chunks = OS.get_ticks_usec()
 	_poll_pending_p2p_chunk_sends()
 	_bo_net_diag_cost("poll_pending_chunks", t_chunks, "pending_chunks=" + str(_pending_p2p_chunk_sends.size()))
-	var t_menu_send = OS.get_ticks_usec()
-	_poll_and_send_local_client_menu_input()
-	_poll_and_send_local_run_page_actions()
-	_poll_direct_upgrade_action_sync()
-	_bo_net_diag_cost("poll_client_menu_send", t_menu_send)
+
+	# Menu input/actions remain responsive without scanning their queues every frame.
+	var menu_action_due = _last_menu_action_poll_usec == 0 or now_usec - _last_menu_action_poll_usec >= MENU_ACTION_POLL_INTERVAL_USEC
+	if menu_action_due:
+		_last_menu_action_poll_usec = now_usec
+		var t_menu_send = OS.get_ticks_usec()
+		_poll_and_send_local_client_menu_input()
+		_poll_and_send_local_run_page_actions()
+		_poll_direct_upgrade_action_sync()
+		_bo_net_diag_cost("poll_client_menu_send", t_menu_send)
+
+	# Battle send behavior is intentionally unchanged in this pass.
 	var t_battle_send = OS.get_ticks_usec()
 	_poll_and_send_local_client_battle_input()
 	_poll_and_send_host_battle_snapshot()
 	_bo_net_diag_cost("poll_battle_send", t_battle_send)
-	var t_phase = OS.get_ticks_usec()
-	_poll_and_send_host_phase_messages()
-	_poll_and_broadcast_selection_state()
-	_poll_online_flow_lifecycle()
-	_bo_net_diag_cost("poll_phase_selection", t_phase)
-	_bo_net_diag_cost("steam_process_total", process_start_usec, "in_game=" + str(in_game_scene) + " pending_chunks=" + str(_pending_p2p_chunk_sends.size()))
+
+	if slow_poll_due:
+		var t_phase = OS.get_ticks_usec()
+		_poll_and_send_host_phase_messages()
+		_poll_and_broadcast_selection_state()
+		_poll_online_flow_lifecycle()
+		_bo_net_diag_cost("poll_phase_selection", t_phase)
+	_bo_net_diag_cost("steam_process_total", process_start_usec, "in_game=" + str(_cached_in_game_scene) + " pending_chunks=" + str(_pending_p2p_chunk_sends.size()))
 
 func create_lobby_and_invite(open_overlay_after_create: bool = false) -> void:
 	# F6, the Run Options toggle, and the invite button share this path.
@@ -2108,19 +2158,21 @@ func _poll_client_hello_retry() -> void:
 	_last_client_hello_retry_msec = now
 	_send_client_hello_to_host()
 
-func _poll_p2p_packets() -> void:
+func _poll_p2p_packets(poll_menu: bool = true, poll_battle: bool = true) -> void:
 	if _steam == null or not _steam_ready:
 		return
 
 	if not _steam_has_method("receiveMessagesOnChannel"):
 		return
 
-	_poll_p2p_channel(P2P_CHANNEL_MENU, P2P_POLL_LIMIT_PER_FRAME)
-	_poll_p2p_channel(P2P_CHANNEL_BATTLE, P2P_BATTLE_POLL_LIMIT_PER_FRAME)
-	# The browser node owns channel 2 while searching from the title screen. A
-	# public host polls it here only to answer pre-join latency probes.
-	if _lobby_id != 0 and _is_game_host() and _get_public_lobby_enabled() and (_is_host_at_character_selection_for_lobby() or _is_in_official_coop_resume_scene()):
-		_poll_p2p_channel(P2P_CHANNEL_LOBBY_BROWSER, P2P_POLL_LIMIT_PER_FRAME)
+	if poll_menu:
+		_poll_p2p_channel(P2P_CHANNEL_MENU, P2P_POLL_LIMIT_PER_FRAME)
+		# The browser node owns channel 2 while searching from the title screen. A
+		# public host polls it here only to answer pre-join latency probes.
+		if _lobby_id != 0 and _is_game_host() and _get_public_lobby_enabled() and (_is_host_at_character_selection_for_lobby() or _is_in_official_coop_resume_scene()):
+			_poll_p2p_channel(P2P_CHANNEL_LOBBY_BROWSER, P2P_POLL_LIMIT_PER_FRAME)
+	if poll_battle:
+		_poll_p2p_channel(P2P_CHANNEL_BATTLE, P2P_BATTLE_POLL_LIMIT_PER_FRAME)
 
 
 func _poll_p2p_channel(channel: int, limit: int) -> void:
@@ -4469,17 +4521,11 @@ func _get_active_coop_upgrades_ui() -> Node:
 	if _is_in_shop_scene():
 		return null
 	var current = get_tree().current_scene
-	if current == null:
+	if current == null or not current.has_node("UI/CoopUpgradesUI"):
 		return null
-	var upgrade_ui = null
-	if current.has_node("UI/CoopUpgradesUI"):
-		# main.tscn always contains CoopUpgradesUI at this direct path.
-		# Do not fall back to recursive scene-tree scans while the wave/battle scene is active.
-		upgrade_ui = current.get_node("UI/CoopUpgradesUI")
-	elif not _is_in_game_scene():
-		upgrade_ui = _find_node_recursive(current, "CoopUpgradesUI")
-	else:
-		return null
+	# CoopUpgradesUI is only resolved through main.tscn's fixed path.
+	# Other scenes must return immediately instead of recursively scanning their UI trees.
+	var upgrade_ui = current.get_node("UI/CoopUpgradesUI")
 	if not _is_live_node(upgrade_ui):
 		return null
 	if upgrade_ui.has_method("is_visible_in_tree") and not upgrade_ui.is_visible_in_tree():
@@ -6969,7 +7015,6 @@ func _get_character_run_options_container(panel: Node) -> Node:
 func _poll_joining_overlay() -> void:
 	var now = OS.get_ticks_msec()
 	if now - _last_joining_overlay_ui_poll_msec < 100:
-		_update_joining_overlay_state()
 		return
 	_last_joining_overlay_ui_poll_msec = now
 	_update_joining_overlay_state()
@@ -7336,12 +7381,7 @@ func _update_continue_lobby_status_label_state() -> void:
 func _poll_character_invite_button() -> void:
 	var now = OS.get_ticks_msec()
 	if now - _last_character_invite_button_ui_poll_msec < 250:
-		_update_character_invite_button_state()
-		_update_character_lobby_status_label_state()
-		_update_continue_invite_button_state()
-		_update_continue_lobby_status_label_state()
-		if not _should_show_character_lobby_status_label() or (_character_lobby_status_label != null and is_instance_valid(_character_lobby_status_label)):
-			return
+		return
 	_last_character_invite_button_ui_poll_msec = now
 
 	var current = get_tree().current_scene
@@ -7472,8 +7512,6 @@ func _on_character_invite_button_pressed() -> void:
 func _poll_continue_invite_button() -> void:
 	var now = OS.get_ticks_msec()
 	if now - _last_continue_invite_button_ui_poll_msec < 250:
-		_update_continue_invite_button_state()
-		_update_continue_lobby_status_label_state()
 		return
 	_last_continue_invite_button_ui_poll_msec = now
 
@@ -7617,7 +7655,6 @@ func _on_continue_invite_button_pressed() -> void:
 func _poll_lobby_toggle_button() -> void:
 	var now = OS.get_ticks_msec()
 	if now - _last_lobby_toggle_ui_poll_msec < 250:
-		_update_lobby_toggle_button_state()
 		return
 	_last_lobby_toggle_ui_poll_msec = now
 
@@ -7739,20 +7776,47 @@ func _update_lobby_toggle_button_state() -> void:
 	_lobby_toggle_signal_guard = false
 
 
+func _get_main_menu_root(current: Node = null) -> Node:
+	if current == null:
+		current = get_tree().current_scene
+	if current == null:
+		return null
+
+	# Running the MainMenu scene directly in the editor uses MainMenu itself as
+	# current_scene. A normal game boot keeps it below the persistent menu root.
+	if str(current.name).to_lower() == "mainmenu":
+		return current
+
+	var nested_main_menu = current.get_node_or_null("Menus/MainMenu")
+	if nested_main_menu != null and is_instance_valid(nested_main_menu):
+		return nested_main_menu
+
+	# Keep one additional fixed-layout compatibility path for menu wrappers.
+	nested_main_menu = current.get_node_or_null("MainMenu")
+	if nested_main_menu != null and is_instance_valid(nested_main_menu):
+		return nested_main_menu
+
+	return null
+
+
+func _is_main_menu_scene(current: Node = null) -> bool:
+	return _get_main_menu_root(current) != null
+
+
 func _poll_main_menu_online_button() -> void:
 	var now = OS.get_ticks_msec()
 	if now - _last_main_menu_online_ui_poll_msec < 250:
-		_update_main_menu_online_button_state()
 		return
 	_last_main_menu_online_ui_poll_msec = now
 
 	var current = get_tree().current_scene
-	if current == null:
+	var main_menu = _get_main_menu_root(current)
+	if main_menu == null:
 		_main_menu_online_button = null
 		_main_menu_online_button_parent = null
 		return
 
-	var start_button = _find_node_recursive(current, "StartButton")
+	var start_button = main_menu.get_node_or_null("MarginContainer/VBoxContainer/HBoxContainer/ButtonsLeft/StartButton")
 	if start_button == null or not is_instance_valid(start_button):
 		_main_menu_online_button = null
 		_main_menu_online_button_parent = null

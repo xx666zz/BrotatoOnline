@@ -69,6 +69,8 @@ var _last_log_msec = 0
 var _apply_count = 0
 var _cached_owned_player_index = -1
 var _last_owned_index_log_msec = 0
+var _cached_owned_player_node = null
+var _cached_owned_player_scene_instance_id = 0
 
 var _host_entities = {}                # net_id -> Node
 var _host_entity_category = {}          # net_id -> String
@@ -1691,17 +1693,16 @@ func _apply_damage_to_attack_behavior_children(node: Node, damage: int) -> void:
 
 
 func _update_host_entity_positions(delta: float) -> void:
-	if _host_entities.empty():
+	# Only Host-motion entities are inserted into this table. Iterating it avoids
+	# scanning every birth-only enemy/tree on every rendered client frame.
+	if _host_entity_targets.empty():
 		return
 	var now = OS.get_ticks_msec()
 	var target_time = _get_estimated_host_time_msec(now) - ENTITY_INTERPOLATION_DELAY_MSEC
 	var alpha = clamp(delta * HOST_ENTITY_LERP_SPEED, 0.0, 1.0)
-	for id_value in _host_entities.keys():
+	for id_value in _host_entity_targets.keys():
 		var id = str(id_value)
-		var category = str(_host_entity_category.get(id, ""))
-		if _get_entity_sync_mode(category, {}) != SYNC_MODE_HOST_MOTION:
-			continue
-		var node = _host_entities[id]
+		var node = _host_entities.get(id, null)
 		if not _is_valid_node(node):
 			continue
 		var sample = _sample_position(_host_entity_samples.get(id, []), target_time, _host_entity_targets.get(id, _get_node_global_pos(node)), _host_entity_velocities.get(id, Vector2.ZERO))
@@ -2014,6 +2015,22 @@ func send_owned_player_terminal_state(player: Node = null, reason: String = "ter
 
 
 func _poll_and_send_player_state(force: bool) -> void:
+	var now = OS.get_ticks_msec()
+	# Avoid resolving the owned player through RuntimeLocator/player arrays on every
+	# rendered frame. During the interval, only a newly observed death edge is allowed
+	# through so terminal reporting remains immediate.
+	if not force and now - _last_player_state_send_msec < PLAYER_STATE_SEND_INTERVAL_MSEC:
+		var cached_player = _get_cached_owned_player_node_for_current_scene()
+		if not _is_valid_node(cached_player):
+			return
+		var cached_stats = cached_player.get("current_stats")
+		var cached_hp = int(cached_stats.health) if cached_stats != null else -1
+		var cached_dead = bool(cached_player.get("dead"))
+		if cached_stats != null and cached_hp <= 0:
+			cached_dead = true
+		if not cached_dead or _last_sent_player_dead_state:
+			return
+
 	var player = _get_owned_player_node()
 	if not _is_valid_node(player):
 		return
@@ -2025,14 +2042,6 @@ func _poll_and_send_player_state(force: bool) -> void:
 		# the vanilla dead flag being visible to the autoload. Treat HP<=0 as death authority.
 		local_dead = true
 	if local_dead and not ENABLE_PLAYER_DEATH_REPORTS:
-		return
-
-	var now = OS.get_ticks_msec()
-	# Do not let the normal interval hide a death edge. The terminal packet must be
-	# sent before the client-side fail cleanup suspends this replica layer.
-	if not force and not local_dead and now - _last_player_state_send_msec < PLAYER_STATE_SEND_INTERVAL_MSEC:
-		return
-	if not force and local_dead and _last_sent_player_dead_state and now - _last_player_state_send_msec < PLAYER_STATE_SEND_INTERVAL_MSEC:
 		return
 	_send_owned_player_state_packet(player, false, "poll", 1)
 
@@ -3501,6 +3510,8 @@ func _clear_all(reason: String) -> void:
 	_last_sent_player_dead_state = false
 	_sent_owned_player_terminal_state = false
 	_last_terminal_player_state_reason = ""
+	_cached_owned_player_node = null
+	_cached_owned_player_scene_instance_id = 0
 	_last_applied_tick = -1
 	_sanitize_stats_manager_queues("clear_all_after:" + reason)
 
@@ -3865,18 +3876,40 @@ func _is_client_owned_player_index(player_index: int) -> bool:
 
 
 func _get_owned_player_node() -> Node:
+	var scene = get_tree().current_scene
+	var scene_instance_id = scene.get_instance_id() if scene != null and is_instance_valid(scene) else 0
+	var owned_index = _get_owned_player_index()
+	if owned_index < 0:
+		return null
+	if scene_instance_id != 0 and scene_instance_id == _cached_owned_player_scene_instance_id and _is_valid_node(_cached_owned_player_node):
+		if _get_player_index_from_node(_cached_owned_player_node, -1) == owned_index:
+			return _cached_owned_player_node
+	_cached_owned_player_node = null
+	_cached_owned_player_scene_instance_id = 0
+
 	var locator = _get_runtime_locator()
 	if locator == null or not locator.has_method("get_players"):
 		return null
 	var players = locator.get_players()
 	if typeof(players) != TYPE_ARRAY:
 		return null
-	var owned_index = _get_owned_player_index()
 	for i in range(players.size()):
 		var player = players[i]
 		if _is_valid_node(player) and _get_player_index_from_node(player, i) == owned_index:
+			_cached_owned_player_node = player
+			_cached_owned_player_scene_instance_id = scene_instance_id
 			return player
 	return null
+
+
+func _get_cached_owned_player_node_for_current_scene() -> Node:
+	if not _is_valid_node(_cached_owned_player_node):
+		return null
+	var scene = get_tree().current_scene
+	var scene_instance_id = scene.get_instance_id() if scene != null and is_instance_valid(scene) else 0
+	if scene_instance_id == 0 or scene_instance_id != _cached_owned_player_scene_instance_id:
+		return null
+	return _cached_owned_player_node
 
 
 func _get_owned_player_index() -> int:

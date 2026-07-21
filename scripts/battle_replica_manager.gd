@@ -40,6 +40,7 @@ const ENABLE_PLAYER_DEATH_REPORTS = true
 const ENABLE_PLAYER_DEATH_SYNC = true
 # Diagnostic switch: ignore Host removed ids and active-id prune on clients.
 const ENABLE_HOST_REMOVED_SYNC = false
+const ENABLE_BOSS_ELITE_REMOVED_SYNC = true
 const REMOTE_PLAYER_HURTBOX_GUARD_INTERVAL_MSEC = 250
 const CLIENT_NEW_BATTLE_TERMINAL_SNAPSHOT_GUARD_MSEC = 6000
 # The first accepted Host combat snapshot after entering a battle must be a clearly
@@ -374,9 +375,11 @@ func receive_battle_reliable_events_from_host(message: Dictionary) -> void:
 	_process_battle_events(message, server_time_msec, now)
 
 	var removed = message.get("removed", [])
-	if ENABLE_HOST_REMOVED_SYNC and typeof(removed) == TYPE_ARRAY:
+	if typeof(removed) == TYPE_ARRAY:
 		for rid in removed:
 			var id = str(rid)
+			if not _should_apply_host_removed_entity(id):
+				continue
 			_handle_host_removed_entity(id, now, "reliable_removed")
 			_remove_birth_marker(id)
 			_remove_pickup_marker(id)
@@ -386,7 +389,7 @@ func _apply_reliable_entity_birth_state(state: Dictionary, server_time_msec: int
 	var net_id = str(state.get("net_id", ""))
 	if net_id == "" or _locally_killed_until.has(net_id):
 		return
-	if bool(state.get("dead", false)):
+	if _host_state_marks_boss_elite_dead(state) or bool(state.get("dead", false)):
 		if ENABLE_DEATH_SYNC:
 			_schedule_remote_death(net_id, str(state.get("category", _host_entity_category.get(net_id, ""))), _dict_to_vec2(state.get("pos", {})), now + DEATH_VISUAL_DELAY_MSEC, "reliable_state_dead")
 		else:
@@ -734,36 +737,23 @@ func _prepare_remote_player_damage_proxies(force: bool) -> void:
 		var player_index = _get_player_index_from_node(player, i)
 		if player_index == owned_index:
 			continue
-		_disable_player_hurtbox_for_net_proxy(player, player_index, "client_remote_guard")
+		_prepare_remote_player_hurtbox_proxy(player, player_index, "client_remote_guard")
 
 
-func _disable_player_hurtbox_for_net_proxy(player: Node, player_index: int, reason: String) -> void:
+func _prepare_remote_player_hurtbox_proxy(player: Node, player_index: int, reason: String) -> void:
 	if not _is_valid_node(player):
 		return
 	player.set_meta("brotato_online_remote_damage_proxy", true)
+	player.set_meta("brotato_online_remote_hurtbox_proxy", true)
+	player.set_meta("brotato_online_remote_bull_hurtbox_proxy", _is_bull_player_index(player_index))
 	player.set_meta("brotato_online_hurtbox_disabled_player_index", player_index)
+	player.set_meta("brotato_online_hurtbox_enabled_reason", reason)
 
-	# Remote non-owned players normally have their Hurtbox disabled on clients so local
-	# enemy overlap cannot damage/kill the display proxy. Bull is the exception: its
-	# character mechanic is the on-hit explosion, so every peer that can see the Bull
-	# must keep a real Hurtbox locally. PlayerSafeRoomCleanup filters HP/death and only
-	# lets the explosion/flash side effect run.
-	if _is_bull_player_index(player_index):
-		player.set_meta("brotato_online_remote_bull_hurtbox_proxy", true)
-		player.set_meta("brotato_online_hurtbox_enabled_reason", reason)
-		_restore_remote_proxy_collision_tree(player)
-		_enable_bull_remote_player_hurtbox(player)
-		return
-
-	player.set_meta("brotato_online_remote_bull_hurtbox_proxy", false)
-	player.set_meta("brotato_online_hurtbox_disabled_reason", reason)
-	if player.has_method("disable_hurtbox"):
-		player.disable_hurtbox()
-	else:
-		var hurtbox = player.get_node_or_null("Hurtbox")
-		if hurtbox != null and hurtbox.has_method("disable"):
-			hurtbox.disable()
-	_disable_remote_proxy_collision_tree(player)
+	# Keep the real Hurtbox for every non-owned player so enemy overlaps enter the
+	# complete vanilla Player.take_damage() pipeline. The Player extension restores
+	# synchronized HP afterward and blocks local proxy death, while preserving all
+	# character/item on-damage mechanics (Bull is no longer a special case).
+	_enable_remote_player_hurtbox(player)
 
 
 func _disable_remote_proxy_collision_tree(root: Node) -> void:
@@ -880,12 +870,13 @@ func _is_bull_player_index(player_index: int) -> bool:
 	return str(character.get("my_id")) == BULL_CHARACTER_ID
 
 
-func _enable_bull_remote_player_hurtbox(player: Node) -> void:
+func _enable_remote_player_hurtbox(player: Node) -> void:
 	if not _is_valid_node(player):
 		return
 	var invincibility_timer = player.get("_invincibility_timer")
 	if invincibility_timer != null and is_instance_valid(invincibility_timer) and invincibility_timer.has_method("is_stopped") and not invincibility_timer.is_stopped():
 		return
+	_restore_remote_proxy_collision_tree(player)
 	if player.has_method("enable_hurtbox"):
 		player.enable_hurtbox()
 		return
@@ -915,7 +906,8 @@ func _apply_latest_snapshot_if_needed() -> void:
 		var net_id = str(state.get("net_id", ""))
 		if net_id == "":
 			continue
-		if bool(state.get("dead", false)):
+		var category = str(state.get("category", ""))
+		if _host_state_marks_boss_elite_dead(state) or bool(state.get("dead", false)):
 			if ENABLE_DEATH_SYNC:
 				_schedule_remote_death(net_id, str(state.get("category", _host_entity_category.get(net_id, ""))), _dict_to_vec2(state.get("pos", {})), now + DEATH_VISUAL_DELAY_MSEC, "state_dead")
 			else:
@@ -925,7 +917,6 @@ func _apply_latest_snapshot_if_needed() -> void:
 			continue
 		active_ids[net_id] = true
 
-		var category = str(state.get("category", ""))
 		var sync_mode = _get_entity_sync_mode(category, state)
 		var pos = _dict_to_vec2(state.get("pos", {}))
 		var vel = _dict_to_vec2(state.get("vel", {}))
@@ -957,9 +948,11 @@ func _apply_latest_snapshot_if_needed() -> void:
 	_apply_host_progression_state(snapshot)
 
 	var removed = snapshot.get("removed", [])
-	if ENABLE_HOST_REMOVED_SYNC and typeof(removed) == TYPE_ARRAY:
+	if typeof(removed) == TYPE_ARRAY:
 		for rid in removed:
 			var id = str(rid)
+			if not _should_apply_host_removed_entity(id):
+				continue
 			_handle_host_removed_entity(id, now, "removed")
 			_remove_birth_marker(id)
 			_remove_pickup_marker(id)
@@ -1771,7 +1764,7 @@ func _apply_remote_player_runtime_state(player_index: int, state: Dictionary) ->
 			break
 	if not _is_valid_node(player):
 		return
-	_disable_player_hurtbox_for_net_proxy(player, player_index, "client_remote_snapshot")
+	_prepare_remote_player_hurtbox_proxy(player, player_index, "client_remote_snapshot")
 	var current_stats = player.get("current_stats")
 	var max_stats = player.get("max_stats")
 	var host_hp = int(state.get("health", state.get("hp", -1)))
@@ -3737,6 +3730,27 @@ func _category_from_entity_type(entity_type: int) -> String:
 	if entity_type == EntityType.PET:
 		return "pet"
 	return ""
+
+
+func _is_boss_elite_category(category: String) -> bool:
+	return category == "boss" or category == "elite"
+
+
+func _host_state_marks_boss_elite_dead(state: Dictionary) -> bool:
+	if typeof(state) != TYPE_DICTIONARY:
+		return false
+	if not _is_boss_elite_category(str(state.get("category", ""))):
+		return false
+	var health = int(state.get("health", -1))
+	return health >= 0 and health <= 0
+
+
+func _should_apply_host_removed_entity(net_id: String) -> bool:
+	if ENABLE_HOST_REMOVED_SYNC:
+		return true
+	if not ENABLE_BOSS_ELITE_REMOVED_SYNC:
+		return false
+	return _is_boss_elite_category(str(_host_entity_category.get(net_id, "")))
 
 
 func _get_entity_sync_mode(category: String, state: Dictionary) -> String:

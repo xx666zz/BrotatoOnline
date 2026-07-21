@@ -2,6 +2,7 @@ extends Node
 
 
 const STATE_POLL_INTERVAL_MSEC = 250
+const CLIENT_CHARACTER_SELECT_REPEAT_GUARD_MSEC = 2000
 const MENU_SCENE_APPLY_DEBOUNCE_MSEC = 500
 const MUTATING_RUN_PAGE_ACTION_DEDUP_MSEC = 900
 const ENABLE_HOST_SHOP_DIAGNOSTICS = false
@@ -47,6 +48,19 @@ var _bo_ui_diag_last_input_burst_log_msec = 0
 var _bo_ui_diag_cost_stats_by_scope = {}
 var _bo_ui_diag_last_queue_key = ""
 var _bo_ui_diag_last_queue_log_msec = 0
+var _last_find_element_collect_usec = 0
+var _last_find_element_scan_usec = 0
+var _last_find_element_candidate_count = 0
+var _last_find_element_cache_hit = false
+var _last_find_element_cache_build_usec = 0
+var _selection_element_cache_selection_id = 0
+var _selection_element_cache_by_player = {}
+var _last_selection_element_cache_hit = false
+var _last_selection_element_cache_build_usec = 0
+var _last_apply_focus_cancel_usec = 0
+var _last_apply_focus_control_usec = 0
+var _last_apply_focus_expected_usec = 0
+var _last_apply_focus_callback_usec = 0
 
 
 
@@ -74,6 +88,8 @@ var _last_client_scene_apply_key = ""
 var _last_client_scene_apply_msec = 0
 var _last_sent_local_focus_key = ""
 var _last_sent_local_select_key = ""
+var _last_sent_character_select_guard_key = ""
+var _last_sent_character_select_guard_msec = 0
 var _last_local_selection_instance_id = 0
 var _last_applied_run_config_key = ""
 var _last_applied_difficulty_start_key = ""
@@ -479,7 +495,10 @@ func reset_online_session_state(reason: String = "") -> void:
 	_last_client_scene_apply_msec = 0
 	_last_sent_local_focus_key = ""
 	_last_sent_local_select_key = ""
+	_last_sent_character_select_guard_key = ""
+	_last_sent_character_select_guard_msec = 0
 	_last_local_selection_instance_id = 0
+	_invalidate_selection_element_cache()
 	_last_applied_run_config_key = ""
 	_last_applied_difficulty_start_key = ""
 	_local_client_steam_id = ""
@@ -634,8 +653,11 @@ func consume_local_client_menu_messages() -> Array:
 	var selection_instance_id = selection.get_instance_id()
 	if selection_instance_id != _last_local_selection_instance_id:
 		_last_local_selection_instance_id = selection_instance_id
+		_invalidate_selection_element_cache()
 		_last_sent_local_focus_key = ""
 		_last_sent_local_select_key = ""
+		_last_sent_character_select_guard_key = ""
+		_last_sent_character_select_guard_msec = 0
 
 	var screen = _get_selection_screen(selection)
 	if not _is_client_interactive_selection_screen(screen):
@@ -8686,6 +8708,7 @@ func _build_data_object_sync_state_array(pool) -> Array:
 
 
 func _invalidate_host_character_catalog_cache() -> void:
+	_invalidate_selection_element_cache()
 	_host_built_catalog_by_screen.erase(SCREEN_CHARACTER_SELECTION)
 	_host_built_catalog_build_key_by_screen.erase(SCREEN_CHARACTER_SELECTION)
 	_host_catalog_by_screen.erase(SCREEN_CHARACTER_SELECTION)
@@ -9143,8 +9166,10 @@ func _apply_online_catalog_to_player_inventory(selection: Node, screen: String, 
 		changed = true
 
 	_last_applied_catalog_player_key_by_inventory[cache_slot] = apply_key
-	if changed and inventory.has_method("queue_set_focus_neighbours"):
-		inventory.queue_set_focus_neighbours()
+	if changed:
+		_invalidate_selection_element_cache()
+		if inventory.has_method("queue_set_focus_neighbours"):
+			inventory.queue_set_focus_neighbours()
 	return changed
 
 func _apply_catalog_state_to_inventory_element(element, inventory: Node, screen: String, host_selectable: bool) -> bool:
@@ -9320,6 +9345,7 @@ func _pick_random_host_selectable_element(selection: Node, screen: String, playe
 				var new_item = data_item.duplicate()
 				new_item.is_locked = false
 				inventory.add_element(new_item, false, true)
+				_invalidate_selection_element_cache()
 				if inventory.has_method("queue_set_focus_neighbours"):
 					inventory.queue_set_focus_neighbours()
 				return _find_element_by_state(selection, player_index, picked_state, true)
@@ -9477,9 +9503,16 @@ func _on_client_inventory_element_pressed(element, selection: Node, screen: Stri
 		return
 	var msg_type = "select_character" if screen == SCREEN_CHARACTER_SELECTION else "select_weapon"
 	var key = screen + ":" + str(player_index) + ":" + msg_type + ":" + item_id
+	var now_msec = OS.get_ticks_msec()
+	if msg_type == "select_character" and key == _last_sent_character_select_guard_key and now_msec - _last_sent_character_select_guard_msec < CLIENT_CHARACTER_SELECT_REPEAT_GUARD_MSEC:
+		_bo_ui_diag_log("SELECT_DEDUP", "blocked=true age_ms=" + str(now_msec - _last_sent_character_select_guard_msec) + " guard_ms=" + str(CLIENT_CHARACTER_SELECT_REPEAT_GUARD_MSEC) + " player=" + str(player_index) + " item=" + item_id)
+		return
 	if not pressed_random and key == _last_sent_local_select_key and _is_player_currently_ready_with_item(selection, player_index, item_state):
 		return
 	_last_sent_local_select_key = key
+	if msg_type == "select_character":
+		_last_sent_character_select_guard_key = key
+		_last_sent_character_select_guard_msec = now_msec
 	_queued_local_client_menu_messages.append({
 		"msg_type": msg_type,
 		"screen": screen,
@@ -10095,7 +10128,10 @@ func host_auto_prime_character_selection_after_remote_join() -> bool:
 	return changed
 
 func apply_remote_focus_by_item_id(player_index: int, item_id) -> void:
+	var total_start_usec = OS.get_ticks_usec()
+	var selection_start_usec = total_start_usec
 	var selection = _find_current_selection_node()
+	var selection_usec = OS.get_ticks_usec() - selection_start_usec
 	if selection == null:
 		return
 
@@ -10103,15 +10139,37 @@ func apply_remote_focus_by_item_id(player_index: int, item_id) -> void:
 	if screen == "difficulty_selection":
 		return
 
+	var find_start_usec = OS.get_ticks_usec()
 	var element = _find_element_by_item_id(selection, player_index, item_id, true)
+	var find_usec = OS.get_ticks_usec() - find_start_usec
+	var collect_usec = _last_find_element_collect_usec
+	var scan_usec = _last_find_element_scan_usec
+	var candidate_count = _last_find_element_candidate_count
+	var cache_hit = _last_find_element_cache_hit
+	var cache_build_usec = _last_find_element_cache_build_usec
 	if element == null:
+		var missing_total_usec = OS.get_ticks_usec() - total_start_usec
+		if missing_total_usec >= BO_UI_DIAG_SINGLE_COST_USEC:
+			_bo_ui_diag_log("REMOTE_FOCUS", "total_us=" + str(missing_total_usec) + " find_selection_us=" + str(selection_usec) + " find_element_us=" + str(find_usec) + " collect_us=" + str(collect_usec) + " scan_us=" + str(scan_usec) + " candidates=" + str(candidate_count) + " cache_hit=" + str(cache_hit) + " cache_build_us=" + str(cache_build_usec) + " apply_us=0 found=false player=" + str(player_index) + " item=" + str(item_id))
 		return
 
+	var apply_start_usec = OS.get_ticks_usec()
 	_apply_focus_element(selection, player_index, element)
+	var apply_usec = OS.get_ticks_usec() - apply_start_usec
+	var cancel_usec = _last_apply_focus_cancel_usec
+	var control_usec = _last_apply_focus_control_usec
+	var expected_usec = _last_apply_focus_expected_usec
+	var callback_usec = _last_apply_focus_callback_usec
+	var total_usec = OS.get_ticks_usec() - total_start_usec
+	if total_usec >= BO_UI_DIAG_SINGLE_COST_USEC:
+		_bo_ui_diag_log("REMOTE_FOCUS", "total_us=" + str(total_usec) + " find_selection_us=" + str(selection_usec) + " find_element_us=" + str(find_usec) + " collect_us=" + str(collect_usec) + " scan_us=" + str(scan_usec) + " candidates=" + str(candidate_count) + " cache_hit=" + str(cache_hit) + " cache_build_us=" + str(cache_build_usec) + " apply_us=" + str(apply_usec) + " cancel_us=" + str(cancel_usec) + " control_us=" + str(control_usec) + " expected_us=" + str(expected_usec) + " callback_us=" + str(callback_usec) + " found=true player=" + str(player_index) + " item=" + str(item_id))
 
 
 func apply_remote_select_by_item_id(player_index: int, item_id, expected_screen: String = "") -> void:
+	var total_start_usec = OS.get_ticks_usec()
+	var selection_start_usec = total_start_usec
 	var selection = _find_current_selection_node()
+	var selection_usec = OS.get_ticks_usec() - selection_start_usec
 	if selection == null:
 		return
 
@@ -10122,7 +10180,14 @@ func apply_remote_select_by_item_id(player_index: int, item_id, expected_screen:
 	if expected_screen != "" and screen != expected_screen:
 		return
 
+	var find_start_usec = OS.get_ticks_usec()
 	var element = _find_element_by_item_id(selection, player_index, item_id)
+	var find_usec = OS.get_ticks_usec() - find_start_usec
+	var collect_usec = _last_find_element_collect_usec
+	var scan_usec = _last_find_element_scan_usec
+	var candidate_count = _last_find_element_candidate_count
+	var cache_hit = _last_find_element_cache_hit
+	var cache_build_usec = _last_find_element_cache_build_usec
 	if element == null:
 		return
 
@@ -10132,12 +10197,23 @@ func apply_remote_select_by_item_id(player_index: int, item_id, expected_screen:
 		if not missing_clients.empty():
 			return
 
+	var apply_start_usec = OS.get_ticks_usec()
 	_apply_focus_element(selection, player_index, element)
+	var apply_usec = OS.get_ticks_usec() - apply_start_usec
+	var cancel_usec = _last_apply_focus_cancel_usec
+	var control_usec = _last_apply_focus_control_usec
+	var expected_usec = _last_apply_focus_expected_usec
+	var callback_usec = _last_apply_focus_callback_usec
 
+	var select_start_usec = OS.get_ticks_usec()
 	if screen == "character_selection":
 		_select_character_element(selection, player_index, element)
 	elif screen == "weapon_selection":
 		_select_weapon_element(selection, player_index, element)
+	var select_usec = OS.get_ticks_usec() - select_start_usec
+	var total_usec = OS.get_ticks_usec() - total_start_usec
+	if total_usec >= BO_UI_DIAG_SINGLE_COST_USEC:
+		_bo_ui_diag_log("REMOTE_SELECT", "total_us=" + str(total_usec) + " find_selection_us=" + str(selection_usec) + " find_element_us=" + str(find_usec) + " collect_us=" + str(collect_usec) + " scan_us=" + str(scan_usec) + " candidates=" + str(candidate_count) + " cache_hit=" + str(cache_hit) + " cache_build_us=" + str(cache_build_usec) + " apply_focus_us=" + str(apply_usec) + " cancel_us=" + str(cancel_usec) + " control_us=" + str(control_usec) + " expected_us=" + str(expected_usec) + " callback_us=" + str(callback_usec) + " select_us=" + str(select_usec) + " player=" + str(player_index) + " item=" + str(item_id) + " screen=" + screen)
 
 
 
@@ -10270,14 +10346,26 @@ func _select_weapon_element(selection: Node, player_index: int, element) -> void
 
 
 func _apply_focus_element(selection: Node, player_index: int, element) -> void:
+	_last_apply_focus_cancel_usec = 0
+	_last_apply_focus_control_usec = 0
+	_last_apply_focus_expected_usec = 0
+	_last_apply_focus_callback_usec = 0
 	if not _is_live_ref(element):
 		return
 
+	var stage_start_usec = OS.get_ticks_usec()
 	_cancel_ready_if_focus_changes(selection, player_index, element, false)
+	_last_apply_focus_cancel_usec = OS.get_ticks_usec() - stage_start_usec
+	stage_start_usec = OS.get_ticks_usec()
 	Utils.focus_player_control(element, player_index)
+	_last_apply_focus_control_usec = OS.get_ticks_usec() - stage_start_usec
+	stage_start_usec = OS.get_ticks_usec()
 	FocusEmulatorSignal.set_expected_control(element, player_index)
+	_last_apply_focus_expected_usec = OS.get_ticks_usec() - stage_start_usec
+	stage_start_usec = OS.get_ticks_usec()
 	if selection.has_method("_on_element_focused"):
 		selection._on_element_focused(element, player_index)
+	_last_apply_focus_callback_usec = OS.get_ticks_usec() - stage_start_usec
 
 
 func _ensure_local_client_focus_exists(selection: Node) -> void:
@@ -10442,12 +10530,11 @@ func _get_selected_element_for_player(selection: Node, player_index: int):
 	if selected_item == null:
 		return null
 
-	var elements = _get_selectable_elements_for_player(selection, player_index, true)
-	for element in elements:
-		if not _is_live_ref(element):
-			continue
-		var element_item = _safe_get(element, "item", null)
-		if _is_live_ref(element_item) and element_item == selected_item:
+	var entry = _get_selection_element_cache_entry(selection, player_index)
+	var item_lookup = entry.get("item_instance_lookup", {})
+	if typeof(item_lookup) == TYPE_DICTIONARY:
+		var element = item_lookup.get(str(selected_item.get_instance_id()), null)
+		if _is_live_ref(element):
 			return element
 
 	return _make_item_state_proxy(selected_item)
@@ -10505,72 +10592,209 @@ func _element_to_state(element) -> Dictionary:
 	return state
 
 
-func _get_selectable_elements_for_player(selection: Node, player_index: int, include_locked: bool = false) -> Array:
-	var result = []
+func _invalidate_selection_element_cache() -> void:
+	_selection_element_cache_selection_id = 0
+	_selection_element_cache_by_player.clear()
+	_last_selection_element_cache_hit = false
+	_last_selection_element_cache_build_usec = 0
+
+
+func _selection_cache_instance_id(value) -> int:
+	if not _is_live_ref(value):
+		return 0
+	if typeof(value) != TYPE_OBJECT:
+		return 0
+	return int(value.get_instance_id())
+
+
+func _get_selection_element_cache_metadata(selection: Node, player_index: int) -> Dictionary:
+	var displayed_elements = []
 	var displayed = selection.get("displayed_elements")
 	if typeof(displayed) == TYPE_ARRAY and player_index >= 0 and player_index < displayed.size():
-		var elements = displayed[player_index]
-		if typeof(elements) == TYPE_ARRAY:
-			for element in elements:
-				if _is_selectable_inventory_element(element, include_locked):
-					result.append(element)
+		var player_displayed = displayed[player_index]
+		if typeof(player_displayed) == TYPE_ARRAY:
+			displayed_elements = player_displayed
 
+	var inventory = null
 	if selection.has_method("_get_inventories"):
 		var inventories = selection._get_inventories()
 		if typeof(inventories) == TYPE_ARRAY and inventories.size() > 0:
-			var inv_index = player_index % inventories.size()
-			var inv = inventories[inv_index]
-			if _is_live_ref(inv):
-				for child in inv.get_children():
-					if _is_selectable_inventory_element(child, include_locked):
-						if not result.has(child):
-							result.append(child)
+			inventory = inventories[player_index % inventories.size()]
 
-	return result
+	var displayed_count = displayed_elements.size()
+	var displayed_first_id = 0
+	var displayed_last_id = 0
+	if displayed_count > 0:
+		displayed_first_id = _selection_cache_instance_id(displayed_elements[0])
+		displayed_last_id = _selection_cache_instance_id(displayed_elements[displayed_count - 1])
+
+	var inventory_id = _selection_cache_instance_id(inventory)
+	var inventory_child_count = 0
+	var inventory_first_id = 0
+	var inventory_last_id = 0
+	if _is_live_ref(inventory):
+		inventory_child_count = inventory.get_child_count()
+		if inventory_child_count > 0:
+			inventory_first_id = _selection_cache_instance_id(inventory.get_child(0))
+			inventory_last_id = _selection_cache_instance_id(inventory.get_child(inventory_child_count - 1))
+
+	return {
+		"displayed_elements": displayed_elements,
+		"displayed_count": displayed_count,
+		"displayed_first_id": displayed_first_id,
+		"displayed_last_id": displayed_last_id,
+		"inventory": inventory,
+		"inventory_id": inventory_id,
+		"inventory_child_count": inventory_child_count,
+		"inventory_first_id": inventory_first_id,
+		"inventory_last_id": inventory_last_id
+	}
+
+
+func _selection_element_cache_entry_matches(entry: Dictionary, metadata: Dictionary) -> bool:
+	if entry.empty():
+		return false
+	for key in ["displayed_count", "displayed_first_id", "displayed_last_id", "inventory_id", "inventory_child_count", "inventory_first_id", "inventory_last_id"]:
+		if int(entry.get(key, -1)) != int(metadata.get(key, -2)):
+			return false
+	return true
+
+
+func _add_selection_element_lookup_id(lookup: Dictionary, value, element) -> void:
+	var key = str(value)
+	if key == "":
+		return
+	if not lookup.has(key):
+		lookup[key] = element
+
+
+func _add_selection_element_ids_to_lookup(lookup: Dictionary, item, element) -> void:
+	if not _is_live_ref(item):
+		return
+	_add_selection_element_lookup_id(lookup, _safe_get(item, "my_id_hash", ""), element)
+	_add_selection_element_lookup_id(lookup, _safe_get(item, "weapon_id_hash", ""), element)
+	_add_selection_element_lookup_id(lookup, _safe_get(item, "my_id", ""), element)
+	_add_selection_element_lookup_id(lookup, _get_item_id_for_log(item), element)
+
+
+func _append_selection_element_to_cache(entry: Dictionary, seen: Dictionary, element) -> void:
+	if not _is_live_ref(element):
+		return
+	var element_instance_id = _selection_cache_instance_id(element)
+	if element_instance_id == 0 or seen.has(element_instance_id):
+		return
+	seen[element_instance_id] = true
+
+	if not _has_property(element, "item"):
+		return
+	var item = element.get("item")
+	if not _is_live_ref(item):
+		return
+
+	var all_elements = entry.get("all_elements", [])
+	all_elements.append(element)
+	entry["all_elements"] = all_elements
+	var all_lookup = entry.get("all_lookup", {})
+	_add_selection_element_ids_to_lookup(all_lookup, item, element)
+	entry["all_lookup"] = all_lookup
+	var item_lookup = entry.get("item_instance_lookup", {})
+	item_lookup[str(item.get_instance_id())] = element
+	entry["item_instance_lookup"] = item_lookup
+
+	if bool(_safe_get(element, "is_special", false)) or bool(_safe_get(element, "is_locked", false)):
+		return
+	var selectable_elements = entry.get("selectable_elements", [])
+	selectable_elements.append(element)
+	entry["selectable_elements"] = selectable_elements
+	var selectable_lookup = entry.get("selectable_lookup", {})
+	_add_selection_element_ids_to_lookup(selectable_lookup, item, element)
+	entry["selectable_lookup"] = selectable_lookup
+
+
+func _build_selection_element_cache_entry(metadata: Dictionary) -> Dictionary:
+	var entry = {
+		"displayed_count": int(metadata.get("displayed_count", 0)),
+		"displayed_first_id": int(metadata.get("displayed_first_id", 0)),
+		"displayed_last_id": int(metadata.get("displayed_last_id", 0)),
+		"inventory_id": int(metadata.get("inventory_id", 0)),
+		"inventory_child_count": int(metadata.get("inventory_child_count", 0)),
+		"inventory_first_id": int(metadata.get("inventory_first_id", 0)),
+		"inventory_last_id": int(metadata.get("inventory_last_id", 0)),
+		"all_elements": [],
+		"selectable_elements": [],
+		"all_lookup": {},
+		"selectable_lookup": {},
+		"item_instance_lookup": {}
+	}
+	var seen = {}
+	var displayed_elements = metadata.get("displayed_elements", [])
+	if typeof(displayed_elements) == TYPE_ARRAY:
+		for element in displayed_elements:
+			_append_selection_element_to_cache(entry, seen, element)
+	var inventory = metadata.get("inventory", null)
+	if _is_live_ref(inventory):
+		for child in inventory.get_children():
+			_append_selection_element_to_cache(entry, seen, child)
+	return entry
+
+
+func _get_selection_element_cache_entry(selection: Node, player_index: int) -> Dictionary:
+	_last_selection_element_cache_hit = false
+	_last_selection_element_cache_build_usec = 0
+	if not _is_live_ref(selection):
+		return {}
+	var selection_id = int(selection.get_instance_id())
+	if selection_id != _selection_element_cache_selection_id:
+		_selection_element_cache_selection_id = selection_id
+		_selection_element_cache_by_player.clear()
+
+	var metadata = _get_selection_element_cache_metadata(selection, player_index)
+	var cache_key = str(player_index)
+	var cached = _get_dict_or_empty(_selection_element_cache_by_player.get(cache_key, {}))
+	if _selection_element_cache_entry_matches(cached, metadata):
+		_last_selection_element_cache_hit = true
+		return cached
+
+	var build_start_usec = OS.get_ticks_usec()
+	var entry = _build_selection_element_cache_entry(metadata)
+	_last_selection_element_cache_build_usec = OS.get_ticks_usec() - build_start_usec
+	_selection_element_cache_by_player[cache_key] = entry
+	return entry
+
+
+func _get_selectable_elements_for_player(selection: Node, player_index: int, include_locked: bool = false) -> Array:
+	var entry = _get_selection_element_cache_entry(selection, player_index)
+	if include_locked:
+		var all_elements = entry.get("all_elements", [])
+		return all_elements if typeof(all_elements) == TYPE_ARRAY else []
+	var selectable_elements = entry.get("selectable_elements", [])
+	return selectable_elements if typeof(selectable_elements) == TYPE_ARRAY else []
 
 
 func _find_element_by_item_id(selection: Node, player_index: int, item_id, include_locked: bool = false):
+	_last_find_element_collect_usec = 0
+	_last_find_element_scan_usec = 0
+	_last_find_element_candidate_count = 0
+	_last_find_element_cache_hit = false
+	_last_find_element_cache_build_usec = 0
 	var target = str(item_id)
-	var elements = _get_selectable_elements_for_player(selection, player_index, include_locked)
-	for element in elements:
-		if not _is_live_ref(element):
-			continue
-
-		var item = _safe_get(element, "item", null)
-		if not _is_live_ref(item):
-			continue
-
-		if str(_safe_get(item, "my_id_hash", "")) == target:
-			return element
-		if str(_safe_get(item, "weapon_id_hash", "")) == target:
-			return element
-		if str(_safe_get(item, "my_id", "")) == target:
-			return element
-		if _get_item_id_for_log(item) == target:
-			return element
+	var collect_start_usec = OS.get_ticks_usec()
+	var entry = _get_selection_element_cache_entry(selection, player_index)
+	_last_find_element_collect_usec = OS.get_ticks_usec() - collect_start_usec
+	_last_find_element_cache_hit = _last_selection_element_cache_hit
+	_last_find_element_cache_build_usec = _last_selection_element_cache_build_usec
+	var elements = entry.get("all_elements", []) if include_locked else entry.get("selectable_elements", [])
+	if typeof(elements) == TYPE_ARRAY:
+		_last_find_element_candidate_count = elements.size()
+	var lookup = entry.get("all_lookup", {}) if include_locked else entry.get("selectable_lookup", {})
+	var scan_start_usec = OS.get_ticks_usec()
+	var result = null
+	if typeof(lookup) == TYPE_DICTIONARY:
+		result = lookup.get(target, null)
+	_last_find_element_scan_usec = OS.get_ticks_usec() - scan_start_usec
+	if _is_live_ref(result):
+		return result
 	return null
-
-
-func _is_selectable_inventory_element(element, include_locked: bool = false) -> bool:
-	if not _is_live_ref(element):
-		return false
-
-	if not _has_property(element, "item"):
-		return false
-
-	if not _is_live_ref(_safe_get(element, "item", null)):
-		return false
-
-	if include_locked:
-		return true
-
-	if _safe_get(element, "is_special", false):
-		return false
-
-	if _safe_get(element, "is_locked", false):
-		return false
-
-	return true
 
 
 func _find_current_selection_node() -> Node:

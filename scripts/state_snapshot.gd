@@ -20,6 +20,7 @@ const MAX_RELIABLE_REMOVED_PER_SEND = 160
 # Diagnostic switch: disable Host removed-id propagation. Host still purges its local registry
 # bookkeeping, but clients no longer receive removed ids or prune missing host entities.
 const ENABLE_REMOVED_SYNC = false
+const ENABLE_BOSS_ELITE_REMOVED_SYNC = true
 const RESERVED_BIRTH_MATCH_RADIUS = 96.0
 const RESERVED_BIRTH_TTL_MSEC = 12000
 const ENABLE_PROJECTILE_VISUAL_EVENTS_IN_B5_5 = false
@@ -188,6 +189,8 @@ func build_snapshot() -> Dictionary:
 		var purged_removed = registry.purge_missing(active_dynamic_net_ids)
 		for removed_id_value in purged_removed:
 			var removed_id = str(removed_id_value)
+			var removed_category = str(_last_entity_category_by_net_id.get(removed_id, ""))
+			var should_sync_removed = ENABLE_REMOVED_SYNC or (ENABLE_BOSS_ELITE_REMOVED_SYNC and _is_boss_elite_category(removed_category))
 			_birth_only_announced_net_ids.erase(removed_id)
 			_birth_only_first_seen_msec.erase(removed_id)
 			_birth_marker_announced_net_ids.erase(removed_id)
@@ -196,7 +199,7 @@ func build_snapshot() -> Dictionary:
 			_structure_curse_data_signature_by_net_id.erase(removed_id)
 			_host_entity_by_net_id.erase(removed_id)
 			_host_entity_by_short_id.erase(str(_net_short_id(removed_id)))
-			if ENABLE_REMOVED_SYNC:
+			if should_sync_removed:
 				removed.append(removed_id)
 				_queue_pending_reliable_removed(removed_id)
 		if ENABLE_REMOVED_SYNC:
@@ -1512,7 +1515,8 @@ func _apply_client_authoritative_remote_player_life_state(player: Node, player_i
 		player.set_meta("brotato_online_remote_dead", true)
 
 		# Host-side remote players are only local proxies for the client-owned player.
-		# Their hurtbox is disabled, so vanilla local damage will not kill them. When the
+		# Their Hurtbox stays enabled to run local on-damage mechanics, but the Player
+		# extension restores synchronized HP and blocks local proxy death. When the
 		# owning client reports death, mirror the vanilla death lifecycle here so Host does
 		# not show a living 0-HP proxy. If another path already set Player.dead=true before
 		# the vanilla death animation ran, force a death pose instead of leaving the proxy standing.
@@ -1802,25 +1806,16 @@ func _prepare_remote_player_proxy_for_client_authority(player: Node, player_inde
 	if not _is_valid_node(player):
 		return
 	player.set_meta("brotato_online_client_authority_hp", true)
+	player.set_meta("brotato_online_remote_hurtbox_proxy", true)
+	player.set_meta("brotato_online_remote_bull_hurtbox_proxy", _is_bull_player_index(player_index))
 	player.set_meta("brotato_online_hurtbox_disabled_player_index", player_index)
+	player.set_meta("brotato_online_hurtbox_enabled_reason", reason)
 
-	# Bull must keep a real Hurtbox on the Host, because its character mechanic
-	# is triggered by being hit. Damage/death is still client-authoritative and
-	# filtered by player_safe_room_cleanup.gd through this meta flag.
-	if _is_bull_player_index(player_index):
-		player.set_meta("brotato_online_remote_bull_hurtbox_proxy", true)
-		player.set_meta("brotato_online_hurtbox_enabled_reason", reason)
-		_enable_bull_remote_player_hurtbox(player)
-		return
-
-	player.set_meta("brotato_online_remote_bull_hurtbox_proxy", false)
-	if player.has_method("disable_hurtbox"):
-		player.disable_hurtbox()
-	else:
-		var hurtbox = player.get_node_or_null("Hurtbox")
-		if hurtbox != null and hurtbox.has_method("disable"):
-			hurtbox.disable()
-	player.set_meta("brotato_online_hurtbox_disabled_reason", reason)
+	# Every remote player keeps a real Hurtbox so Host-side overlaps enter the complete
+	# vanilla Player.take_damage() pipeline. The Player extension restores client-owned
+	# HP afterward and blocks local proxy death, while preserving character/item
+	# on-damage mechanics (Bull is no longer a special case).
+	_enable_remote_player_hurtbox(player)
 
 
 func _is_bull_player_index(player_index: int) -> bool:
@@ -1844,7 +1839,7 @@ func _is_bull_player_index(player_index: int) -> bool:
 	return str(character.get("my_id")) == BULL_CHARACTER_ID
 
 
-func _enable_bull_remote_player_hurtbox(player: Node) -> void:
+func _enable_remote_player_hurtbox(player: Node) -> void:
 	if not _is_valid_node(player):
 		return
 	var invincibility_timer = player.get("_invincibility_timer")
@@ -1887,6 +1882,10 @@ func _get_player_index_for_steam_id(steam_id: String) -> int:
 	if slot_manager != null and slot_manager.has_method("get_player_index_for_steam_id"):
 		return int(slot_manager.get_player_index_for_steam_id(steam_id))
 	return -1
+
+
+func _is_boss_elite_category(category: String) -> bool:
+	return category == "boss" or category == "elite"
 
 
 func _net_short_id(net_id: String) -> int:
@@ -2069,7 +2068,7 @@ func peek_pending_battle_reliable_events_for_send() -> Dictionary:
 	return {
 		"entities": _pending_ordered_dictionary_values(_pending_reliable_birth_entity_order, _pending_reliable_birth_entities_by_net_id, MAX_RELIABLE_BIRTH_ENTITIES_PER_SEND),
 		"births": _pending_ordered_dictionary_values(_pending_reliable_birth_marker_order, _pending_reliable_birth_markers_by_net_id, MAX_RELIABLE_BIRTH_MARKERS_PER_SEND),
-		"removed": _peek_pending_reliable_removed_ids(MAX_RELIABLE_REMOVED_PER_SEND) if ENABLE_REMOVED_SYNC else [],
+		"removed": _peek_pending_reliable_removed_ids(MAX_RELIABLE_REMOVED_PER_SEND) if ENABLE_REMOVED_SYNC or ENABLE_BOSS_ELITE_REMOVED_SYNC else [],
 		"events": _peek_pending_battle_events(MAX_EVENTS_PER_SNAPSHOT)
 	}
 
@@ -2156,7 +2155,7 @@ func _queue_pending_reliable_birth_marker(state: Dictionary) -> void:
 
 
 func _queue_pending_reliable_removed(net_id: String) -> void:
-	if not ENABLE_REMOVED_SYNC:
+	if not ENABLE_REMOVED_SYNC and not ENABLE_BOSS_ELITE_REMOVED_SYNC:
 		return
 	if net_id == "":
 		return
@@ -2189,7 +2188,7 @@ func _pending_ordered_dictionary_values(order: Array, values_by_id: Dictionary, 
 
 func _peek_pending_reliable_removed_ids(max_count: int) -> Array:
 	var result = []
-	if not ENABLE_REMOVED_SYNC:
+	if not ENABLE_REMOVED_SYNC and not ENABLE_BOSS_ELITE_REMOVED_SYNC:
 		return result
 	if max_count <= 0:
 		return result

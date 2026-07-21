@@ -130,6 +130,8 @@ var _last_menu_phase_selection_poll_usec = 0
 var _cached_in_game_scene = false
 var _cached_in_normal_shop_scene = false
 var _accepted_p2p_sessions = {}
+var _pending_received_menu_focus_by_sender = {}
+var _pending_received_menu_focus_order = []
 var _online_flow_started = false
 var _online_flow_left_since_msec = 0
 var _host_known_remote_ids = []
@@ -671,6 +673,8 @@ func leave_lobby() -> void:
 	_client_join_request_started_msec = 0
 	_clear_join_presence()
 	_accepted_p2p_sessions.clear()
+	_pending_received_menu_focus_by_sender.clear()
+	_pending_received_menu_focus_order.clear()
 	_host_known_remote_ids.clear()
 	_client_hello_retry_until_msec = 0
 	_last_client_hello_retry_msec = 0
@@ -1748,6 +1752,8 @@ func _reset_transient_online_state_for_new_session(reason: String = "") -> void:
 	_full_item_list_scene_sync_required_by_steam_id.clear()
 	_pending_p2p_chunk_sends.clear()
 	_incoming_p2p_chunks.clear()
+	_pending_received_menu_focus_by_sender.clear()
+	_pending_received_menu_focus_order.clear()
 	_seen_client_hello_by_steam_id.clear()
 	_client_seen_host_setup_key_by_sender.clear()
 	_client_seen_host_setup_msec_by_sender.clear()
@@ -2183,19 +2189,97 @@ func _poll_p2p_channel(channel: int, limit: int) -> void:
 		prefix = "p2p_browser"
 	var t_receive = OS.get_ticks_usec()
 	var messages = _receive_steam_messages_on_channel(channel, limit)
-	_bo_net_diag_cost(prefix + "_receive", t_receive, "count=" + str(messages.size()) + " limit=" + str(limit))
+	var received_count = messages.size()
+	_bo_net_diag_cost(prefix + "_receive", t_receive, "count=" + str(received_count) + " limit=" + str(limit))
+
+	var dropped_focus_count = 0
+	var held_focus_count = 0
+	var flushed_focus_count = 0
+	if channel == P2P_CHANNEL_MENU and _is_game_host() and (not messages.empty() or not _pending_received_menu_focus_by_sender.empty()):
+		# A full receive batch means Steam may still have older reliable focus packets
+		# queued. Consume those packets without applying intermediate UI positions and
+		# flush only the latest focus once the receive batch is no longer full.
+		var prepared = _prepare_received_menu_packets(messages, received_count >= limit)
+		if typeof(prepared) == TYPE_DICTIONARY:
+			dropped_focus_count = int(prepared.get("dropped", 0))
+			held_focus_count = int(prepared.get("held", 0))
+			flushed_focus_count = int(prepared.get("flushed", 0))
+			var kept_messages = prepared.get("messages", messages)
+			if typeof(kept_messages) == TYPE_ARRAY:
+				messages = kept_messages
+		if dropped_focus_count > 0 or held_focus_count > 0 or flushed_focus_count > 0:
+			var coalesce_key = str(received_count) + ":" + str(messages.size()) + ":" + str(dropped_focus_count) + ":" + str(held_focus_count) + ":" + str(flushed_focus_count)
+			_bo_net_diag_state_change("FOCUS_COALESCE", coalesce_key, "received=" + str(received_count) + " handled=" + str(messages.size()) + " dropped_focus=" + str(dropped_focus_count) + " held_focus=" + str(held_focus_count) + " flushed_focus=" + str(flushed_focus_count), 500)
+
 	if messages.empty():
 		return
+
 	var total_bytes = 0
 	var t_handle = OS.get_ticks_usec()
 	for packet in messages:
 		var packet_size = _extract_packet_bytes(packet).size() if typeof(packet) == TYPE_DICTIONARY else 0
 		total_bytes += packet_size
 		_handle_raw_p2p_packet(packet)
-	_bo_net_diag_cost(prefix + "_handle_batch", t_handle, "count=" + str(messages.size()) + " bytes=" + str(total_bytes) + " limit=" + str(limit))
-	if messages.size() >= limit or total_bytes >= BO_NET_DIAG_LARGE_BATCH_BYTES:
-		var key = prefix + ":" + str(messages.size()) + ":" + str(total_bytes)
-		_bo_net_diag_state_change("POLL_BACKLOG", key, "channel=" + str(channel) + " count=" + str(messages.size()) + " limit=" + str(limit) + " bytes=" + str(total_bytes), 1000)
+	_bo_net_diag_cost(prefix + "_handle_batch", t_handle, "received=" + str(received_count) + " handled=" + str(messages.size()) + " dropped_focus=" + str(dropped_focus_count) + " held_focus=" + str(held_focus_count) + " flushed_focus=" + str(flushed_focus_count) + " bytes=" + str(total_bytes) + " limit=" + str(limit))
+	if received_count >= limit or total_bytes >= BO_NET_DIAG_LARGE_BATCH_BYTES:
+		var key = prefix + ":" + str(received_count) + ":" + str(messages.size()) + ":" + str(total_bytes)
+		_bo_net_diag_state_change("POLL_BACKLOG", key, "channel=" + str(channel) + " received=" + str(received_count) + " handled=" + str(messages.size()) + " dropped_focus=" + str(dropped_focus_count) + " held_focus=" + str(held_focus_count) + " limit=" + str(limit) + " bytes=" + str(total_bytes), 1000)
+
+
+func _prepare_received_menu_packets(messages: Array, hold_focus: bool) -> Dictionary:
+	var result = []
+	var dropped = 0
+	for packet in messages:
+		if typeof(packet) != TYPE_DICTIONARY:
+			result.append(packet)
+			continue
+		var sender = _extract_packet_sender(packet)
+		var bytes = _extract_packet_bytes(packet)
+		if sender == "" or bytes.size() == 0:
+			result.append(packet)
+			continue
+		var parsed = parse_json(bytes.get_string_from_utf8())
+		if typeof(parsed) != TYPE_DICTIONARY:
+			result.append(packet)
+			continue
+		var msg_type = str(parsed.get("msg_type", ""))
+		var session_key = str(parsed.get("session_lobby_id", parsed.get("lobby_id", "")))
+		var focus_key = sender + ":" + session_key
+		if msg_type == "menu_focus":
+			if _pending_received_menu_focus_by_sender.has(focus_key):
+				dropped += 1
+			_pending_received_menu_focus_by_sender[focus_key] = packet
+			_pending_received_menu_focus_order.erase(focus_key)
+			_pending_received_menu_focus_order.append(focus_key)
+			continue
+
+		# A character/weapon confirmation includes the selected item and applies its own
+		# focus on Host. Any older pending focus from this sender is already obsolete.
+		if msg_type == "select_character" or msg_type == "select_weapon":
+			if _pending_received_menu_focus_by_sender.has(focus_key):
+				_pending_received_menu_focus_by_sender.erase(focus_key)
+				_pending_received_menu_focus_order.erase(focus_key)
+				dropped += 1
+		result.append(packet)
+
+	var held = _pending_received_menu_focus_by_sender.size()
+	var flushed = 0
+	if not hold_focus and not _pending_received_menu_focus_by_sender.empty():
+		for focus_key in _pending_received_menu_focus_order:
+			if not _pending_received_menu_focus_by_sender.has(focus_key):
+				continue
+			result.append(_pending_received_menu_focus_by_sender[focus_key])
+			flushed += 1
+		_pending_received_menu_focus_by_sender.clear()
+		_pending_received_menu_focus_order.clear()
+		held = 0
+
+	return {
+		"messages": result,
+		"dropped": dropped,
+		"held": held,
+		"flushed": flushed
+	}
 
 
 func _receive_steam_messages_on_channel(channel: int, limit: int) -> Array:
@@ -2466,34 +2550,62 @@ func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 		return
 
 	if msg_type == "hello":
+		var hello_start_usec = OS.get_ticks_usec()
+		var capability_usec = 0
+		var mark_sync_usec = 0
+		var ensure_slot_usec = 0
+		var refresh_members_usec = 0
+		var dlc_gate_usec = 0
+		var send_setup_usec = 0
+		var send_selection_usec = 0
+		var broadcast_usec = 0
 		var first_hello = not _seen_client_hello_by_steam_id.has(from_steam_id)
 		_seen_client_hello_by_steam_id[from_steam_id] = true
 		var client_content_changed = false
 		var menu_sync_for_capability = _get_menu_sync_manager()
+		var stage_start_usec = OS.get_ticks_usec()
 		if _is_game_host() and menu_sync_for_capability != null and menu_sync_for_capability.has_method("receive_client_content_capability_from_hello"):
 			client_content_changed = bool(menu_sync_for_capability.receive_client_content_capability_from_hello(from_steam_id, message))
+		capability_usec = OS.get_ticks_usec() - stage_start_usec
+		stage_start_usec = OS.get_ticks_usec()
 		if first_hello or _is_in_official_coop_resume_scene() or _is_in_game_scene() or _is_in_shop_scene():
 			_mark_full_item_list_scene_sync_required(from_steam_id, "hello")
+		mark_sync_usec = OS.get_ticks_usec() - stage_start_usec
 		if first_hello:
 			var cap_for_log = message.get("content_capability", {})
 			var cap_count_for_log = 0
 			if typeof(cap_for_log) == TYPE_DICTIONARY:
 				cap_count_for_log = int(cap_for_log.get("character_count", 0))
 		if _is_game_host():
+			stage_start_usec = OS.get_ticks_usec()
 			_ensure_host_coop_slot_for_remote(from_steam_id)
+			ensure_slot_usec = OS.get_ticks_usec() - stage_start_usec
+			stage_start_usec = OS.get_ticks_usec()
 			if first_hello and not _should_freeze_online_run_slots():
 				_refresh_lobby_members()
 				_schedule_prime_and_broadcast_after_remote_join()
+			refresh_members_usec = OS.get_ticks_usec() - stage_start_usec
+			stage_start_usec = OS.get_ticks_usec()
 			if client_content_changed:
 				_sent_character_setup_key_by_steam_id.clear()
 				_last_broadcast_selection_key = ""
 				if menu_sync_for_capability != null and menu_sync_for_capability.has_method("apply_host_dlc_gate_now"):
 					menu_sync_for_capability.apply_host_dlc_gate_now()
+			dlc_gate_usec = OS.get_ticks_usec() - stage_start_usec
+			stage_start_usec = OS.get_ticks_usec()
 			_send_host_phase_setup_to_client(from_steam_id, first_hello or client_content_changed)
+			send_setup_usec = OS.get_ticks_usec() - stage_start_usec
+			stage_start_usec = OS.get_ticks_usec()
 			_send_selection_state_to_client(from_steam_id, first_hello or client_content_changed)
+			send_selection_usec = OS.get_ticks_usec() - stage_start_usec
+			stage_start_usec = OS.get_ticks_usec()
 			if client_content_changed:
 				_send_host_phase_messages_to_all(true, from_steam_id)
 				_broadcast_selection_state(true)
+			broadcast_usec = OS.get_ticks_usec() - stage_start_usec
+		var hello_total_usec = OS.get_ticks_usec() - hello_start_usec
+		if hello_total_usec >= BO_NET_DIAG_SINGLE_COST_USEC:
+			_bo_net_diag_log("HELLO_DETAIL", "total_us=" + str(hello_total_usec) + " capability_us=" + str(capability_usec) + " mark_sync_us=" + str(mark_sync_usec) + " ensure_slot_us=" + str(ensure_slot_usec) + " refresh_members_us=" + str(refresh_members_usec) + " dlc_gate_us=" + str(dlc_gate_usec) + " send_setup_us=" + str(send_setup_usec) + " send_selection_us=" + str(send_selection_usec) + " broadcast_us=" + str(broadcast_usec) + " first=" + str(first_hello) + " content_changed=" + str(client_content_changed) + " from=" + from_steam_id)
 		return
 
 	if msg_type == "request_selection_state":
@@ -5239,7 +5351,7 @@ func _compact_host_motion_entities(snapshot: Dictionary) -> Array:
 			int(entity.get("entity_type", -1)),
 			pos[0], pos[1],
 			vel[0], vel[1],
-			1 if ENABLE_DEATH_EVENT_MESSAGES and _safe_bool(entity.get("dead", false)) else 0,
+			1 if _should_wire_entity_dead(entity) else 0,
 			int(entity.get("health", -1)),
 			int(entity.get("max_health", -1)),
 			int(entity.get("speed", -1)),
@@ -5338,12 +5450,21 @@ func _make_wire_progression_state(snapshot: Dictionary) -> Dictionary:
 	# Already compact: only ids/resource paths plus the currently visible Host-generated options.
 	return state.duplicate(true)
 
+func _should_wire_entity_dead(entity: Dictionary) -> bool:
+	if typeof(entity) != TYPE_DICTIONARY or not _safe_bool(entity.get("dead", false)):
+		return false
+	if ENABLE_DEATH_EVENT_MESSAGES:
+		return true
+	var category = str(entity.get("category", ""))
+	return category == "boss" or category == "elite"
+
+
 func _make_wire_entity_state(entity: Dictionary, legacy_enemy: bool) -> Dictionary:
 	var result = {
 		"net_id": str(entity.get("net_id", "")),
 		"pos": entity.get("pos", {}),
 		"vel": entity.get("vel", {}),
-		"dead": ENABLE_DEATH_EVENT_MESSAGES and _safe_bool(entity.get("dead", false)),
+		"dead": _should_wire_entity_dead(entity),
 		"health": int(entity.get("health", -1)),
 		"max_health": int(entity.get("max_health", -1)),
 		"speed": int(entity.get("speed", -1)),

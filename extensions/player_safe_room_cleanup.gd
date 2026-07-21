@@ -188,12 +188,12 @@ func _brotato_online_clamp_owned_enemy_projectile_damage(value: int, args: TakeD
 	return value
 
 
-func _brotato_online_restore_remote_proxy_hp() -> void:
+func _brotato_online_restore_remote_proxy_hp(preferred_hp: int = -1) -> void:
 	if current_stats == null:
 		return
 	var max_health = int(max_stats.health) if max_stats != null else 1
-	var restore_hp = int(current_stats.health)
-	if has_meta("brotato_online_last_host_hp"):
+	var restore_hp = preferred_hp if preferred_hp >= 0 else int(current_stats.health)
+	if preferred_hp < 0 and has_meta("brotato_online_last_host_hp"):
 		restore_hp = int(get_meta("brotato_online_last_host_hp"))
 	elif restore_hp <= 0:
 		restore_hp = 1
@@ -206,95 +206,45 @@ func _brotato_online_restore_remote_proxy_hp() -> void:
 		emit_signal("health_updated", self, current_stats.health, max_health)
 
 
-func _brotato_online_is_remote_bull_hurtbox_proxy() -> bool:
+func _brotato_online_is_remote_hurtbox_proxy() -> bool:
 	if not _brotato_online_is_online_session_active():
 		return false
-	if not has_meta("brotato_online_remote_bull_hurtbox_proxy"):
-		return false
-	if not bool(get_meta("brotato_online_remote_bull_hurtbox_proxy")):
-		return false
-	return _brotato_online_is_bull_character_index(_brotato_online_get_self_player_index())
-
-
-func _brotato_online_is_bull_character_index(index: int) -> bool:
-	if index < 0:
-		return false
-	if RunData != null and RunData.has_method("get_player_count") and index >= int(RunData.get_player_count()):
-		return false
-	var character = null
-	if RunData != null and RunData.has_method("get_player_character"):
-		character = RunData.get_player_character(index)
-	elif RunData != null and RunData.get("players_data") != null:
-		var players_data = RunData.get("players_data")
-		if typeof(players_data) == TYPE_ARRAY and index < players_data.size():
-			var player_data = players_data[index]
-			if player_data != null:
-				character = player_data.get("current_character")
-	if character == null:
-		return false
-	return str(character.get("my_id")) == "character_bull"
-
-
-func _brotato_online_remote_bull_can_take_proxy_hit(args: TakeDamageArgs) -> bool:
-	if args != null and args.hitbox != null and args.hitbox.get("is_healing") != null and bool(args.hitbox.is_healing):
-		return false
-	if args != null and bool(args.bypass_invincibility):
+	if has_meta("brotato_online_remote_hurtbox_proxy") and bool(get_meta("brotato_online_remote_hurtbox_proxy")):
 		return true
-	if _invincibility_timer != null and is_instance_valid(_invincibility_timer) and not _invincibility_timer.is_stopped():
-		return false
-	return true
-
-
-func _brotato_online_trigger_remote_bull_explosion() -> void:
-	var explode_on_hit_effects = RunData.get_player_effect(Keys.explode_on_hit_hash, player_index)
-	if typeof(explode_on_hit_effects) != TYPE_ARRAY or explode_on_hit_effects.empty():
-		return
-	init_exploding_stats(false)
-	var explode_when_below_hp_effects = RunData.get_player_effect(Keys.explode_when_below_hp_hash, player_index)
-	var nb_explosions = explode_on_hit_effects.size()
-	if typeof(explode_when_below_hp_effects) == TYPE_ARRAY:
-		nb_explosions += explode_when_below_hp_effects.size()
-	if nb_explosions <= 0:
-		nb_explosions = 1
-	for effect in explode_on_hit_effects:
-		if not _explode_on_hit_stats.has(effect):
-			continue
-		explode(_explode_on_hit_stats[effect], effect, nb_explosions)
-	if has_method("flash"):
-		flash()
-
-
-func _brotato_online_start_remote_bull_proxy_iframes() -> void:
-	if has_method("disable_hurtbox"):
-		disable_hurtbox()
-	if _invincibility_timer != null and is_instance_valid(_invincibility_timer):
-		_invincibility_timer.start(MIN_IFRAMES)
+	# Compatibility with scenes prepared by an older manager instance during hot reload.
+	return has_meta("brotato_online_remote_bull_hurtbox_proxy") and bool(get_meta("brotato_online_remote_bull_hurtbox_proxy"))
 
 
 func take_damage(value: int, args: TakeDamageArgs) -> Array:
-	# Host-side remote Bull keeps its Hurtbox enabled so enemy hits can trigger the
-	# Bull explosion, but the local hit must never own HP/death for that remote player.
-	if _brotato_online_is_remote_bull_hurtbox_proxy():
-		if _brotato_online_remote_bull_can_take_proxy_hit(args):
-			_brotato_online_trigger_remote_bull_explosion()
-			_brotato_online_start_remote_bull_proxy_iframes()
-		_brotato_online_restore_remote_proxy_hp()
-		return [0, 0, false]
-
-	# Remote players on an online client are Host-driven display proxies. Local enemy
-	# simulation can still overlap them before/after snapshots, so block all local damage
-	if _brotato_online_is_remote_online_proxy():
-		disable_hurtbox()
-		_brotato_online_restore_remote_proxy_hp()
-		return [0, 0, false]
+	# Remote online players are client-authoritative for HP/death, but their local Player
+	# instance must still run Brotato's complete damage pipeline. Calling vanilla here
+	# preserves dodge/protection, took_damage signals, on-hit explosions, temporary and
+	# decaying stat effects, reset-on-hit effects, character mechanics and item hooks.
+	# After those effects have run, restore the last synchronized HP so this peer cannot
+	# independently damage or kill the remote player. die() below blocks the transient
+	# vanilla death path while the damage pipeline is executing.
+	if _brotato_online_is_remote_hurtbox_proxy() or _brotato_online_is_remote_online_proxy():
+		# current_stats.health at entry is the latest synchronized remote HP on both
+		# Host and clients. Host-side remote proxies do not always carry last_host_hp
+		# metadata, so preserve this value explicitly across the vanilla damage call.
+		var synchronized_hp_before = int(current_stats.health) if current_stats != null else -1
+		var result = .take_damage(value, args)
+		_brotato_online_restore_remote_proxy_hp(synchronized_hp_before)
+		# Preserve the old proxy-authority contract: callers must not treat this local
+		# replay as authoritative damage dealt. The vanilla pipeline has already emitted
+		# its own took_damage/dodge/protection signals for local gameplay effects.
+		var was_dodge = false
+		if typeof(result) == TYPE_ARRAY and result.size() >= 3:
+			was_dodge = bool(result[2])
+		return [0, 0, was_dodge]
 	value = _brotato_online_clamp_owned_enemy_projectile_damage(value, args)
 	return .take_damage(value, args)
 
 
 func die(args = Utils.default_die_args) -> void:
-	# Local overlap damage must not kill a remote Bull proxy. Remote death sync sets
+	# Local overlap damage must not kill a remote proxy. Remote death sync sets
 	# brotato_online_allow_remote_die before calling die(), so synced deaths still work.
-	if _brotato_online_is_remote_bull_hurtbox_proxy() and not bool(get_meta("brotato_online_allow_remote_die", false)):
+	if _brotato_online_is_remote_hurtbox_proxy() and not bool(get_meta("brotato_online_allow_remote_die", false)):
 		_brotato_online_restore_remote_proxy_hp()
 		return
 	# filtered in take_damage(); actual death callbacks are filtered in MainSafePoolExit.

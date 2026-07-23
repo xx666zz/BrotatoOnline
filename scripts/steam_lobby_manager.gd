@@ -271,6 +271,7 @@ func _bo_net_diag_log(tag: String, msg: String) -> void:
 	print("[BO_LAG][NET][" + tag + "] " + msg)
 
 
+
 func _bo_net_diag_cost(scope: String, start_usec: int, extra: String = "") -> void:
 	if not BO_NET_DIAG_ENABLED:
 		return
@@ -6301,7 +6302,8 @@ func _send_p2p_json(target_steam_id: String, message: Dictionary, reliable: bool
 	# native message ordering; if Steam refuses one, fall back to the frame-paced chunk
 	# queue below.
 	if payload.size() > P2P_JSON_CHUNK_TRIGGER_BYTES:
-		return _queue_p2p_json_chunks(target_steam_id, payload, msg_type, send_flags, channel, coalesce_key)
+		var queued_large = _queue_p2p_json_chunks(target_steam_id, payload, msg_type, send_flags, channel, coalesce_key)
+		return queued_large
 
 	# If a large message to this peer/channel is still being split across frames,
 	# queue later small messages behind it. Otherwise shop_buy can be chunked while
@@ -6309,7 +6311,8 @@ func _send_p2p_json(target_steam_id: String, message: Dictionary, reliable: bool
 	# action seq first and reject the delayed buy as stale.
 	if _has_pending_p2p_send_for_target_channel(target_steam_id, channel):
 		_bo_net_diag_log_large_or_queued_send(target_steam_id, msg_type, payload.size(), channel, reliable or FORCE_ALL_STEAM_MESSAGES_RELIABLE, "queued_behind_pending", _pending_p2p_chunk_sends.size())
-		return _queue_p2p_json_direct_after_pending(target_steam_id, payload, msg_type, send_flags, channel, coalesce_key)
+		var queued_behind = _queue_p2p_json_direct_after_pending(target_steam_id, payload, msg_type, send_flags, channel, coalesce_key)
+		return queued_behind
 
 	var target_int = int(target_steam_id)
 	var result = _steam.sendMessageToUser(target_int, payload, send_flags, channel)

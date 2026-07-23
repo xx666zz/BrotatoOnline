@@ -189,6 +189,7 @@ func _bo_ui_diag_log(tag: String, msg: String) -> void:
 	print("[BO_LAG][UI][" + tag + "] " + msg)
 
 
+
 func _bo_ui_diag_node_desc(node) -> String:
 	if not _is_live_ref(node):
 		return "null"
@@ -749,11 +750,13 @@ func consume_local_run_page_action_messages() -> Array:
 
 	var messages = []
 	while not _queued_local_run_page_action_messages.empty():
-		messages.append(_queued_local_run_page_action_messages.pop_front())
+		var queued_message = _queued_local_run_page_action_messages.pop_front()
+		messages.append(queued_message)
 	return messages
 
 
 func receive_run_page_action_sync(from_steam_id: String, message: Dictionary, self_steam_id: String) -> Dictionary:
+	var action_type = str(message.get("action_type", ""))
 	var action_id = str(message.get("action_id", ""))
 	if action_id != "":
 		if _processed_run_page_action_ids.has(action_id):
@@ -763,7 +766,6 @@ func receive_run_page_action_sync(from_steam_id: String, message: Dictionary, se
 		_processed_run_page_action_ids[action_id] = OS.get_ticks_msec()
 		_trim_processed_run_page_actions()
 
-	var action_type = str(message.get("action_type", ""))
 	if _is_game_start_guard_active() and _is_guarded_run_page_action(action_type):
 		# Upgrade/item-box overlays live inside main.tscn and can legitimately appear
 		# shortly after a synced shop->battle start (especially on short/final waves).
@@ -1160,18 +1162,25 @@ func _queue_shop_focus_if_changed(player_index: int) -> void:
 	var target = _get_current_shop_focus_target(shop, player_index)
 	if target == "":
 		return
-	var key = str(player_index) + ":" + target
+	# Keep the compact positional target for the common case. Inventory/weapon focus
+	# also carries a stable item identity so the receiver can verify that the same
+	# index still contains the same item after a gift/combine/reorder.
+	var focus_item_identity = _get_shop_focus_target_stable_identity(shop, player_index, target)
+	var key = str(player_index) + ":" + target + ":" + _shop_item_stable_identity_key(focus_item_identity)
 	if key == str(_last_local_shop_focus_key.get(player_index, "")):
 		return
 	_last_local_shop_focus_key[player_index] = key
-	_queue_local_run_page_action({
+	var action = {
 		"msg_type": "run_page_action_sync",
 		"action_type": "shop_focus",
 		"screen": "shop",
 		"player_index": player_index,
 		"target": target,
 		"shop_index": _shop_target_to_index(target)
-	})
+	}
+	if not focus_item_identity.empty():
+		action["focus_item_identity"] = focus_item_identity
+	_queue_local_run_page_action(action)
 
 
 func _install_host_shop_go_sync_intercept(shop: Node) -> void:
@@ -1404,7 +1413,12 @@ func _apply_shop_focus_visual_action(player_index: int, message: Dictionary) -> 
 			target = "item_" + str(idx)
 	if target == "":
 		return false
-	var control = _get_control_for_shop_target(shop, player_index, target)
+	# Positional target remains the fast path. Only when that index contains a
+	# different inventory item do we scan the same container for the stable ID.
+	var resolved_target = _resolve_shop_focus_target_by_stable_identity(shop, player_index, target, message.get("focus_item_identity", {}))
+	if resolved_target == "":
+		return false
+	var control = _get_control_for_shop_target(shop, player_index, resolved_target)
 	if not _is_live_ref(control):
 		return false
 	var focus_emulator = Utils.get_focus_emulator(player_index)
@@ -1421,8 +1435,8 @@ func _apply_shop_focus_visual_action(player_index: int, message: Dictionary) -> 
 	# Refresh tooltip even if the target string did not change. After a buy/reroll/
 	# combine the target key can remain item_0/weapon_0 while the underlying data
 	# and popup content changed.
-	_apply_shop_focus_popup_side_effects(shop, player_index, previous_target, target, true)
-	_last_shop_focus_target_by_player[player_index] = target
+	_apply_shop_focus_popup_side_effects(shop, player_index, previous_target, resolved_target, true)
+	_last_shop_focus_target_by_player[player_index] = resolved_target
 	return true
 
 
@@ -3332,6 +3346,7 @@ func _ensure_shop_inventory_popup_wiring_for_player(shop: Node, player_index: in
 	if not _is_valid_shop_node(shop) or player_index < 0:
 		return
 	var gear_container = shop._get_gear_container(player_index) if shop.has_method("_get_gear_container") else null
+	var item_popup = shop._get_item_popup(player_index) if shop.has_method("_get_item_popup") else null
 	if _is_live_ref(gear_container):
 		_reconnect_shop_inventory_popup_sources(shop, gear_container, player_index)
 	_ensure_shop_item_popup_action_connections(shop, player_index, client_action_intercept)
@@ -3444,6 +3459,9 @@ func _ensure_shop_inventory_custom_popup_button_wiring(item_popup: Node, player_
 	if not item_popup.is_connected("visibility_changed", self, "_on_shop_inventory_popup_visibility_changed"):
 		item_popup.connect("visibility_changed", self, "_on_shop_inventory_popup_visibility_changed", [player_index, int(item_popup.get_instance_id())])
 	if item_popup.visible and item_popup.is_inside_tree():
+		# Third-party mods may add or replace popup buttons after ItemPopup becomes visible.
+		# Keep scheduling a cheap scan while the popup is open; the scan only connects
+		# signals that are still missing and refreshes the cached item locator.
 		call_deferred("_scan_shop_inventory_custom_popup_buttons_deferred", player_index, int(item_popup.get_instance_id()), false)
 
 
@@ -3475,8 +3493,10 @@ func _scan_shop_inventory_custom_popup_buttons_deferred(player_index: int, popup
 	if not item_popup.visible or not item_popup.is_inside_tree():
 		return
 	var popup_key = str(popup_instance_id) + ":" + _get_shop_inventory_popup_item_key(item_popup)
-	if not force_rescan and str(_shop_inventory_custom_button_popup_key_by_player.get(player_index, "")) == popup_key:
-		return
+	# Do not treat one completed scan as proof that the popup's children are final.
+	# Mods such as ShareWithYourBro create their buttons with call_deferred(), and other
+	# mods rebuild them when the focused item changes. This function is already reached
+	# through the 120/250 ms shop poll, so rescanning this small popup subtree is cheap.
 	_shop_inventory_custom_button_popup_key_by_player[player_index] = popup_key
 	var buttons = []
 	_collect_shop_inventory_custom_popup_buttons(item_popup, item_popup, buttons)
@@ -3484,10 +3504,14 @@ func _scan_shop_inventory_custom_popup_buttons_deferred(player_index: int, popup
 		if not _is_live_ref(button):
 			continue
 		var connected_key = str(popup_instance_id) + ":" + str(button.get_instance_id())
-		_shop_inventory_custom_button_connected_keys[connected_key] = OS.get_ticks_msec()
 		var descriptor = _build_shop_inventory_custom_button_descriptor(item_popup, button, player_index)
-		if not descriptor.empty():
-			_shop_inventory_custom_button_descriptor_cache[_get_shop_inventory_custom_button_cache_key(popup_instance_id, button)] = descriptor
+		var descriptor_cache_key = _get_shop_inventory_custom_button_cache_key(popup_instance_id, button)
+		var cached_descriptor = _get_cached_shop_inventory_custom_button_descriptor(popup_instance_id, button)
+		# Never replace a good locator with an empty one while a third-party pressed
+		# callback is closing the popup or rebuilding the inventory.
+		if _shop_inventory_custom_button_descriptor_has_item_locator(descriptor) or cached_descriptor.empty():
+			if not descriptor.empty():
+				_shop_inventory_custom_button_descriptor_cache[descriptor_cache_key] = descriptor
 		# Send on button_down too. Many third-party buttons mutate/close the popup in
 		# their pressed handler before our later pressed callback can read _item_data.
 		# button_down captures the item/button identity before the mod consumes it;
@@ -3496,6 +3520,8 @@ func _scan_shop_inventory_custom_popup_buttons_deferred(player_index: int, popup
 			button.connect("button_down", self, "_on_shop_inventory_custom_button_down", [player_index, popup_instance_id, button])
 		if not button.is_connected("pressed", self, "_on_shop_inventory_custom_button_pressed"):
 			button.connect("pressed", self, "_on_shop_inventory_custom_button_pressed", [player_index, popup_instance_id, button])
+		if button.is_connected("button_down", self, "_on_shop_inventory_custom_button_down") and button.is_connected("pressed", self, "_on_shop_inventory_custom_button_pressed"):
+			_shop_inventory_custom_button_connected_keys[connected_key] = OS.get_ticks_msec()
 
 
 func _collect_shop_inventory_custom_popup_buttons(root_popup: Node, node: Node, out: Array) -> void:
@@ -3564,20 +3590,42 @@ func _queue_shop_inventory_custom_button_signal(player_index: int, popup_instanc
 	if not _is_shop_inventory_custom_popup_button(item_popup, button):
 		return
 	var descriptor = _build_shop_inventory_custom_button_descriptor(item_popup, button, player_index)
+	var cached_descriptor = _get_cached_shop_inventory_custom_button_descriptor(popup_instance_id, button)
 	if descriptor.empty():
-		descriptor = _get_cached_shop_inventory_custom_button_descriptor(popup_instance_id, button)
-	if descriptor.empty():
+		descriptor = cached_descriptor
+	elif not cached_descriptor.empty():
+		# A keyboard/controller activation emits pressed without button_down. The Mod's
+		# own pressed handler can run first and remove the item or close the popup before
+		# this callback executes. Preserve the locator captured during the periodic scan.
+		if str(descriptor.get("item_key", "")) == "":
+			descriptor["item_key"] = str(cached_descriptor.get("item_key", ""))
+		if str(descriptor.get("item_kind", "")) == "":
+			descriptor["item_kind"] = str(cached_descriptor.get("item_kind", ""))
+		if int(descriptor.get("item_index", -1)) < 0:
+			descriptor["item_index"] = int(cached_descriptor.get("item_index", -1))
+		if str(descriptor.get("item_log", "")) == "":
+			descriptor["item_log"] = str(cached_descriptor.get("item_log", ""))
+		var live_identity = descriptor.get("item_identity", {})
+		if typeof(live_identity) != TYPE_DICTIONARY or live_identity.empty():
+			var cached_identity = cached_descriptor.get("item_identity", {})
+			if typeof(cached_identity) == TYPE_DICTIONARY and not cached_identity.empty():
+				descriptor["item_identity"] = cached_identity.duplicate(true)
+	if descriptor.empty() or not _shop_inventory_custom_button_descriptor_has_item_locator(descriptor):
 		return
 	_shop_inventory_custom_button_descriptor_cache[_get_shop_inventory_custom_button_cache_key(popup_instance_id, button)] = descriptor
-	var dedup_key = str(player_index) + ":" + str(descriptor.get("button_path", "")) + ":" + str(descriptor.get("button_name", "")) + ":" + str(descriptor.get("item_kind", "")) + ":" + str(descriptor.get("item_index", -1)) + ":" + str(descriptor.get("item_key", ""))
+	var dedup_identity = descriptor.get("item_identity", {})
+	if typeof(dedup_identity) != TYPE_DICTIONARY:
+		dedup_identity = {}
+	var dedup_key = str(player_index) + ":" + str(descriptor.get("button_path", "")) + ":" + str(descriptor.get("button_name", "")) + ":" + str(descriptor.get("item_kind", "")) + ":" + str(descriptor.get("item_index", -1)) + ":" + _shop_item_stable_identity_key(dedup_identity) + ":" + str(descriptor.get("item_key", ""))
 	var now = OS.get_ticks_msec()
 	# button_down and pressed both fire for normal mouse/controller activation.
 	# Keep one outgoing packet per real click, but allow a later separate click.
-	if now - int(_shop_inventory_custom_button_recent_press_keys.get(dedup_key, 0)) < 900:
+	var last_press_msec = int(_shop_inventory_custom_button_recent_press_keys.get(dedup_key, 0))
+	if now - last_press_msec < 900:
 		return
 	_shop_inventory_custom_button_recent_press_keys[dedup_key] = now
 	_trim_shop_inventory_custom_button_recent_press_keys(now)
-	_queue_local_run_page_action({
+	var outbound = {
 		"msg_type": "run_page_action_sync",
 		"action_type": SHOP_CUSTOM_POPUP_BUTTON_ACTION,
 		"screen": "shop",
@@ -3587,11 +3635,13 @@ func _queue_shop_inventory_custom_button_signal(player_index: int, popup_instanc
 		"button_text": str(descriptor.get("button_text", "")),
 		"button_script_path": str(descriptor.get("button_script_path", "")),
 		"item_key": str(descriptor.get("item_key", "")),
+		"item_identity": dedup_identity.duplicate(true),
 		"item_kind": str(descriptor.get("item_kind", "")),
 		"item_index": int(descriptor.get("item_index", -1)),
 		"item_log": str(descriptor.get("item_log", "")),
 		"signal": signal_name
-	})
+	}
+	_queue_local_run_page_action(outbound)
 
 
 func _get_shop_inventory_custom_button_cache_key(popup_instance_id: int, button: Node) -> String:
@@ -3608,19 +3658,35 @@ func _get_cached_shop_inventory_custom_button_descriptor(popup_instance_id: int,
 	return {}
 
 
+func _shop_inventory_custom_button_descriptor_has_item_locator(descriptor: Dictionary) -> bool:
+	if typeof(descriptor) != TYPE_DICTIONARY or descriptor.empty():
+		return false
+	var item_identity = descriptor.get("item_identity", {})
+	if typeof(item_identity) == TYPE_DICTIONARY and not item_identity.empty():
+		return true
+	if str(descriptor.get("item_key", "")) != "":
+		return true
+	var kind = str(descriptor.get("item_kind", ""))
+	return (kind == "item" or kind == "weapon") and int(descriptor.get("item_index", -1)) >= 0
+
+
 func _build_shop_inventory_custom_button_descriptor(item_popup: Node, button: Node, player_index: int) -> Dictionary:
 	if not _is_shop_inventory_custom_popup_button(item_popup, button):
 		return {}
 	var locator = _get_shop_inventory_popup_item_locator(item_popup, player_index)
+	var item_data = _safe_get(item_popup, "_item_data", null)
 	return {
 		"button_path": str(item_popup.get_path_to(button)),
 		"button_name": str(button.name),
 		"button_text": str(_safe_get(button, "text", "")),
 		"button_script_path": _get_script_path(button),
+		# item_key is retained for backward compatibility and diagnostics. New peers
+		# match item_identity first, which is independent of resource_path presence.
 		"item_key": _get_shop_inventory_popup_item_key(item_popup),
+		"item_identity": _build_shop_item_stable_identity(item_data),
 		"item_kind": str(locator.get("kind", "")),
 		"item_index": int(locator.get("index", -1)),
-		"item_log": _get_item_id_for_log(_safe_get(item_popup, "_item_data", null))
+		"item_log": _get_item_id_for_log(item_data)
 	}
 
 
@@ -3652,8 +3718,7 @@ func _apply_shop_inventory_custom_popup_button_action(player_index: int, message
 	if not _prepare_shop_inventory_custom_popup_for_message(shop, player_index, item_popup, message):
 		return false
 
-	var expected_item_key = str(message.get("item_key", ""))
-	if expected_item_key != "" and _get_shop_inventory_popup_item_key(item_popup) != expected_item_key:
+	if not _shop_item_matches_custom_popup_message(_safe_get(item_popup, "_item_data", null), message):
 		return false
 
 	# Some mods add their Button in response to the popup being shown, sometimes deferred.
@@ -3680,8 +3745,8 @@ func _apply_shop_inventory_custom_popup_button_action(player_index: int, message
 func _prepare_shop_inventory_custom_popup_for_message(shop: Node, player_index: int, item_popup: Node, message: Dictionary) -> bool:
 	if not _is_valid_shop_node(shop) or not _is_live_ref(item_popup):
 		return false
-	var expected_item_key = str(message.get("item_key", ""))
-	if item_popup.visible and (expected_item_key == "" or _get_shop_inventory_popup_item_key(item_popup) == expected_item_key):
+	var current_matches = _shop_item_matches_custom_popup_message(_safe_get(item_popup, "_item_data", null), message)
+	if item_popup.visible and current_matches:
 		return true
 	var element = _find_shop_inventory_element_for_custom_popup_action(shop, player_index, message)
 	if not _is_live_ref(element):
@@ -3694,34 +3759,41 @@ func _prepare_shop_inventory_custom_popup_for_message(shop: Node, player_index: 
 			return false
 		if item_popup.has_method("display_item_data"):
 			item_popup.display_item_data(item_data, element, true)
+		else:
+			return false
 	if item_popup.has_method("focus"):
 		item_popup.focus()
 	var player_container = shop._get_coop_player_container(player_index) if shop.has_method("_get_coop_player_container") else null
 	if _is_live_ref(player_container) and player_container.has_method("on_show_focused_inventory_popup"):
 		player_container.on_show_focused_inventory_popup()
-	return expected_item_key == "" or _get_shop_inventory_popup_item_key(item_popup) == expected_item_key
+	var ok = _shop_item_matches_custom_popup_message(_safe_get(item_popup, "_item_data", null), message)
+	return ok
 
 
 func _find_shop_inventory_element_for_custom_popup_action(shop: Node, player_index: int, message: Dictionary):
 	if not _is_valid_shop_node(shop) or player_index < 0:
 		return null
-	var expected_item_key = str(message.get("item_key", ""))
 	var kind = str(message.get("item_kind", ""))
 	var index = int(message.get("item_index", -1))
+	# Preserve the positional fast path. The scan only runs when the indexed slot
+	# disappeared or now contains a different stable item identity.
 	if index >= 0 and (kind == "weapon" or kind == "item"):
 		var by_index = _get_shop_inventory_elements_for_custom_popup(shop, player_index, kind == "weapon")
 		if index < by_index.size():
 			var element = by_index[index]
-			var item_data = _safe_get(element, "item", null)
-			if expected_item_key == "" or _get_shop_item_identity_key(item_data) == expected_item_key:
+			if _shop_item_matches_custom_popup_message(_safe_get(element, "item", null), message):
 				return element
-	for is_weapon in [true, false]:
+	var search_kinds = [true, false]
+	if kind == "weapon":
+		search_kinds = [true]
+	elif kind == "item":
+		search_kinds = [false]
+	for is_weapon in search_kinds:
 		var elements = _get_shop_inventory_elements_for_custom_popup(shop, player_index, is_weapon)
 		for element in elements:
 			if not _is_live_ref(element):
 				continue
-			var item_data = _safe_get(element, "item", null)
-			if expected_item_key != "" and _get_shop_item_identity_key(item_data) == expected_item_key:
+			if _shop_item_matches_custom_popup_message(_safe_get(element, "item", null), message):
 				return element
 	return null
 
@@ -4967,6 +5039,107 @@ func _get_wave_value_from_shop_pair(pair, fallback: int) -> int:
 	return fallback
 
 
+func _build_shop_item_stable_identity(item_data) -> Dictionary:
+	if item_data == null:
+		return {}
+	var data_type = "weapon" if item_data is WeaponData else "item"
+	var identity = {
+		"type": data_type,
+		"my_id_hash": int(_safe_get(item_data, "my_id_hash", 0)),
+		"my_id": str(_safe_get(item_data, "my_id", "")),
+		"item_log": _get_item_id_for_log(item_data),
+		"is_cursed": bool(_safe_get(item_data, "is_cursed", false)),
+		"curse_factor": float(_safe_get(item_data, "curse_factor", 0.0))
+	}
+	if item_data is WeaponData:
+		identity["weapon_id_hash"] = int(_safe_get(item_data, "weapon_id_hash", 0))
+		identity["weapon_id"] = str(_safe_get(item_data, "weapon_id", ""))
+	return identity
+
+
+func _shop_item_stable_identity_key(identity) -> String:
+	if typeof(identity) != TYPE_DICTIONARY or identity.empty():
+		return ""
+	return str(identity.get("type", "")) + "|" + str(identity.get("my_id_hash", 0)) + "|" + str(identity.get("my_id", "")) + "|" + str(identity.get("weapon_id_hash", 0)) + "|" + str(identity.get("weapon_id", "")) + "|" + str(identity.get("item_log", "")) + "|" + str(identity.get("is_cursed", false)) + "|" + str(identity.get("curse_factor", 0.0))
+
+
+func _shop_item_matches_stable_identity(item_data, identity) -> bool:
+	if item_data == null or typeof(identity) != TYPE_DICTIONARY or identity.empty():
+		return false
+
+	var has_primary_identity = false
+	var wanted_hash = int(identity.get("my_id_hash", 0))
+	if wanted_hash != 0:
+		has_primary_identity = true
+		if int(_safe_get(item_data, "my_id_hash", 0)) != wanted_hash:
+			return false
+	else:
+		var wanted_id = str(identity.get("my_id", ""))
+		if wanted_id != "":
+			has_primary_identity = true
+			if str(_safe_get(item_data, "my_id", "")) != wanted_id:
+				return false
+		else:
+			var wanted_weapon_hash = int(identity.get("weapon_id_hash", 0))
+			if wanted_weapon_hash != 0:
+				has_primary_identity = true
+				if int(_safe_get(item_data, "weapon_id_hash", 0)) != wanted_weapon_hash:
+					return false
+			else:
+				var wanted_weapon_id = str(identity.get("weapon_id", ""))
+				if wanted_weapon_id != "":
+					has_primary_identity = true
+					if str(_safe_get(item_data, "weapon_id", "")) != wanted_weapon_id:
+						return false
+				else:
+					var wanted_log = str(identity.get("item_log", ""))
+					if wanted_log != "":
+						has_primary_identity = true
+						if _get_item_id_for_log(item_data) != wanted_log:
+							return false
+
+	if not has_primary_identity:
+		return false
+	if identity.has("type"):
+		var expected_type = str(identity.get("type", ""))
+		if expected_type == "weapon" and not (item_data is WeaponData):
+			return false
+		if expected_type == "item" and item_data is WeaponData:
+			return false
+	if identity.has("is_cursed"):
+		var expected_cursed = bool(identity.get("is_cursed", false))
+		if bool(_safe_get(item_data, "is_cursed", false)) != expected_cursed:
+			return false
+		if expected_cursed and identity.has("curse_factor"):
+			if abs(float(_safe_get(item_data, "curse_factor", 0.0)) - float(identity.get("curse_factor", 0.0))) > 0.0001:
+				return false
+	return true
+
+
+func _shop_item_matches_custom_popup_message(item_data, message: Dictionary) -> bool:
+	if item_data == null:
+		return false
+	var identity = message.get("item_identity", {})
+	if typeof(identity) == TYPE_DICTIONARY and not identity.empty():
+		return _shop_item_matches_stable_identity(item_data, identity)
+
+	# Compatibility with packets created before stable item identities were added.
+	# Either legacy locator may match; resource_path-vs-runtime-copy differences no
+	# longer force a false negative when item_log identifies the same item type.
+	var has_legacy_identity = false
+	var expected_item_key = str(message.get("item_key", ""))
+	if expected_item_key != "":
+		has_legacy_identity = true
+		if _get_shop_item_identity_key(item_data) == expected_item_key:
+			return true
+	var expected_item_log = str(message.get("item_log", ""))
+	if expected_item_log != "":
+		has_legacy_identity = true
+		if _get_item_id_for_log(item_data) == expected_item_log:
+			return true
+	return not has_legacy_identity
+
+
 func _get_shop_item_identity_key(item_data) -> String:
 	if item_data == null:
 		return ""
@@ -5304,6 +5477,66 @@ func _get_current_shop_focus_target(shop: Node, player_index: int) -> String:
 	return ""
 
 
+func _get_shop_focus_target_stable_identity(shop: Node, player_index: int, target: String) -> Dictionary:
+	var is_weapon = target.begins_with("weapon_")
+	if not is_weapon and not target.begins_with("inventory_item_"):
+		return {}
+	# The target was just derived from FocusEmulator. Walk from the focused control
+	# to its InventoryElement parent instead of enumerating the inventory a second
+	# time merely to serialize the focused item's identity.
+	var focus_emulator = Utils.get_focus_emulator(player_index)
+	var focused_control = _safe_get(focus_emulator, "focused_control", null) if _is_live_ref(focus_emulator) else null
+	var elements_node = _get_shop_inventory_elements_node(shop, player_index, is_weapon)
+	var current = focused_control
+	while _is_live_ref(current) and _is_live_ref(elements_node) and current != elements_node:
+		if current.get_parent() == elements_node:
+			return _build_shop_item_stable_identity(_safe_get(current, "item", null))
+		current = current.get_parent()
+
+	# Rare fallback for vanilla state-derived targets where FocusEmulator is absent.
+	var element = _get_inventory_element_for_shop_target(shop, player_index, target)
+	if not _is_live_ref(element):
+		return {}
+	return _build_shop_item_stable_identity(_safe_get(element, "item", null))
+
+
+func _resolve_shop_focus_target_by_stable_identity(shop: Node, player_index: int, target: String, identity) -> String:
+	if typeof(identity) != TYPE_DICTIONARY or identity.empty():
+		return target
+	var is_weapon = false
+	var prefix = ""
+	var index = -1
+	if target.begins_with("weapon_"):
+		is_weapon = true
+		prefix = "weapon_"
+		var raw_weapon = target.substr(prefix.length(), target.length())
+		if raw_weapon.is_valid_integer():
+			index = int(raw_weapon)
+	elif target.begins_with("inventory_item_"):
+		is_weapon = false
+		prefix = "inventory_item_"
+		var raw_item = target.substr(prefix.length(), target.length())
+		if raw_item.is_valid_integer():
+			index = int(raw_item)
+	else:
+		return target
+
+	# Common case: inspect only the requested visible index. The full inventory array
+	# is not built unless this slot contains a different item identity.
+	var indexed_element = _get_shop_inventory_element_at_visible_index(shop, player_index, is_weapon, index)
+	if _is_live_ref(indexed_element) and _shop_item_matches_stable_identity(_safe_get(indexed_element, "item", null), identity):
+		return target
+
+	# Reordering after gift/combine can move the item. Scan only on mismatch and only
+	# within the corresponding weapons/items container.
+	var elements = _get_shop_inventory_elements(shop, player_index, is_weapon)
+	for i in range(elements.size()):
+		var element = elements[i]
+		if _is_live_ref(element) and _shop_item_matches_stable_identity(_safe_get(element, "item", null), identity):
+			return prefix + str(i)
+	return ""
+
+
 func _get_control_for_shop_target(shop: Node, player_index: int, target: String):
 	if target == "reroll":
 		return shop._get_reroll_button(player_index) if shop.has_method("_get_reroll_button") else null
@@ -5362,26 +5595,46 @@ func _get_inventory_element_for_shop_target(shop: Node, player_index: int, targe
 		return null
 	if index < 0:
 		return null
-	var elements = _get_shop_inventory_elements(shop, player_index, is_weapon)
-	if index >= 0 and index < elements.size():
-		return elements[index]
+	return _get_shop_inventory_element_at_visible_index(shop, player_index, is_weapon, index)
+
+
+func _get_shop_inventory_elements_node(shop: Node, player_index: int, is_weapon: bool):
+	if not _is_valid_shop_node(shop) or not shop.has_method("_get_gear_container"):
+		return null
+	var gear = shop._get_gear_container(player_index)
+	if not _is_live_ref(gear):
+		return null
+	var inv_container = _safe_get(gear, "weapons_container", null) if is_weapon else _safe_get(gear, "items_container", null)
+	if not _is_live_ref(inv_container):
+		return null
+	var elements_node = _safe_get(inv_container, "_elements", null)
+	return elements_node if _is_live_ref(elements_node) else null
+
+
+func _get_shop_inventory_element_at_visible_index(shop: Node, player_index: int, is_weapon: bool, wanted_index: int):
+	if wanted_index < 0:
+		return null
+	var elements_node = _get_shop_inventory_elements_node(shop, player_index, is_weapon)
+	if not _is_live_ref(elements_node):
+		return null
+	var visible_index = 0
+	for child_index in range(elements_node.get_child_count()):
+		var child = elements_node.get_child(child_index)
+		if not _is_live_ref(child) or not (child is Control) or not child.is_visible_in_tree():
+			continue
+		if visible_index == wanted_index:
+			return child
+		visible_index += 1
 	return null
 
 
 func _get_shop_inventory_elements(shop: Node, player_index: int, is_weapon: bool) -> Array:
 	var result = []
-	if not _is_valid_shop_node(shop) or not shop.has_method("_get_gear_container"):
-		return result
-	var gear = shop._get_gear_container(player_index)
-	if not _is_live_ref(gear):
-		return result
-	var inv_container = _safe_get(gear, "weapons_container", null) if is_weapon else _safe_get(gear, "items_container", null)
-	if not _is_live_ref(inv_container):
-		return result
-	var elements_node = _safe_get(inv_container, "_elements", null)
+	var elements_node = _get_shop_inventory_elements_node(shop, player_index, is_weapon)
 	if not _is_live_ref(elements_node):
 		return result
-	for child in elements_node.get_children():
+	for child_index in range(elements_node.get_child_count()):
+		var child = elements_node.get_child(child_index)
 		if _is_live_ref(child) and child is Control and child.is_visible_in_tree():
 			result.append(child)
 	return result

@@ -7,6 +7,8 @@ extends Node
 
 const PHASE = "B12_delayed_death_sync"
 const BULL_CHARACTER_ID = "character_bull"
+const LOOTER_ENEMY_ID = "looter"
+const LOOTER_SCENE_PATH = "res://entities/units/enemies/looter/looter.tscn"
 const LOCAL_SUPPRESS_INTERVAL_MSEC = 700
 const PLAYER_STATE_SEND_INTERVAL_MSEC = 80
 const BOSS_DAMAGE_SEND_INTERVAL_MSEC = 120
@@ -35,6 +37,7 @@ const ENABLE_DEATH_REPORTS = false
 # then recreate it from the next Host snapshot as the generic boss fallback.
 const ENABLE_CLIENT_BOSS_ONE_SHOT_REPORTS = true
 const ENABLE_CLIENT_BOSS_ELITE_DEATH_REPORTS = true
+const ENABLE_CLIENT_LOOTER_DEATH_REPORTS = true
 const ENABLE_DEATH_SYNC = false
 const ENABLE_PLAYER_DEATH_REPORTS = true
 const ENABLE_PLAYER_DEATH_SYNC = true
@@ -1096,7 +1099,7 @@ func _get_or_create_host_entity(net_id: String, state: Dictionary) -> Node:
 	_host_entity_scene_path[net_id] = scene_path
 
 	if _is_local_combat_category(category) and not _has_meta_true(node, "brotato_online_display_only_fallback"):
-		_configure_local_combat_entity(node, net_id, category)
+		_configure_local_combat_entity(node, net_id, category, state)
 		_repair_zero_projectile_speed_for_node(node, category, "spawn:" + net_id)
 	else:
 		_configure_display_only_entity(node)
@@ -1321,11 +1324,11 @@ func _repair_zero_projectile_speed_for_node(node: Node, category: String, reason
 		node.set_meta("brotato_online_repaired_zero_projectile_speed", true)
 
 
-func _configure_local_combat_entity(node: Node, net_id: String, category: String) -> void:
+func _configure_local_combat_entity(node: Node, net_id: String, category: String, state: Dictionary = {}) -> void:
 	if not _is_valid_node(node):
 		return
 	_ensure_combat_behavior_parent_links(node)
-	var host_motion = _get_entity_sync_mode(category, {}) == SYNC_MODE_HOST_MOTION
+	var host_motion = _get_entity_sync_mode(category, state) == SYNC_MODE_HOST_MOTION
 	# Enemy/tree/boss drops are local-only visuals on clients. Structures/pets must not spawn
 	# loot just because they now run local logic. Boss covers elites and bosses in Brotato.
 	node.set("can_drop_loot", category == "enemy" or category == "neutral" or category == "boss")
@@ -1863,13 +1866,23 @@ func _allows_client_boss_elite_death_report(category: String) -> bool:
 	return ENABLE_CLIENT_BOSS_ELITE_DEATH_REPORTS and (category == "boss" or category == "elite")
 
 
+func _allows_client_looter_death_report(category: String, entity: Node = null, net_id: String = "") -> bool:
+	if not ENABLE_CLIENT_LOOTER_DEATH_REPORTS or category != "enemy":
+		return false
+	return _is_looter_entity(entity) or _is_looter_net_id(net_id)
+
+
+func _allows_client_entity_death_report(category: String, entity: Node = null, net_id: String = "") -> bool:
+	return _allows_client_boss_elite_death_report(category) or _allows_client_looter_death_report(category, entity, net_id)
+
+
 func _on_host_local_entity_died(entity, _die_args, net_id: String, category: String) -> void:
 	if _is_game_host():
 		return
 	if net_id == "":
 		return
 	if not ENABLE_DEATH_REPORTS:
-		if _allows_client_boss_elite_death_report(category):
+		if _allows_client_entity_death_report(category, entity, net_id):
 			# Bosses/elites are Host-motion controlled. If a client-side kill removes the
 			# local proxy first, do not let the next compact Host snapshot recreate this
 			# net_id as the generic baby/boss fallback while the reliable claim is in flight.
@@ -1906,7 +1919,7 @@ func _on_host_local_entity_died(entity, _die_args, net_id: String, category: Str
 
 
 func _send_entity_kill_claim(net_id: String, category: String, entity: Node = null) -> void:
-	if not ENABLE_DEATH_REPORTS and not _allows_client_boss_elite_death_report(category):
+	if not ENABLE_DEATH_REPORTS and not _allows_client_entity_death_report(category, entity, net_id):
 		return
 	if net_id == "" or _sent_kill_claim_ids.has(net_id):
 		return
@@ -3736,6 +3749,21 @@ func _is_boss_elite_category(category: String) -> bool:
 	return category == "boss" or category == "elite"
 
 
+func _is_looter_entity(entity) -> bool:
+	if not _is_valid_node(entity):
+		return false
+	var enemy_id = entity.get("enemy_id")
+	return enemy_id != null and str(enemy_id).to_lower() == LOOTER_ENEMY_ID
+
+
+func _is_looter_net_id(net_id: String) -> bool:
+	if net_id == "":
+		return false
+	if str(_host_entity_scene_path.get(net_id, "")) == LOOTER_SCENE_PATH:
+		return true
+	return _is_looter_entity(_host_entities.get(net_id, null))
+
+
 func _host_state_marks_boss_elite_dead(state: Dictionary) -> bool:
 	if typeof(state) != TYPE_DICTIONARY:
 		return false
@@ -3750,7 +3778,7 @@ func _should_apply_host_removed_entity(net_id: String) -> bool:
 		return true
 	if not ENABLE_BOSS_ELITE_REMOVED_SYNC:
 		return false
-	return _is_boss_elite_category(str(_host_entity_category.get(net_id, "")))
+	return _is_boss_elite_category(str(_host_entity_category.get(net_id, ""))) or _is_looter_net_id(net_id)
 
 
 func _get_entity_sync_mode(category: String, state: Dictionary) -> String:
@@ -3758,8 +3786,10 @@ func _get_entity_sync_mode(category: String, state: Dictionary) -> String:
 	if explicit_mode == SYNC_MODE_BIRTH_ONLY or explicit_mode == SYNC_MODE_HOST_MOTION:
 		return explicit_mode
 	# Regular enemies, neutral trees and structures are birth-only. Boss covers
-	# elites/bosses in Brotato; pets still use Host motion.
+	# elites/bosses in Brotato; pets and the random-moving Looter use Host motion.
 	if category == "boss" or category == "pet":
+		return SYNC_MODE_HOST_MOTION
+	if category == "enemy" and str(state.get("scene_path", "")) == LOOTER_SCENE_PATH:
 		return SYNC_MODE_HOST_MOTION
 	return SYNC_MODE_BIRTH_ONLY
 

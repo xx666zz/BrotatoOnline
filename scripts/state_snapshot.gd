@@ -2,6 +2,8 @@ extends Node
 
 const REMOTE_DEAD_DISPLAY_HP = -999
 const BULL_CHARACTER_ID = "character_bull"
+const LOOTER_ENEMY_ID = "looter"
+const LOOTER_SCENE_PATH = "res://entities/units/enemies/looter/looter.tscn"
 
 # Host-side snapshot collector for battle sync.
 # Birth-only entities are announced once through reliable battle events; host-motion
@@ -32,6 +34,7 @@ const ENABLE_DEATH_REPORT_APPLY = false
 # In Brotato, elites and bosses both arrive as category == "boss".
 const ENABLE_BOSS_ELITE_DEATH_REPORT_APPLY = true
 const ENABLE_BOSS_ONE_SHOT_REPORT_APPLY = true
+const ENABLE_LOOTER_DEATH_REPORT_APPLY = true
 const ENABLE_DEATH_EVENT_BROADCAST = false
 const ENABLE_REMOTE_PLAYER_DEATH_SYNC = true
 
@@ -59,6 +62,7 @@ var _damage_signal_connected_ids = {}
 var _known_projectile_instance_ids = {}
 var _last_entity_pos_by_net_id = {}
 var _last_entity_category_by_net_id = {}
+var _looter_net_ids = {}
 var _last_entity_cursed_by_net_id = {}
 var _structure_curse_data_signature_by_net_id = {}
 var _host_entity_by_net_id = {}
@@ -190,12 +194,13 @@ func build_snapshot() -> Dictionary:
 		for removed_id_value in purged_removed:
 			var removed_id = str(removed_id_value)
 			var removed_category = str(_last_entity_category_by_net_id.get(removed_id, ""))
-			var should_sync_removed = ENABLE_REMOVED_SYNC or (ENABLE_BOSS_ELITE_REMOVED_SYNC and _is_boss_elite_category(removed_category))
+			var should_sync_removed = ENABLE_REMOVED_SYNC or (ENABLE_BOSS_ELITE_REMOVED_SYNC and _is_boss_elite_category(removed_category)) or _looter_net_ids.has(removed_id)
 			_birth_only_announced_net_ids.erase(removed_id)
 			_birth_only_first_seen_msec.erase(removed_id)
 			_birth_marker_announced_net_ids.erase(removed_id)
 			_last_entity_pos_by_net_id.erase(removed_id)
 			_last_entity_category_by_net_id.erase(removed_id)
+			_looter_net_ids.erase(removed_id)
 			_structure_curse_data_signature_by_net_id.erase(removed_id)
 			_host_entity_by_net_id.erase(removed_id)
 			_host_entity_by_short_id.erase(str(_net_short_id(removed_id)))
@@ -296,6 +301,8 @@ func _append_dynamic_entity_states(locator: Node, registry: Node, method_name: S
 func _append_dynamic_node_state(node, registry: Node, category: String, entity_type: int, prefix: String, sync_mode: String, now_msec: int, entities_out: Array, active_dynamic_net_ids: Dictionary, emitted_dynamic_net_ids: Dictionary) -> void:
 	if not _is_valid_node(node):
 		return
+	if category == "enemy" and _is_looter_entity(node):
+		sync_mode = SYNC_MODE_HOST_MOTION
 
 	var net_id = _get_or_assign_entity_net_id(node, registry, category, entity_type, prefix)
 	if net_id == "":
@@ -380,6 +387,8 @@ func _touch_dynamic_entity_tracking(entity: Node, net_id: String, category: Stri
 	if update_pos:
 		_last_entity_pos_by_net_id[net_id] = _vec_to_dict(_get_global_pos(entity))
 	_last_entity_category_by_net_id[net_id] = category
+	if category == "enemy" and _is_looter_entity(entity):
+		_looter_net_ids[net_id] = true
 	_host_entity_by_net_id[net_id] = entity
 	_host_entity_by_short_id[str(_net_short_id(net_id))] = entity
 	_ensure_host_damage_event_connection(entity, net_id, category)
@@ -799,7 +808,7 @@ func _build_birth_state(birth: Node, registry: Node, now_msec: int) -> Dictionar
 		"spawn_net_id": spawn_net_id,
 		"entity_net_id": spawn_net_id,
 		"spawn_category": spawn_category,
-		"spawn_sync_mode": _sync_mode_from_category(spawn_category),
+		"spawn_sync_mode": SYNC_MODE_HOST_MOTION if spawn_category == "enemy" and _is_looter_scene_path(scene_path) else _sync_mode_from_category(spawn_category),
 		"spawn_scene_path": scene_path
 	}
 	if typeof(spawn_data_state) == TYPE_DICTIONARY and not spawn_data_state.empty():
@@ -944,6 +953,17 @@ func _prefix_from_category(category: String) -> String:
 	if category == "":
 		return "entity"
 	return category
+
+
+func _is_looter_entity(entity) -> bool:
+	if not _is_valid_node(entity):
+		return false
+	var enemy_id = entity.get("enemy_id")
+	return enemy_id != null and str(enemy_id).to_lower() == LOOTER_ENEMY_ID
+
+
+func _is_looter_scene_path(scene_path: String) -> bool:
+	return scene_path == LOOTER_SCENE_PATH
 
 
 func _sync_mode_from_category(category: String) -> String:
@@ -1359,7 +1379,9 @@ func apply_entity_kill_claim(from_steam_id: String, message: Dictionary) -> void
 	if bool(target.get("dead")):
 		return
 	var category = str(_last_entity_category_by_net_id.get(net_id, message.get("category", "")))
-	if not ENABLE_DEATH_REPORT_APPLY and not (ENABLE_BOSS_ELITE_DEATH_REPORT_APPLY and (category == "boss" or category == "elite")):
+	var allow_boss_elite = ENABLE_BOSS_ELITE_DEATH_REPORT_APPLY and (category == "boss" or category == "elite")
+	var allow_looter = ENABLE_LOOTER_DEATH_REPORT_APPLY and category == "enemy" and _is_looter_entity(target)
+	if not ENABLE_DEATH_REPORT_APPLY and not allow_boss_elite and not allow_looter:
 		return
 	var player_index = int(message.get("player_index", -1))
 	if player_index < 0:
@@ -1621,7 +1643,7 @@ func build_battle_entity_resync_payload(net_ids: Array) -> Dictionary:
 		var state = _build_dynamic_entity_state_from_net_id(entity, net_id, category, entity_type)
 		if state.empty():
 			continue
-		state["sync_mode"] = _sync_mode_from_category(category)
+		state["sync_mode"] = SYNC_MODE_HOST_MOTION if category == "enemy" and _is_looter_entity(entity) else _sync_mode_from_category(category)
 		entities.append(state.duplicate(true))
 	return {
 		"entities": entities,
@@ -2263,6 +2285,7 @@ func _ensure_current_game_scene_registered(reason: String, locator: Node, is_hos
 		_known_projectile_instance_ids.clear()
 		_last_entity_pos_by_net_id.clear()
 		_last_entity_category_by_net_id.clear()
+		_looter_net_ids.clear()
 		_last_entity_cursed_by_net_id.clear()
 		_structure_curse_data_signature_by_net_id.clear()
 		_host_entity_by_net_id.clear()
@@ -2298,6 +2321,7 @@ func _on_left_game_scene() -> void:
 	_known_projectile_instance_ids.clear()
 	_last_entity_pos_by_net_id.clear()
 	_last_entity_category_by_net_id.clear()
+	_looter_net_ids.clear()
 	_last_entity_cursed_by_net_id.clear()
 	_structure_curse_data_signature_by_net_id.clear()
 	_host_entity_by_net_id.clear()

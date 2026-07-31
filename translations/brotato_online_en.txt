@@ -2,10 +2,15 @@ key,text
 MENU_BACK,Back
 BROTATO_ONLINE_MENU_SETTINGS,Online Settings
 BROTATO_ONLINE_SETTINGS_TITLE,Brotato Online Settings
+BROTATO_ONLINE_INPUT_DEVICE,Local online input device
+BROTATO_ONLINE_INPUT_DEVICE_DESC,"Choose the input device used by this machine in online play. The selection is locked after entering a lobby."
+BROTATO_ONLINE_INPUT_DEVICE_AUTO,Auto select
+BROTATO_ONLINE_INPUT_DEVICE_AUTO_FORMAT,Auto select (Current: %s)
+BROTATO_ONLINE_INPUT_DEVICE_KEYBOARD,Keyboard and mouse
+BROTATO_ONLINE_INPUT_DEVICE_UNKNOWN_GAMEPAD,Unknown controller
+BROTATO_ONLINE_INPUT_DEVICE_GAMEPAD_FORMAT,%s (Device %d)
 BROTATO_ONLINE_LOCAL_CHARACTER_OUTLINE,Outline local character
-BROTATO_ONLINE_LOCAL_CHARACTER_OUTLINE_DESC,"In online battles, add a character outline only to the player controlled on this machine. This does not change the vanilla circle under players."
-BROTATO_ONLINE_AUTO_JOIN_HOST_PLAYER,Auto-add host as Player 1
-BROTATO_ONLINE_AUTO_JOIN_HOST_PLAYER_DESC,"Default: on. If you turn this off, the host must first join and lock Player 1 with the intended keyboard/controller on the character selection screen, then other players may join. If Player 2 joins before Player 1 is ready, character slots or focus may desync."
+BROTATO_ONLINE_LOCAL_CHARACTER_OUTLINE_DESC,In online battles, add a character outline only to the player controlled on this machine.
 BROTATO_ONLINE_QUICK_CHAT_CANCEL,Release Ctrl to cancel
 BROTATO_ONLINE_QUICK_CHAT_STAY_ALIVE,Stay alive
 BROTATO_ONLINE_QUICK_CHAT_HURRY,Hurry!

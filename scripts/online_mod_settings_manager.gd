@@ -7,6 +7,16 @@ const DEFAULT_LOCAL_CHARACTER_OUTLINE = false
 const KEY_AUTO_JOIN_HOST_PLAYER = "auto_join_host_player"
 const DEFAULT_AUTO_JOIN_HOST_PLAYER = true
 const META_AUTO_JOIN_HOST_PLAYER = "brotato_online_auto_join_host_player"
+const KEY_LOCAL_INPUT_DEVICE_MODE = "local_input_device_mode"
+const KEY_LOCAL_INPUT_JOYPAD_ID = "local_input_joypad_id"
+const KEY_LOCAL_INPUT_JOYPAD_NAME = "local_input_joypad_name"
+const INPUT_DEVICE_MODE_AUTO = "auto"
+const INPUT_DEVICE_MODE_KEYBOARD = "keyboard"
+const INPUT_DEVICE_MODE_JOYPAD = "joypad"
+const DEFAULT_LOCAL_INPUT_DEVICE_MODE = INPUT_DEVICE_MODE_AUTO
+const META_LOCAL_INPUT_DEVICE_MODE = "brotato_online_local_input_device_mode"
+const META_LOCAL_INPUT_JOYPAD_ID = "brotato_online_local_input_joypad_id"
+const META_LOCAL_INPUT_JOYPAD_NAME = "brotato_online_local_input_joypad_name"
 
 const SETTINGS_BUTTON_NAME = "BrotatoOnlineSettingsButton"
 const SETTINGS_OVERLAY_NAME = "BrotatoOnlineSettingsOverlay"
@@ -15,13 +25,19 @@ const META_LOCAL_OUTLINE_OWNED = "brotato_online_local_outline_owned"
 
 var _local_character_outline_enabled = DEFAULT_LOCAL_CHARACTER_OUTLINE
 var _auto_join_host_player_enabled = DEFAULT_AUTO_JOIN_HOST_PLAYER
+var _local_input_device_mode = DEFAULT_LOCAL_INPUT_DEVICE_MODE
+var _local_input_joypad_id = -1
+var _local_input_joypad_name = ""
 var _last_scan_msec = 0
 var _settings_button = null
 var _settings_overlay = null
 var _local_outline_button = null
 var _local_outline_description_label = null
-var _auto_join_host_button = null
-var _auto_join_host_description_label = null
+var _input_device_label = null
+var _input_device_option_button = null
+var _input_device_description_label = null
+var _input_device_option_values = []
+var _last_input_device_list_key = ""
 var _title_label = null
 var _description_label = null
 var _back_button = null
@@ -32,6 +48,8 @@ var _i18n = null
 func _ready() -> void:
 	_load_settings()
 	_publish_settings_meta()
+	if not Input.is_connected("joy_connection_changed", self, "_on_joy_connection_changed"):
+		var _joy_connection_err = Input.connect("joy_connection_changed", self, "_on_joy_connection_changed")
 	set_process(true)
 	set_process_input(false)
 
@@ -44,9 +62,21 @@ func _process(_delta: float) -> void:
 	_try_inject_title_screen_settings_button()
 	_refresh_settings_button_text_only()
 	if _settings_overlay != null and is_instance_valid(_settings_overlay) and _settings_overlay.visible:
+		_refresh_input_device_options(false)
 		_refresh_localized_texts()
 	if _local_character_outline_enabled or _has_any_local_outline_meta():
 		_apply_outline_to_live_players()
+
+
+func _on_joy_connection_changed(device: int, connected: bool) -> void:
+	if connected:
+		_last_input_device_list_key = ""
+		return
+	if _local_input_device_mode == INPUT_DEVICE_MODE_JOYPAD and device == _local_input_joypad_id:
+		set_local_input_device(INPUT_DEVICE_MODE_AUTO)
+	_last_input_device_list_key = ""
+	if _settings_overlay != null and is_instance_valid(_settings_overlay) and _settings_overlay.visible:
+		_refresh_input_device_options(true)
 
 
 func _input(event) -> void:
@@ -73,16 +103,45 @@ func set_local_character_outline_enabled(enabled: bool) -> void:
 
 
 func get_auto_join_host_player_enabled() -> bool:
-	return _auto_join_host_player_enabled
+	return true
 
 
-func set_auto_join_host_player_enabled(enabled: bool) -> void:
-	if _auto_join_host_player_enabled == enabled:
+func set_auto_join_host_player_enabled(_enabled: bool) -> void:
+	# Player 1 is always created automatically. Keep this method for compatibility
+	# with older callers, but do not allow the behavior to be disabled.
+	if not _auto_join_host_player_enabled:
+		_auto_join_host_player_enabled = true
+		_save_settings()
+		_publish_settings_meta()
+		_notify_slot_manager_settings_changed()
+
+
+func get_local_input_device_mode() -> String:
+	return _local_input_device_mode
+
+
+func get_local_input_joypad_id() -> int:
+	return _local_input_joypad_id
+
+
+func get_local_input_joypad_name() -> String:
+	return _local_input_joypad_name
+
+
+func set_local_input_device(mode: String, joypad_id: int = -1, joypad_name: String = "") -> void:
+	var normalized_mode = mode
+	if normalized_mode != INPUT_DEVICE_MODE_KEYBOARD and normalized_mode != INPUT_DEVICE_MODE_JOYPAD:
+		normalized_mode = INPUT_DEVICE_MODE_AUTO
+	if normalized_mode != INPUT_DEVICE_MODE_JOYPAD:
+		joypad_id = -1
+		joypad_name = ""
+	if _local_input_device_mode == normalized_mode and _local_input_joypad_id == joypad_id and _local_input_joypad_name == joypad_name:
 		return
-	_auto_join_host_player_enabled = enabled
+	_local_input_device_mode = normalized_mode
+	_local_input_joypad_id = joypad_id
+	_local_input_joypad_name = joypad_name
 	_save_settings()
 	_publish_settings_meta()
-	_notify_slot_manager_settings_changed()
 
 
 func is_online_session_active() -> bool:
@@ -130,14 +189,32 @@ func _load_settings() -> void:
 			KEY_LOCAL_CHARACTER_OUTLINE,
 			DEFAULT_LOCAL_CHARACTER_OUTLINE
 		))
-		_auto_join_host_player_enabled = bool(config.get_value(
+		# This option used to be configurable. It is now always enabled so an old
+		# config containing false cannot leave the host without Player 1.
+		_auto_join_host_player_enabled = true
+		_local_input_device_mode = str(config.get_value(
 			SETTINGS_SECTION,
-			KEY_AUTO_JOIN_HOST_PLAYER,
-			DEFAULT_AUTO_JOIN_HOST_PLAYER
+			KEY_LOCAL_INPUT_DEVICE_MODE,
+			DEFAULT_LOCAL_INPUT_DEVICE_MODE
 		))
+		_local_input_joypad_id = int(config.get_value(
+			SETTINGS_SECTION,
+			KEY_LOCAL_INPUT_JOYPAD_ID,
+			-1
+		))
+		_local_input_joypad_name = str(config.get_value(
+			SETTINGS_SECTION,
+			KEY_LOCAL_INPUT_JOYPAD_NAME,
+			""
+		))
+		if _local_input_device_mode != INPUT_DEVICE_MODE_KEYBOARD and _local_input_device_mode != INPUT_DEVICE_MODE_JOYPAD:
+			_local_input_device_mode = INPUT_DEVICE_MODE_AUTO
 	else:
 		_local_character_outline_enabled = DEFAULT_LOCAL_CHARACTER_OUTLINE
 		_auto_join_host_player_enabled = DEFAULT_AUTO_JOIN_HOST_PLAYER
+		_local_input_device_mode = DEFAULT_LOCAL_INPUT_DEVICE_MODE
+		_local_input_joypad_id = -1
+		_local_input_joypad_name = ""
 
 
 func _save_settings() -> void:
@@ -145,6 +222,9 @@ func _save_settings() -> void:
 	var _load_err = config.load(SETTINGS_FILE_PATH)
 	config.set_value(SETTINGS_SECTION, KEY_LOCAL_CHARACTER_OUTLINE, _local_character_outline_enabled)
 	config.set_value(SETTINGS_SECTION, KEY_AUTO_JOIN_HOST_PLAYER, _auto_join_host_player_enabled)
+	config.set_value(SETTINGS_SECTION, KEY_LOCAL_INPUT_DEVICE_MODE, _local_input_device_mode)
+	config.set_value(SETTINGS_SECTION, KEY_LOCAL_INPUT_JOYPAD_ID, _local_input_joypad_id)
+	config.set_value(SETTINGS_SECTION, KEY_LOCAL_INPUT_JOYPAD_NAME, _local_input_joypad_name)
 	var _save_err = config.save(SETTINGS_FILE_PATH)
 
 
@@ -153,7 +233,10 @@ func _publish_settings_meta() -> void:
 	if tree == null or tree.root == null:
 		return
 	tree.root.set_meta("brotato_online_local_character_outline", _local_character_outline_enabled)
-	tree.root.set_meta(META_AUTO_JOIN_HOST_PLAYER, _auto_join_host_player_enabled)
+	tree.root.set_meta(META_AUTO_JOIN_HOST_PLAYER, true)
+	tree.root.set_meta(META_LOCAL_INPUT_DEVICE_MODE, _local_input_device_mode)
+	tree.root.set_meta(META_LOCAL_INPUT_JOYPAD_ID, _local_input_joypad_id)
+	tree.root.set_meta(META_LOCAL_INPUT_JOYPAD_NAME, _local_input_joypad_name)
 
 
 func _notify_slot_manager_settings_changed() -> void:
@@ -178,8 +261,11 @@ func _try_inject_title_screen_settings_button() -> void:
 		_settings_overlay = null
 		_local_outline_button = null
 		_local_outline_description_label = null
-		_auto_join_host_button = null
-		_auto_join_host_description_label = null
+		_input_device_label = null
+		_input_device_option_button = null
+		_input_device_description_label = null
+		_input_device_option_values.clear()
+		_last_input_device_list_key = ""
 		_title_label = null
 		_description_label = null
 		_back_button = null
@@ -271,13 +357,15 @@ func _ensure_settings_overlay(title_screen: Node) -> void:
 		_title_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/TitleLabel")
 		_local_outline_button = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/LocalCharacterOutlineButton")
 		_local_outline_description_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/LocalCharacterOutlineDescriptionLabel")
-		_auto_join_host_button = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/AutoJoinHostPlayerButton")
-		_auto_join_host_description_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/AutoJoinHostPlayerDescriptionLabel")
+		_input_device_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/InputDeviceLabel")
+		_input_device_option_button = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/InputDeviceOptionButton")
+		_input_device_description_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/InputDeviceDescriptionLabel")
 		_description_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/DescriptionLabel")
 		_back_button = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/BackButton")
+		_connect_runtime_mouse_focus(_input_device_option_button)
 		_connect_runtime_mouse_focus(_local_outline_button)
-		_connect_runtime_mouse_focus(_auto_join_host_button)
 		_connect_runtime_mouse_focus(_back_button)
+		_refresh_input_device_options(true)
 		return
 
 	var overlay = Control.new()
@@ -307,20 +395,20 @@ func _ensure_settings_overlay(title_screen: Node) -> void:
 
 	var panel = PanelContainer.new()
 	panel.name = "PanelContainer"
-	panel.rect_min_size = Vector2(900, 540)
+	panel.rect_min_size = Vector2(900, 560)
 	center.add_child(panel)
 
 	var margin = MarginContainer.new()
 	margin.name = "MarginContainer"
-	margin.add_constant_override("margin_left", 40)
-	margin.add_constant_override("margin_right", 40)
-	margin.add_constant_override("margin_top", 35)
-	margin.add_constant_override("margin_bottom", 35)
+	margin.add_constant_override("margin_left", 46)
+	margin.add_constant_override("margin_right", 46)
+	margin.add_constant_override("margin_top", 30)
+	margin.add_constant_override("margin_bottom", 30)
 	panel.add_child(margin)
 
 	var vbox = VBoxContainer.new()
 	vbox.name = "VBoxContainer"
-	vbox.add_constant_override("separation", 16)
+	vbox.add_constant_override("separation", 12)
 	margin.add_child(vbox)
 
 	var title = Label.new()
@@ -333,11 +421,41 @@ func _ensure_settings_overlay(title_screen: Node) -> void:
 	vbox.add_child(title)
 	_title_label = title
 
+	var input_device_label = Label.new()
+	input_device_label.name = "InputDeviceLabel"
+	input_device_label.text = _txt("BROTATO_ONLINE_INPUT_DEVICE")
+	input_device_label.align = Label.ALIGN_LEFT
+	input_device_label.add_color_override("font_color", Color(0.82, 0.82, 0.82, 1.0))
+	var input_label_font = load("res://resources/fonts/actual/base/font_26_outline.tres")
+	if input_label_font != null:
+		input_device_label.add_font_override("font", input_label_font)
+	vbox.add_child(input_device_label)
+	_input_device_label = input_device_label
+
+	var input_device_option = OptionButton.new()
+	input_device_option.name = "InputDeviceOptionButton"
+	input_device_option.rect_min_size = Vector2(0, 68)
+	input_device_option.focus_mode = Control.FOCUS_ALL
+	input_device_option.mouse_filter = Control.MOUSE_FILTER_STOP
+	_configure_input_device_option_button(input_device_option)
+	vbox.add_child(input_device_option)
+	var _input_device_err = input_device_option.connect("item_selected", self, "_on_input_device_item_selected")
+	_input_device_option_button = input_device_option
+	_connect_runtime_mouse_focus(_input_device_option_button)
+
+	var input_device_description = _create_settings_description_label("InputDeviceDescriptionLabel", "BROTATO_ONLINE_INPUT_DEVICE_DESC")
+	vbox.add_child(input_device_description)
+	_input_device_description_label = input_device_description
+	_refresh_input_device_options(true)
+
+	var settings_separator = _create_settings_separator("InputOutlineSeparator")
+	vbox.add_child(settings_separator)
+
 	var check = CheckButton.new()
 	check.name = "LocalCharacterOutlineButton"
 	check.text = _txt("BROTATO_ONLINE_LOCAL_CHARACTER_OUTLINE")
 	check.pressed = _local_character_outline_enabled
-	check.rect_min_size = Vector2(0, 62)
+	check.rect_min_size = Vector2(0, 68)
 	check.focus_mode = Control.FOCUS_ALL
 	check.mouse_filter = Control.MOUSE_FILTER_STOP
 	check.align = 0
@@ -352,51 +470,39 @@ func _ensure_settings_overlay(title_screen: Node) -> void:
 	_local_outline_description_label = local_outline_description
 	_description_label = local_outline_description
 
-	var auto_join_check = CheckButton.new()
-	auto_join_check.name = "AutoJoinHostPlayerButton"
-	auto_join_check.text = _txt("BROTATO_ONLINE_AUTO_JOIN_HOST_PLAYER")
-	auto_join_check.pressed = _auto_join_host_player_enabled
-	auto_join_check.rect_min_size = Vector2(0, 62)
-	auto_join_check.focus_mode = Control.FOCUS_ALL
-	auto_join_check.mouse_filter = Control.MOUSE_FILTER_STOP
-	auto_join_check.align = 0
-	_configure_option_check_button(auto_join_check)
-	vbox.add_child(auto_join_check)
-	var _auto_join_check_err = auto_join_check.connect("toggled", self, "_on_auto_join_host_player_toggled")
-	_auto_join_host_button = auto_join_check
-	_connect_runtime_mouse_focus(_auto_join_host_button)
-
-	var auto_join_description = _create_settings_description_label("AutoJoinHostPlayerDescriptionLabel", "BROTATO_ONLINE_AUTO_JOIN_HOST_PLAYER_DESC")
-	vbox.add_child(auto_join_description)
-	_auto_join_host_description_label = auto_join_description
-
 	var spacer = Control.new()
 	spacer.name = "Spacer"
 	spacer.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	vbox.add_child(spacer)
 
+	var back_separator = _create_settings_separator("BackSeparator")
+	vbox.add_child(back_separator)
+
 	var back_button = Button.new()
 	back_button.name = "BackButton"
 	back_button.text = _txt("MENU_BACK")
 	back_button.rect_min_size = Vector2(0, 65)
-	back_button.align = 0
+	back_button.align = 1
 	back_button.focus_mode = Control.FOCUS_ALL
 	back_button.mouse_filter = Control.MOUSE_FILTER_STOP
+	_configure_settings_action_button(back_button)
 	vbox.add_child(back_button)
 	var _back_err = back_button.connect("pressed", self, "_close_settings_overlay")
 	_back_button = back_button
 	_connect_runtime_mouse_focus(_back_button)
 
-	check.focus_neighbour_top = check.get_path_to(back_button)
-	if _auto_join_host_button != null and is_instance_valid(_auto_join_host_button):
-		check.focus_neighbour_bottom = check.get_path_to(_auto_join_host_button)
-		_auto_join_host_button.focus_neighbour_top = _auto_join_host_button.get_path_to(check)
-		_auto_join_host_button.focus_neighbour_bottom = _auto_join_host_button.get_path_to(back_button)
-		back_button.focus_neighbour_top = back_button.get_path_to(_auto_join_host_button)
+	if _input_device_option_button != null and is_instance_valid(_input_device_option_button):
+		_input_device_option_button.focus_neighbour_top = _input_device_option_button.get_path_to(back_button)
+		_input_device_option_button.focus_neighbour_bottom = _input_device_option_button.get_path_to(check)
+		check.focus_neighbour_top = check.get_path_to(_input_device_option_button)
 	else:
-		check.focus_neighbour_bottom = check.get_path_to(back_button)
-		back_button.focus_neighbour_top = back_button.get_path_to(check)
-	back_button.focus_neighbour_bottom = back_button.get_path_to(check)
+		check.focus_neighbour_top = check.get_path_to(back_button)
+	check.focus_neighbour_bottom = check.get_path_to(back_button)
+	back_button.focus_neighbour_top = back_button.get_path_to(check)
+	if _input_device_option_button != null and is_instance_valid(_input_device_option_button):
+		back_button.focus_neighbour_bottom = back_button.get_path_to(_input_device_option_button)
+	else:
+		back_button.focus_neighbour_bottom = back_button.get_path_to(check)
 
 	_settings_overlay = overlay
 
@@ -407,29 +513,186 @@ func _create_settings_description_label(node_name: String, text_key: String) -> 
 	description.text = _txt(text_key)
 	description.autowrap = true
 	description.align = Label.ALIGN_LEFT
+	description.add_color_override("font_color", Color(0.72, 0.72, 0.72, 1.0))
 	var desc_font = load("res://resources/fonts/actual/base/font_22.tres")
 	if desc_font != null:
 		description.add_font_override("font", desc_font)
 	return description
 
 
-func _configure_option_check_button(check: CheckButton) -> void:
-	var option_font = load("res://resources/fonts/actual/base/font_40_outline.tres")
-	if option_font != null:
-		check.add_font_override("font", option_font)
+func _create_settings_separator(node_name: String) -> ColorRect:
+	var separator = ColorRect.new()
+	separator.name = node_name
+	separator.rect_min_size = Vector2(0, 2)
+	separator.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	separator.color = Color(1, 1, 1, 0.16)
+	separator.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	return separator
+
+
+func _apply_settings_button_styles(button: BaseButton) -> void:
+	# Use a visible dark card instead of the nearly transparent default control.
+	# This keeps labels, descriptions and interactive controls visually separate.
+	var normal_style = StyleBoxFlat.new()
+	normal_style.bg_color = Color(0.16, 0.16, 0.16, 0.96)
+	normal_style.border_width_left = 2
+	normal_style.border_width_top = 2
+	normal_style.border_width_right = 2
+	normal_style.border_width_bottom = 2
+	normal_style.border_color = Color(0.42, 0.42, 0.42, 0.9)
+	normal_style.corner_radius_top_left = 10
+	normal_style.corner_radius_top_right = 10
+	normal_style.corner_radius_bottom_right = 10
+	normal_style.corner_radius_bottom_left = 10
+	normal_style.content_margin_left = 18
+	normal_style.content_margin_right = 18
+	normal_style.content_margin_top = 10
+	normal_style.content_margin_bottom = 10
+	button.add_stylebox_override("normal", normal_style)
+	button.add_stylebox_override("pressed", normal_style)
+
+	button.add_color_override("font_color", Color(1, 1, 1, 1))
+	button.add_color_override("font_color_pressed", Color(1, 1, 1, 1))
+	button.add_color_override("font_color_hover", Color(0, 0, 0, 1))
+	button.add_color_override("font_color_focus", Color(0, 0, 0, 1))
+	button.add_color_override("font_color_hover_pressed", Color(0, 0, 0, 1))
+	button.add_color_override("font_color_disabled", Color(0.78, 0.78, 0.78, 0.95))
 
 	var hover_style = load("res://resources/themes/button_styles/button_hover.tres")
 	if hover_style != null:
-		check.add_stylebox_override("hover", hover_style)
-		check.add_stylebox_override("hover_pressed", hover_style)
-		check.add_stylebox_override("focus", hover_style)
+		button.add_stylebox_override("hover", hover_style)
+		button.add_stylebox_override("hover_pressed", hover_style)
+		button.add_stylebox_override("focus", hover_style)
+
+
+func _configure_option_check_button(check: CheckButton) -> void:
+	var option_font = load("res://resources/fonts/actual/base/font_30_outline.tres")
+	if option_font != null:
+		check.add_font_override("font", option_font)
+	_apply_settings_button_styles(check)
+
+
+func _configure_input_device_option_button(option: OptionButton) -> void:
+	var option_font = load("res://resources/fonts/actual/base/font_30_outline.tres")
+	if option_font != null:
+		option.add_font_override("font", option_font)
+	_apply_settings_button_styles(option)
+
+
+func _configure_settings_action_button(button: Button) -> void:
+	var button_font = load("res://resources/fonts/actual/base/font_30_outline.tres")
+	if button_font != null:
+		button.add_font_override("font", button_font)
+	_apply_settings_button_styles(button)
+
+
+func _refresh_input_device_options(force: bool = false) -> void:
+	if _input_device_option_button == null or not is_instance_valid(_input_device_option_button):
+		return
+
+	_input_device_option_button.disabled = is_online_session_active()
+	if not is_online_session_active():
+		_reset_disconnected_selected_input_device()
+
+	var options = []
+	options.append({
+		"mode": INPUT_DEVICE_MODE_AUTO,
+		"joypad_id": -1,
+		"joypad_name": "",
+		"label": _txt("BROTATO_ONLINE_INPUT_DEVICE_AUTO_FORMAT") % _get_auto_selected_input_device_label()
+	})
+	options.append({"mode": INPUT_DEVICE_MODE_KEYBOARD, "joypad_id": -1, "joypad_name": "", "label": _txt("BROTATO_ONLINE_INPUT_DEVICE_KEYBOARD")})
+
+	var connected_joypads = Input.get_connected_joypads()
+	if typeof(connected_joypads) == TYPE_ARRAY:
+		for joypad_value in connected_joypads:
+			var joypad_id = int(joypad_value)
+			# Brotato reserves remapped device 6 for physical joypad 0 and device 7
+			# for keyboard/mouse, so only physical joypads 0..5 can own distinct slots.
+			if joypad_id < 0 or joypad_id >= CoopService.GAMEPAD_REMAPPED_DEVICE_ID:
+				continue
+			var joypad_name = _get_joypad_display_name(joypad_id)
+			options.append({
+				"mode": INPUT_DEVICE_MODE_JOYPAD,
+				"joypad_id": joypad_id,
+				"joypad_name": joypad_name,
+				"label": _txt("BROTATO_ONLINE_INPUT_DEVICE_GAMEPAD_FORMAT") % [joypad_name, joypad_id]
+			})
+
+	var parts = []
+	for option_data in options:
+		parts.append(str(option_data.get("mode", "")) + ":" + str(option_data.get("joypad_id", -1)) + ":" + str(option_data.get("joypad_name", "")) + ":" + str(option_data.get("label", "")))
+	var list_key = "|".join(parts)
+	if not force and list_key == _last_input_device_list_key:
+		return
+	_last_input_device_list_key = list_key
+	_input_device_option_values = options
+	_input_device_option_button.clear()
+	var selected_index = 0
+	for i in range(options.size()):
+		var option_data = options[i]
+		_input_device_option_button.add_item(str(option_data.get("label", "")))
+		if _input_device_option_matches_setting(option_data):
+			selected_index = i
+	_input_device_option_button.select(selected_index)
+
+
+func _get_joypad_display_name(joypad_id: int) -> String:
+	var joypad_name = Input.get_joy_name(joypad_id)
+	if joypad_name == "":
+		joypad_name = _txt("BROTATO_ONLINE_INPUT_DEVICE_UNKNOWN_GAMEPAD")
+	return joypad_name
+
+
+func _get_auto_selected_input_device_label() -> String:
+	var connected_joypads = Input.get_connected_joypads()
+	if typeof(connected_joypads) == TYPE_ARRAY:
+		for joypad_value in connected_joypads:
+			var joypad_id = int(joypad_value)
+			if joypad_id < 0 or joypad_id >= CoopService.GAMEPAD_REMAPPED_DEVICE_ID:
+				continue
+			return _txt("BROTATO_ONLINE_INPUT_DEVICE_GAMEPAD_FORMAT") % [_get_joypad_display_name(joypad_id), joypad_id]
+	return _txt("BROTATO_ONLINE_INPUT_DEVICE_KEYBOARD")
+
+
+func _is_selected_joypad_connected() -> bool:
+	if _local_input_device_mode != INPUT_DEVICE_MODE_JOYPAD:
+		return true
+	var connected_joypads = Input.get_connected_joypads()
+	if typeof(connected_joypads) != TYPE_ARRAY or not connected_joypads.has(_local_input_joypad_id):
+		return false
+	if _local_input_joypad_name == "":
+		return true
+	return Input.get_joy_name(_local_input_joypad_id) == _local_input_joypad_name
+
+
+func _reset_disconnected_selected_input_device() -> void:
+	if _local_input_device_mode != INPUT_DEVICE_MODE_JOYPAD:
+		return
+	if _is_selected_joypad_connected():
+		return
+	set_local_input_device(INPUT_DEVICE_MODE_AUTO)
+	_last_input_device_list_key = ""
+
+
+func _input_device_option_matches_setting(option_data: Dictionary) -> bool:
+	var mode = str(option_data.get("mode", INPUT_DEVICE_MODE_AUTO))
+	if mode != _local_input_device_mode:
+		return false
+	if mode != INPUT_DEVICE_MODE_JOYPAD:
+		return true
+	var option_id = int(option_data.get("joypad_id", -1))
+	var option_name = str(option_data.get("joypad_name", ""))
+	return option_id == _local_input_joypad_id and (_local_input_joypad_name == "" or option_name == _local_input_joypad_name)
 
 
 func _connect_runtime_mouse_focus(control) -> void:
 	if control == null or not is_instance_valid(control):
 		return
 	if control.has_signal("mouse_entered") and not control.is_connected("mouse_entered", self, "_on_runtime_focusable_mouse_entered"):
-		var _mouse_err = control.connect("mouse_entered", self, "_on_runtime_focusable_mouse_entered", [control])
+		var _mouse_enter_err = control.connect("mouse_entered", self, "_on_runtime_focusable_mouse_entered", [control])
+	if control.has_signal("mouse_exited") and not control.is_connected("mouse_exited", self, "_on_runtime_focusable_mouse_exited"):
+		var _mouse_exit_err = control.connect("mouse_exited", self, "_on_runtime_focusable_mouse_exited", [control])
 
 
 func _on_runtime_focusable_mouse_entered(control) -> void:
@@ -443,6 +706,18 @@ func _on_runtime_focusable_mouse_entered(control) -> void:
 		control.grab_focus()
 
 
+func _on_runtime_focusable_mouse_exited(control) -> void:
+	if control == null or not is_instance_valid(control):
+		return
+	if not (control is Control):
+		return
+	var viewport = get_viewport()
+	if viewport != null and viewport.has_method("gui_get_focus_owner"):
+		var focus_owner = viewport.call("gui_get_focus_owner")
+		if focus_owner == control:
+			control.release_focus()
+
+
 func _refresh_localized_texts() -> void:
 	if _settings_button != null and is_instance_valid(_settings_button):
 		_settings_button.text = _txt("BROTATO_ONLINE_MENU_SETTINGS")
@@ -454,10 +729,10 @@ func _refresh_localized_texts() -> void:
 		_local_outline_description_label.text = _txt("BROTATO_ONLINE_LOCAL_CHARACTER_OUTLINE_DESC")
 	elif _description_label != null and is_instance_valid(_description_label):
 		_description_label.text = _txt("BROTATO_ONLINE_LOCAL_CHARACTER_OUTLINE_DESC")
-	if _auto_join_host_button != null and is_instance_valid(_auto_join_host_button):
-		_auto_join_host_button.text = _txt("BROTATO_ONLINE_AUTO_JOIN_HOST_PLAYER")
-	if _auto_join_host_description_label != null and is_instance_valid(_auto_join_host_description_label):
-		_auto_join_host_description_label.text = _txt("BROTATO_ONLINE_AUTO_JOIN_HOST_PLAYER_DESC")
+	if _input_device_label != null and is_instance_valid(_input_device_label):
+		_input_device_label.text = _txt("BROTATO_ONLINE_INPUT_DEVICE")
+	if _input_device_description_label != null and is_instance_valid(_input_device_description_label):
+		_input_device_description_label.text = _txt("BROTATO_ONLINE_INPUT_DEVICE_DESC")
 	if _back_button != null and is_instance_valid(_back_button):
 		_back_button.text = _txt("MENU_BACK")
 
@@ -483,10 +758,9 @@ func _open_settings_overlay() -> void:
 	else:
 		_last_focus_owner = _settings_button
 
+	_refresh_input_device_options(true)
 	if _local_outline_button != null and is_instance_valid(_local_outline_button):
 		_local_outline_button.set_pressed_no_signal(_local_character_outline_enabled)
-	if _auto_join_host_button != null and is_instance_valid(_auto_join_host_button):
-		_auto_join_host_button.set_pressed_no_signal(_auto_join_host_player_enabled)
 
 	_refresh_localized_texts()
 	_settings_overlay.show()
@@ -499,7 +773,9 @@ func _focus_first_settings_control() -> void:
 		return
 	if not _settings_overlay.visible:
 		return
-	if _local_outline_button != null and is_instance_valid(_local_outline_button):
+	if _input_device_option_button != null and is_instance_valid(_input_device_option_button) and not _input_device_option_button.disabled:
+		_input_device_option_button.grab_focus()
+	elif _local_outline_button != null and is_instance_valid(_local_outline_button):
 		_local_outline_button.grab_focus()
 
 
@@ -514,12 +790,26 @@ func _close_settings_overlay() -> void:
 		_settings_button.grab_focus()
 
 
+func _on_input_device_item_selected(index: int) -> void:
+	if is_online_session_active():
+		_refresh_input_device_options(true)
+		return
+	if index < 0 or index >= _input_device_option_values.size():
+		return
+	var option_data = _input_device_option_values[index]
+	if typeof(option_data) != TYPE_DICTIONARY:
+		return
+	set_local_input_device(
+		str(option_data.get("mode", INPUT_DEVICE_MODE_AUTO)),
+		int(option_data.get("joypad_id", -1)),
+		str(option_data.get("joypad_name", ""))
+	)
+	_last_input_device_list_key = ""
+	_refresh_input_device_options(true)
+
+
 func _on_local_character_outline_toggled(button_pressed: bool) -> void:
 	set_local_character_outline_enabled(button_pressed)
-
-
-func _on_auto_join_host_player_toggled(button_pressed: bool) -> void:
-	set_auto_join_host_player_enabled(button_pressed)
 
 
 func _has_any_local_outline_meta() -> bool:

@@ -34,7 +34,7 @@ const ENABLE_DEATH_REPORT_APPLY = false
 # In Brotato, elites and bosses both arrive as category == "boss".
 const ENABLE_BOSS_ELITE_DEATH_REPORT_APPLY = true
 const ENABLE_BOSS_ONE_SHOT_REPORT_APPLY = true
-const ENABLE_LOOTER_DEATH_REPORT_APPLY = true
+const ENABLE_LOOTER_DEATH_REPORT_APPLY = false
 const ENABLE_DEATH_EVENT_BROADCAST = false
 const ENABLE_REMOTE_PLAYER_DEATH_SYNC = true
 
@@ -194,7 +194,7 @@ func build_snapshot() -> Dictionary:
 		for removed_id_value in purged_removed:
 			var removed_id = str(removed_id_value)
 			var removed_category = str(_last_entity_category_by_net_id.get(removed_id, ""))
-			var should_sync_removed = ENABLE_REMOVED_SYNC or (ENABLE_BOSS_ELITE_REMOVED_SYNC and _is_boss_elite_category(removed_category)) or _looter_net_ids.has(removed_id)
+			var should_sync_removed = ENABLE_REMOVED_SYNC or (ENABLE_BOSS_ELITE_REMOVED_SYNC and _is_boss_elite_category(removed_category))
 			_birth_only_announced_net_ids.erase(removed_id)
 			_birth_only_first_seen_msec.erase(removed_id)
 			_birth_marker_announced_net_ids.erase(removed_id)

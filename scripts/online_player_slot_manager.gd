@@ -5,13 +5,18 @@ const MAX_REMOTE_PLAYERS = 3
 const RESTORE_CHECK_INTERVAL_MSEC = 500
 # Remote placeholders must use vanilla-mapped device ids.
 # InputService creates ui_* / button_* actions for remapped devices 0..7.
-# 7 is the local keyboard. Vanilla local gamepads are remapped from the high end
-# (normally 6, then 5, 4, ...), so remote placeholders use the low free ids.
-# Always check CoopService.is_device_assigned() before using one, because Host may
-# have several local controllers in the same online run.
-const REMOTE_PLACEHOLDER_DEVICE_IDS = [1, 2, 3]
+# Prefer the original low ids 1..3. 4, 5 and 0 are fallback ids only when a
+# manually selected local controller already owns one of 1..3. Connected physical
+# controllers are always reserved before a placeholder is allocated.
+const REMOTE_PLACEHOLDER_DEVICE_IDS = [1, 2, 3, 4, 5, 0]
 const REMOTE_PLACEHOLDER_PLAYER_TYPE = CoopService.PlayerType.GAMEPAD_XBOX
 const META_AUTO_JOIN_HOST_PLAYER = "brotato_online_auto_join_host_player"
+const META_LOCAL_INPUT_DEVICE_MODE = "brotato_online_local_input_device_mode"
+const META_LOCAL_INPUT_JOYPAD_ID = "brotato_online_local_input_joypad_id"
+const META_LOCAL_INPUT_JOYPAD_NAME = "brotato_online_local_input_joypad_name"
+const INPUT_DEVICE_MODE_AUTO = "auto"
+const INPUT_DEVICE_MODE_KEYBOARD = "keyboard"
+const INPUT_DEVICE_MODE_JOYPAD = "joypad"
 
 const BO_SLOT_DIAG_ENABLED = true
 # Slot logs are for finding stalls only.  Low-frequency, low-cost restore checks
@@ -426,6 +431,12 @@ func apply_host_selection_layout(selection_state: Dictionary, self_steam_id: Str
 
 	var new_local_mirrored_player_index = -1
 	var matched_local_player_count = 0
+	var local_entry_for_layout = _get_preferred_local_player_entry(true)
+	var reserved_local_devices = _get_connected_local_gamepad_remapped_devices()
+	if not local_entry_for_layout.empty():
+		var local_layout_device = int(local_entry_for_layout[0])
+		if not reserved_local_devices.has(local_layout_device):
+			reserved_local_devices.append(local_layout_device)
 	var target_client_player_index = int(selection_state.get("target_client_player_index", selection_state.get("client_player_index", -1)))
 	var target_client_steam_id = str(selection_state.get("target_client_steam_id", self_steam_id))
 	if target_client_steam_id == "":
@@ -445,7 +456,7 @@ func apply_host_selection_layout(selection_state: Dictionary, self_steam_id: Str
 		var player_index = int(player_data.get("player_index", new_connected_players.size()))
 		while new_connected_players.size() < player_index:
 			# 补洞，理论上不应该发生；保持数组下标不乱。
-			var hole_device = _get_next_remote_placeholder_device_from_lists(new_remote_devices, new_connected_players)
+			var hole_device = _get_next_remote_placeholder_device_from_lists(new_remote_devices, new_connected_players, reserved_local_devices)
 			if hole_device < 0:
 				return
 			new_connected_players.append([hole_device, REMOTE_PLACEHOLDER_PLAYER_TYPE])
@@ -467,14 +478,13 @@ func apply_host_selection_layout(selection_state: Dictionary, self_steam_id: Str
 			matched_local_player_count += 1
 			# 本机真实输入必须保留真实设备。旧逻辑强制写 keyboard device=7，
 			# 会让插着手柄的客户端/主机进入联机后只能用键盘槽位。
-			var local_entry = _get_preferred_local_player_entry(true)
-			if not local_entry.empty():
-				device = int(local_entry[0])
-				player_type = int(local_entry[1])
+			if not local_entry_for_layout.empty():
+				device = int(local_entry_for_layout[0])
+				player_type = int(local_entry_for_layout[1])
 			new_local_mirrored_player_index = player_index
 		else:
 			# 其他玩家只是显示/槽位占位，不接本机输入；使用官方已映射的 gamepad placeholder。
-			device = _get_next_remote_placeholder_device_from_lists(new_remote_devices, new_connected_players)
+			device = _get_next_remote_placeholder_device_from_lists(new_remote_devices, new_connected_players, reserved_local_devices)
 			if device < 0:
 				continue
 			player_type = REMOTE_PLACEHOLDER_PLAYER_TYPE
@@ -790,10 +800,18 @@ func _get_preferred_local_player_entry(allow_create: bool = true) -> Array:
 	if not allow_create:
 		return []
 
-	# For the auto-inserted Host P1 fallback, prefer a real controller whenever one
-	# is connected. This matches vanilla local-COOP expectations better than using
-	# the last UI device, which often stays keyboard/mouse after opening the lobby
-	# and creates a phantom keyboard P1 while the controllers become P2/P3.
+	var selected_mode = _get_selected_local_input_device_mode()
+	if selected_mode == INPUT_DEVICE_MODE_KEYBOARD:
+		return [CoopService.KEYBOARD_REMAPPED_DEVICE_ID, CoopService.PlayerType.KEYBOARD_AND_MOUSE]
+	if selected_mode == INPUT_DEVICE_MODE_JOYPAD:
+		var selected_joypad = _resolve_selected_joypad_device()
+		if selected_joypad >= 0:
+			var selected_entry = _get_local_gamepad_entry_for_joypad(selected_joypad)
+			if not selected_entry.empty():
+				return selected_entry
+
+	# Auto mode, or a selected controller that is currently disconnected: preserve
+	# the previous behavior of preferring the first connected controller.
 	var gamepad_entry = _get_preferred_local_gamepad_entry()
 	if not gamepad_entry.empty():
 		return gamepad_entry
@@ -801,16 +819,63 @@ func _get_preferred_local_player_entry(allow_create: bool = true) -> Array:
 	return [CoopService.KEYBOARD_REMAPPED_DEVICE_ID, CoopService.PlayerType.KEYBOARD_AND_MOUSE]
 
 
+func _get_selected_local_input_device_mode() -> String:
+	var tree = get_tree()
+	if tree == null or tree.root == null:
+		return INPUT_DEVICE_MODE_AUTO
+	var mode = str(tree.root.get_meta(META_LOCAL_INPUT_DEVICE_MODE, INPUT_DEVICE_MODE_AUTO))
+	if mode != INPUT_DEVICE_MODE_KEYBOARD and mode != INPUT_DEVICE_MODE_JOYPAD:
+		return INPUT_DEVICE_MODE_AUTO
+	return mode
+
+
+func _resolve_selected_joypad_device() -> int:
+	var tree = get_tree()
+	if tree == null or tree.root == null:
+		return -1
+	var selected_id = int(tree.root.get_meta(META_LOCAL_INPUT_JOYPAD_ID, -1))
+	var selected_name = str(tree.root.get_meta(META_LOCAL_INPUT_JOYPAD_NAME, ""))
+	var joypads = Input.get_connected_joypads()
+	if typeof(joypads) != TYPE_ARRAY:
+		return -1
+	if not joypads.has(selected_id):
+		return -1
+	var live_name = Input.get_joy_name(selected_id)
+	if selected_name != "" and live_name != selected_name:
+		return -1
+	return selected_id
+
+
 func _get_preferred_local_gamepad_entry() -> Array:
 	var joypads = Input.get_connected_joypads()
 	if typeof(joypads) != TYPE_ARRAY or joypads.empty():
 		return []
+	return _get_local_gamepad_entry_for_joypad(int(joypads[0]))
 
-	# Brotato remaps the first physical gamepad (event.device == 0) to device 6.
-	# Keep using the vanilla remapped local gamepad slot, not the remote placeholders 1..3.
-	var device = CoopService.GAMEPAD_REMAPPED_DEVICE_ID
-	var player_type = _get_player_type_for_joypad(int(joypads[0]))
+
+func _get_local_gamepad_entry_for_joypad(unmapped_device: int) -> Array:
+	# Brotato maps physical joypad 0 to local device 6. Physical joypads 1..5
+	# keep their ids; 6 and 7 are already reserved by that remap and keyboard.
+	if unmapped_device < 0 or unmapped_device >= CoopService.GAMEPAD_REMAPPED_DEVICE_ID:
+		return []
+	var device = CoopService.GAMEPAD_REMAPPED_DEVICE_ID if unmapped_device == 0 else unmapped_device
+	var player_type = _get_player_type_for_joypad(unmapped_device)
 	return [device, player_type]
+
+
+func _get_connected_local_gamepad_remapped_devices() -> Array:
+	var result = []
+	var joypads = Input.get_connected_joypads()
+	if typeof(joypads) != TYPE_ARRAY:
+		return result
+	for joypad_value in joypads:
+		var entry = _get_local_gamepad_entry_for_joypad(int(joypad_value))
+		if entry.empty():
+			continue
+		var device = int(entry[0])
+		if not result.has(device):
+			result.append(device)
+	return result
 
 
 func _get_player_type_for_joypad(unmapped_device: int) -> int:
@@ -829,6 +894,8 @@ func _get_player_type_for_joypad(unmapped_device: int) -> int:
 
 func _maybe_replace_manager_keyboard_slot_with_gamepad() -> bool:
 	if not _host_player_joined_by_manager:
+		return false
+	if _get_selected_local_input_device_mode() != INPUT_DEVICE_MODE_AUTO:
 		return false
 	if not _prefers_local_gamepad_input():
 		return false
@@ -854,6 +921,8 @@ func _maybe_replace_manager_keyboard_slot_with_gamepad() -> bool:
 
 func _maybe_replace_local_mirrored_keyboard_slot_with_gamepad() -> bool:
 	if _local_mirrored_player_index < 0:
+		return false
+	if _get_selected_local_input_device_mode() != INPUT_DEVICE_MODE_AUTO:
 		return false
 	if not _prefers_local_gamepad_input():
 		return false
@@ -1045,16 +1114,19 @@ func _get_player_index_for_device(device: int) -> int:
 
 
 func _get_next_free_remote_device() -> int:
+	var reserved_devices = _get_connected_local_gamepad_remapped_devices()
 	for device in REMOTE_PLACEHOLDER_DEVICE_IDS:
+		if reserved_devices.has(device):
+			continue
 		if not CoopService.is_device_assigned(device) and not _remote_devices.has(device):
 			return device
 
 	return -1
 
 
-func _get_next_remote_placeholder_device_from_lists(remote_devices: Array, connected_players: Array) -> int:
+func _get_next_remote_placeholder_device_from_lists(remote_devices: Array, connected_players: Array, reserved_devices: Array = []) -> int:
 	for device in REMOTE_PLACEHOLDER_DEVICE_IDS:
-		if remote_devices.has(device):
+		if remote_devices.has(device) or reserved_devices.has(device):
 			continue
 
 		var used = false

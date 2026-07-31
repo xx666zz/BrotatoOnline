@@ -37,7 +37,7 @@ const ENABLE_DEATH_REPORTS = false
 # then recreate it from the next Host snapshot as the generic boss fallback.
 const ENABLE_CLIENT_BOSS_ONE_SHOT_REPORTS = true
 const ENABLE_CLIENT_BOSS_ELITE_DEATH_REPORTS = true
-const ENABLE_CLIENT_LOOTER_DEATH_REPORTS = true
+const ENABLE_CLIENT_LOOTER_DEATH_REPORTS = false
 const ENABLE_DEATH_SYNC = false
 const ENABLE_PLAYER_DEATH_REPORTS = true
 const ENABLE_PLAYER_DEATH_SYNC = true
@@ -3778,7 +3778,7 @@ func _should_apply_host_removed_entity(net_id: String) -> bool:
 		return true
 	if not ENABLE_BOSS_ELITE_REMOVED_SYNC:
 		return false
-	return _is_boss_elite_category(str(_host_entity_category.get(net_id, ""))) or _is_looter_net_id(net_id)
+	return _is_boss_elite_category(str(_host_entity_category.get(net_id, "")))
 
 
 func _get_entity_sync_mode(category: String, state: Dictionary) -> String:

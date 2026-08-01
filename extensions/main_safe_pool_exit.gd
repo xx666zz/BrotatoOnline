@@ -172,14 +172,14 @@ func _brotato_online_is_online_session_active() -> bool:
 		return false
 	return bool(tree.root.get_meta("brotato_online_session_active", false))
 
-func _brotato_online_get_steam_lobby_manager() -> Node:
+func _brotato_online_get_session_manager() -> Node:
 	var tree = get_tree()
 	if tree == null or tree.root == null:
 		return null
-	var direct = tree.root.get_node_or_null("ModLoader/six666-BrotatoOnline/BrotatoOnlineSteamLobbyManager")
+	var direct = tree.root.get_node_or_null("ModLoader/six666-BrotatoOnline/BrotatoOnlineSessionManager")
 	if direct != null and is_instance_valid(direct):
 		return direct
-	return _brotato_online_find_node_named(tree.root, "BrotatoOnlineSteamLobbyManager", 0)
+	return _brotato_online_find_node_named(tree.root, "BrotatoOnlineSessionManager", 0)
 
 
 func _brotato_online_get_battle_replica_manager() -> Node:
@@ -251,7 +251,7 @@ func _brotato_online_find_node_named(node: Node, target_name: String, depth: int
 func _brotato_online_is_online_client() -> bool:
 	if not _brotato_online_is_online_session_active():
 		return false
-	var steam = _brotato_online_get_steam_lobby_manager()
+	var steam = _brotato_online_get_session_manager()
 	if steam != null and steam.has_method("is_game_host"):
 		return not bool(steam.is_game_host())
 	return false
@@ -468,7 +468,7 @@ func _on_player_died(p_player, _args) -> void:
 func _brotato_online_is_game_host() -> bool:
 	if not _brotato_online_is_online_session_active():
 		return false
-	var steam = _brotato_online_get_steam_lobby_manager()
+	var steam = _brotato_online_get_session_manager()
 	if steam != null and steam.has_method("is_game_host"):
 		return bool(steam.is_game_host())
 	return false

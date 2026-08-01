@@ -32,7 +32,7 @@ func get_api_version() -> int:
 
 
 func is_online() -> bool:
-	var steam_manager = _get_steam_lobby_manager()
+	var steam_manager = _get_session_manager()
 	if steam_manager != null and steam_manager.has_method("bo_api_is_online"):
 		return bool(steam_manager.bo_api_is_online())
 	var tree = get_tree()
@@ -44,7 +44,7 @@ func is_online() -> bool:
 func is_host() -> bool:
 	if not is_online():
 		return false
-	var steam_manager = _get_steam_lobby_manager()
+	var steam_manager = _get_session_manager()
 	if steam_manager != null and steam_manager.has_method("bo_api_is_host"):
 		return bool(steam_manager.bo_api_is_host())
 	return false
@@ -53,7 +53,7 @@ func is_host() -> bool:
 func is_client() -> bool:
 	if not is_online():
 		return false
-	var steam_manager = _get_steam_lobby_manager()
+	var steam_manager = _get_session_manager()
 	if steam_manager != null and steam_manager.has_method("bo_api_is_client"):
 		return bool(steam_manager.bo_api_is_client())
 	return not is_host()
@@ -379,7 +379,7 @@ func _get_current_wave() -> int:
 
 
 func _get_battle_id() -> int:
-	var steam_manager = _get_steam_lobby_manager()
+	var steam_manager = _get_session_manager()
 	if steam_manager != null and steam_manager.has_method("bo_api_get_battle_id"):
 		var id = int(steam_manager.bo_api_get_battle_id())
 		if id > 0:
@@ -397,7 +397,7 @@ func _get_player_index_for_steam_id(steam_id: String) -> int:
 		var local_indices = get_local_player_indices()
 		if not local_indices.empty():
 			return int(local_indices[0])
-	var steam_manager = _get_steam_lobby_manager()
+	var steam_manager = _get_session_manager()
 	if steam_manager != null and steam_manager.has_method("bo_api_get_player_index_for_steam_id"):
 		var idx = int(steam_manager.bo_api_get_player_index_for_steam_id(steam_id))
 		if idx >= 0:
@@ -416,21 +416,21 @@ func _get_remote_steam_id_for_player(player_index: int) -> String:
 
 
 func _get_self_steam_id() -> String:
-	var steam_manager = _get_steam_lobby_manager()
+	var steam_manager = _get_session_manager()
 	if steam_manager != null and steam_manager.has_method("bo_api_get_self_steam_id"):
 		return str(steam_manager.bo_api_get_self_steam_id())
 	return ""
 
 
 func _get_host_steam_id() -> String:
-	var steam_manager = _get_steam_lobby_manager()
+	var steam_manager = _get_session_manager()
 	if steam_manager != null and steam_manager.has_method("bo_api_get_host_steam_id"):
 		return str(steam_manager.bo_api_get_host_steam_id())
 	return ""
 
 
 func _get_remote_member_steam_ids() -> Array:
-	var steam_manager = _get_steam_lobby_manager()
+	var steam_manager = _get_session_manager()
 	if steam_manager != null and steam_manager.has_method("bo_api_get_remote_member_steam_ids"):
 		var ids = steam_manager.bo_api_get_remote_member_steam_ids()
 		if typeof(ids) == TYPE_ARRAY:
@@ -439,7 +439,7 @@ func _get_remote_member_steam_ids() -> Array:
 
 
 func _send_wire_to_steam_id(target_steam_id: String, message: Dictionary, reliable: bool) -> bool:
-	var steam_manager = _get_steam_lobby_manager()
+	var steam_manager = _get_session_manager()
 	if steam_manager == null:
 		return false
 	if steam_manager.has_method("bo_api_send_to_steam_id"):
@@ -465,11 +465,11 @@ func _is_run_end_visible() -> bool:
 	return scene_path.find("end") != -1 or scene_name.find("end") != -1 or scene_name.find("victory") != -1 or scene_name.find("defeat") != -1
 
 
-func _get_steam_lobby_manager() -> Node:
+func _get_session_manager() -> Node:
 	var parent = get_parent()
 	if parent == null:
 		return null
-	return parent.get_node_or_null("BrotatoOnlineSteamLobbyManager")
+	return parent.get_node_or_null("BrotatoOnlineSessionManager")
 
 
 func _get_menu_sync_manager() -> Node:

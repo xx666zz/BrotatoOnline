@@ -114,10 +114,13 @@ func _ready() -> void:
 	# 子弹、命中、伤害跳字、死亡表现逐步改为 Host presentation event 驱动。
 	_add_i18n_manager()
 	_add_version_adapter()
+	_add_session_manager()
+	_add_steam_transport()
+	_add_lan_transport()
+	_add_lan_discovery()
+	_add_lobby_browser()
 	_add_online_player_slot_manager()
 	_add_menu_sync_manager()
-	_add_steam_lobby_manager()
-	_add_public_lobby_browser()
 	_add_quick_chat_wheel_manager()
 	_add_online_input_manager()
 	_add_runtime_locator()
@@ -162,17 +165,41 @@ func _add_menu_sync_manager() -> void:
 	)
 
 
-func _add_steam_lobby_manager() -> void:
+func _add_session_manager() -> void:
 	_add_script_node(
-		"BrotatoOnlineSteamLobbyManager",
-		"scripts/steam_lobby_manager.gd",
+		"BrotatoOnlineSessionManager",
+		"scripts/session_manager.gd",
 		true
 	)
 
 
-func _add_public_lobby_browser() -> void:
+func _add_steam_transport() -> void:
 	_add_script_node(
-		"BrotatoOnlinePublicLobbyBrowser",
+		"BrotatoOnlineSteamTransport",
+		"scripts/steam_transport.gd",
+		true
+	)
+
+
+func _add_lan_transport() -> void:
+	_add_script_node(
+		"BrotatoOnlineLanTransport",
+		"scripts/lan_transport.gd",
+		true
+	)
+
+
+func _add_lan_discovery() -> void:
+	_add_script_node(
+		"BrotatoOnlineLanDiscovery",
+		"scripts/lan_discovery.gd",
+		true
+	)
+
+
+func _add_lobby_browser() -> void:
+	_add_script_node(
+		"BrotatoOnlineLobbyBrowser",
 		"scripts/public_lobby_browser.gd",
 		true
 	)
@@ -288,4 +315,3 @@ func _add_script_node(node_name: String, script_rel_path: String, required: bool
 	node.name = node_name
 	node.set_script(script_res)
 	add_child(node)
-

@@ -2565,7 +2565,7 @@ func _apply_shop_go_action(player_index: int, _message: Dictionary) -> bool:
 	# guarded network-action path and could cancel readiness after Clients had
 	# already accepted game_start_commit, splitting Host and Client scenes.
 	if _is_game_host():
-		var steam_lobby_pending = _get_steam_lobby_manager()
+		var steam_lobby_pending = _get_session_manager()
 		if steam_lobby_pending != null and steam_lobby_pending.has_method("has_pending_synced_shop_game_start"):
 			if bool(steam_lobby_pending.has_pending_synced_shop_game_start()):
 				return true
@@ -2592,7 +2592,7 @@ func _apply_shop_go_action(player_index: int, _message: Dictionary) -> bool:
 func _should_sync_shop_game_start(shop: Node, player_index: int) -> bool:
 	if not _is_game_host() or not _is_valid_shop_node(shop):
 		return false
-	var steam_lobby = _get_steam_lobby_manager()
+	var steam_lobby = _get_session_manager()
 	if steam_lobby == null or not steam_lobby.has_method("request_synced_shop_game_start"):
 		return false
 	if bool(_get_node_array_value(shop, "_player_pressed_go_button", player_index, false)):
@@ -2611,7 +2611,7 @@ func _request_synced_shop_game_start(shop: Node, player_index: int) -> bool:
 		return false
 	_force_shop_go_visual_state(shop, player_index, true)
 
-	var steam_lobby = _get_steam_lobby_manager()
+	var steam_lobby = _get_session_manager()
 	if steam_lobby != null and steam_lobby.has_method("request_synced_shop_game_start"):
 		var force_full_held_items = false
 		if steam_lobby.has_method("should_force_full_item_list_for_next_scene_sync"):
@@ -7718,11 +7718,13 @@ func _build_all_progression_visible_options(ui: Node = null, include_marker_stat
 
 
 func _is_stale_run_page_action(action_id: String) -> bool:
-	var parts = action_id.split(":")
-	if parts.size() < 2:
+	# LAN peer ids contain a colon (for example "lan:2"). Split at the final
+	# separator so "lan:2:17" keeps "lan:2" as the origin and 17 as the seq.
+	var separator = action_id.rfind(":")
+	if separator <= 0 or separator >= action_id.length() - 1:
 		return false
-	var origin = str(parts[0])
-	var seq = int(parts[1])
+	var origin = action_id.substr(0, separator)
+	var seq = int(action_id.substr(separator + 1))
 	if origin == "" or seq <= 0:
 		return false
 	var last_seq = int(_last_run_page_action_seq_by_origin.get(origin, 0))
@@ -7793,15 +7795,15 @@ func _trim_processed_run_page_actions() -> void:
 			_processed_run_page_action_ids.erase(key)
 
 
-func _get_steam_lobby_manager() -> Node:
+func _get_session_manager() -> Node:
 	var parent = get_parent()
 	if parent == null:
 		return null
-	return parent.get_node_or_null("BrotatoOnlineSteamLobbyManager")
+	return parent.get_node_or_null("BrotatoOnlineSessionManager")
 
 
 func _is_online_session_active() -> bool:
-	var steam_lobby = _get_steam_lobby_manager()
+	var steam_lobby = _get_session_manager()
 	if steam_lobby != null:
 		if steam_lobby.has_method("is_online_session_active"):
 			return bool(steam_lobby.is_online_session_active())
@@ -7811,7 +7813,7 @@ func _is_online_session_active() -> bool:
 
 
 func _is_game_host() -> bool:
-	var steam_lobby = _get_steam_lobby_manager()
+	var steam_lobby = _get_session_manager()
 	if steam_lobby != null and steam_lobby.has_method("is_game_host"):
 		return bool(steam_lobby.is_game_host())
 	return false
@@ -7845,14 +7847,14 @@ func _force_run_player_count_to_online_coop_layout(reason: String) -> void:
 
 
 func _get_game_host_steam_id() -> String:
-	var steam_lobby = _get_steam_lobby_manager()
+	var steam_lobby = _get_session_manager()
 	if steam_lobby != null and steam_lobby.has_method("get_game_host_steam_id"):
 		return str(steam_lobby.get_game_host_steam_id())
 	return ""
 
 
 func _get_self_steam_id() -> String:
-	var steam_lobby = _get_steam_lobby_manager()
+	var steam_lobby = _get_session_manager()
 	if steam_lobby != null and steam_lobby.has_method("get_self_steam_id"):
 		return str(steam_lobby.get_self_steam_id())
 	return _local_client_steam_id
@@ -8510,7 +8512,7 @@ func _apply_run_config_before_client_scene_change(config: Dictionary, target_scr
 		_apply_endless_mode_to_current_ui(endless_value)
 
 	if config.has("retry_wave_enabled"):
-		var steam_lobby = _get_steam_lobby_manager()
+		var steam_lobby = _get_session_manager()
 		if steam_lobby != null and steam_lobby.has_method("apply_host_retry_wave_setting"):
 			steam_lobby.apply_host_retry_wave_setting(bool(config.get("retry_wave_enabled", false)))
 		else:

@@ -160,7 +160,7 @@ func receive_remote_quick_chat(message: Dictionary) -> void:
 
 
 func _can_use_quick_chat() -> bool:
-	var steam = _get_steam_lobby_manager()
+	var steam = _get_session_manager()
 	if steam == null or not steam.has_method("has_active_online_session"):
 		return false
 	return bool(steam.has_active_online_session())
@@ -307,7 +307,7 @@ func _refresh_wheel_styles() -> void:
 func _submit_selected() -> void:
 	if _selected_index < 0 or _selected_index >= OPTION_IDS.size():
 		return
-	var steam = _get_steam_lobby_manager()
+	var steam = _get_session_manager()
 	if steam == null or not steam.has_method("send_or_broadcast_quick_chat"):
 		return
 	_local_seq += 1
@@ -772,11 +772,11 @@ func _t(key: String) -> String:
 	return key
 
 
-func _get_steam_lobby_manager() -> Node:
+func _get_session_manager() -> Node:
 	var parent = get_parent()
 	if parent == null:
 		return null
-	return parent.get_node_or_null("BrotatoOnlineSteamLobbyManager")
+	return parent.get_node_or_null("BrotatoOnlineSessionManager")
 
 
 func _get_slot_manager() -> Node:

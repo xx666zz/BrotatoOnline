@@ -94,7 +94,7 @@ func _ready() -> void:
 
 func _process(_delta: float) -> void:
 	var locator = _get_runtime_locator()
-	var steam = _get_steam_lobby_manager()
+	var steam = _get_session_manager()
 	var in_game = locator != null and locator.has_method("is_in_game_scene") and bool(locator.is_in_game_scene())
 	var online_active = _is_online_session_active()
 	var is_host = _is_game_host()
@@ -251,7 +251,7 @@ func get_last_snapshot_message() -> Dictionary:
 
 func force_fresh_snapshot_message() -> Dictionary:
 	var locator = _get_runtime_locator()
-	var steam = _get_steam_lobby_manager()
+	var steam = _get_session_manager()
 	if locator != null and locator.has_method("is_in_game_scene") and bool(locator.is_in_game_scene()):
 		_ensure_current_game_scene_registered("force_fresh", locator, _is_game_host(), steam)
 	var snapshot = build_snapshot()
@@ -2353,8 +2353,8 @@ func _get_net_id_registry() -> Node:
 	return _get_sibling_or_root_node("BrotatoOnlineNetIdRegistry")
 
 
-func _get_steam_lobby_manager() -> Node:
-	return _get_sibling_or_root_node("BrotatoOnlineSteamLobbyManager")
+func _get_session_manager() -> Node:
+	return _get_sibling_or_root_node("BrotatoOnlineSessionManager")
 
 
 func _get_sibling_or_root_node(node_name: String) -> Node:
@@ -2384,7 +2384,7 @@ func _find_node_by_name(root: Node, node_name: String) -> Node:
 
 
 func _is_online_session_active() -> bool:
-	var steam_manager = _get_steam_lobby_manager()
+	var steam_manager = _get_session_manager()
 	if steam_manager == null:
 		return false
 	if steam_manager.has_method("is_online_session_active"):
@@ -2395,7 +2395,7 @@ func _is_online_session_active() -> bool:
 
 
 func _is_game_host() -> bool:
-	var steam_manager = _get_steam_lobby_manager()
+	var steam_manager = _get_session_manager()
 	if steam_manager == null:
 		return false
 	if steam_manager.has_method("is_game_host"):

@@ -1,10 +1,12 @@
 extends Node
 
-# Public-lobby discovery and UI are kept separate from the gameplay replication
-# path. The SteamLobbyManager remains the single owner of lobby join/leave state.
+# Steam and LAN discovery share one list; SessionManager remains the only owner
+# of join/leave and gameplay state.
 
 const MOD_ID = "six666-BrotatoOnline"
-const MOD_VERSION = "4.0.0"
+# Steam/LAN compatibility is negotiated independently from the package version.
+const NETWORK_PROTOCOL_VERSION = "4.0.0"
+const DEFAULT_LAN_PORT = 27462
 const GAME_VERSION = "1.1.15.4"
 const META_PUBLIC_LOBBY_ENABLED = "brotato_online_public_lobby_enabled"
 const SETTINGS_FILE_PATH = "user://brotato_online_settings.cfg"
@@ -58,12 +60,18 @@ var _overlay_open = false
 var _list_request_pending = false
 var _last_list_request_msec = 0
 var _lobby_entries = []
+var _entry_by_key = {}
+var _lan_discovery = null
 var _ping_label_by_lobby_id = {}
 var _ping_state_by_lobby_id = {}
 var _pending_ping_by_nonce = {}
 var _ping_sequence = 0
 var _pending_public_join_lobby_id = 0
 var _pending_public_join_started_msec = 0
+var _direct_connect_button = null
+var _direct_panel = null
+var _direct_address_edit = null
+var _direct_port_edit = null
 
 # Lobby metadata writes are cached. Rewriting the same Steam lobby data every
 # second emits lobby_data_update callbacks; those callbacks used to rebuild the
@@ -83,6 +91,16 @@ func _ready() -> void:
 	set_process(true)
 	set_process_input(true)
 	call_deferred("_apply_public_preference_to_lobby_manager")
+	call_deferred("_bind_lan_discovery")
+
+
+func _bind_lan_discovery() -> void:
+	var parent = get_parent()
+	if parent == null:
+		return
+	_lan_discovery = parent.get_node_or_null("BrotatoOnlineLanDiscovery")
+	if _lan_discovery != null and _lan_discovery.has_signal("lobby_found") and not _lan_discovery.is_connected("lobby_found", self, "_on_lan_lobby_found"):
+		_lan_discovery.connect("lobby_found", self, "_on_lan_lobby_found")
 
 
 func _process(_delta: float) -> void:
@@ -111,7 +129,10 @@ func _input(event: InputEvent) -> void:
 	if not _overlay_open:
 		return
 	if event.is_action_released("ui_cancel"):
-		_close_browser_overlay()
+		if _direct_panel != null and _direct_panel.visible:
+			_hide_direct_connect()
+		else:
+			_close_browser_overlay()
 		get_tree().set_input_as_handled()
 
 
@@ -211,21 +232,21 @@ func _publish_public_lobby_preference() -> void:
 
 
 func _apply_public_preference_to_lobby_manager() -> void:
-	var manager = _get_steam_lobby_manager()
+	var manager = _get_session_manager()
 	if manager != null and manager.has_method("set_public_lobby_enabled"):
 		manager.call("set_public_lobby_enabled", _public_lobby_enabled)
 
 
-func _get_steam_lobby_manager() -> Node:
+func _get_session_manager() -> Node:
 	var parent = get_parent()
 	if parent != null:
-		var direct = parent.get_node_or_null("BrotatoOnlineSteamLobbyManager")
+		var direct = parent.get_node_or_null("BrotatoOnlineSessionManager")
 		if direct != null and is_instance_valid(direct):
 			return direct
 	var tree = get_tree()
 	if tree == null or tree.root == null:
 		return null
-	return _find_node_named(tree.root, "BrotatoOnlineSteamLobbyManager", 0)
+	return _find_node_named(tree.root, "BrotatoOnlineSessionManager", 0)
 
 
 func _find_node_named(node: Node, target_name: String, depth: int) -> Node:
@@ -476,7 +497,7 @@ func _reposition_character_public_toggle(parent: Node, lobby_toggle: Node) -> vo
 func _update_public_toggle_state() -> void:
 	if _public_toggle == null or not is_instance_valid(_public_toggle):
 		return
-	var manager = _get_steam_lobby_manager()
+	var manager = _get_session_manager()
 	var active = false
 	var host = true
 	if manager != null:
@@ -513,7 +534,12 @@ func _ensure_browser_overlay(title_screen: Node) -> void:
 		_status_label = existing.get_node_or_null("Center/Panel/Margin/VBox/Status")
 		_rows_container = existing.get_node_or_null("Center/Panel/Margin/VBox/Scroll/Rows")
 		_refresh_button = existing.get_node_or_null("Center/Panel/Margin/VBox/Bottom/Refresh")
+		_direct_connect_button = existing.get_node_or_null("Center/Panel/Margin/VBox/Bottom/DirectConnect")
 		_back_button = existing.get_node_or_null("Center/Panel/Margin/VBox/Bottom/Back")
+		_direct_panel = existing.get_node_or_null("DirectConnectPanel")
+		if _direct_panel != null:
+			_direct_address_edit = _direct_panel.get_node_or_null("Margin/VBox/Address")
+			_direct_port_edit = _direct_panel.get_node_or_null("Margin/VBox/Port")
 		return
 
 	var overlay = Control.new()
@@ -620,6 +646,17 @@ func _ensure_browser_overlay(title_screen: Node) -> void:
 	_configure_runtime_button(refresh)
 	_refresh_button = refresh
 
+	var direct_connect = Button.new()
+	direct_connect.name = "DirectConnect"
+	direct_connect.text = _text("direct_connect")
+	direct_connect.rect_min_size = Vector2(250, 65)
+	direct_connect.focus_mode = Control.FOCUS_ALL
+	direct_connect.mouse_filter = Control.MOUSE_FILTER_STOP
+	bottom.add_child(direct_connect)
+	direct_connect.connect("pressed", self, "_show_direct_connect")
+	_configure_runtime_button(direct_connect)
+	_direct_connect_button = direct_connect
+
 	var bottom_spacer = Control.new()
 	bottom_spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	bottom.add_child(bottom_spacer)
@@ -635,10 +672,67 @@ func _ensure_browser_overlay(title_screen: Node) -> void:
 	_configure_runtime_button(back)
 	_back_button = back
 
-	_refresh_button.focus_neighbour_left = _refresh_button.get_path_to(_back_button)
-	_refresh_button.focus_neighbour_right = _refresh_button.get_path_to(_back_button)
-	_back_button.focus_neighbour_left = _back_button.get_path_to(_refresh_button)
-	_back_button.focus_neighbour_right = _back_button.get_path_to(_refresh_button)
+	var direct_panel = PanelContainer.new()
+	direct_panel.name = "DirectConnectPanel"
+	direct_panel.anchor_left = 0.5
+	direct_panel.anchor_top = 0.5
+	direct_panel.anchor_right = 0.5
+	direct_panel.anchor_bottom = 0.5
+	direct_panel.margin_left = -280
+	direct_panel.margin_top = -165
+	direct_panel.margin_right = 280
+	direct_panel.margin_bottom = 165
+	direct_panel.visible = false
+	overlay.add_child(direct_panel)
+	var direct_margin = MarginContainer.new()
+	direct_margin.name = "Margin"
+	for side in ["margin_left", "margin_right", "margin_top", "margin_bottom"]:
+		direct_margin.add_constant_override(side, 24)
+	direct_panel.add_child(direct_margin)
+	var direct_vbox = VBoxContainer.new()
+	direct_vbox.name = "VBox"
+	direct_vbox.add_constant_override("separation", 12)
+	direct_margin.add_child(direct_vbox)
+	var direct_title = Label.new()
+	direct_title.name = "Title"
+	direct_title.text = _text("direct_title")
+	direct_title.align = Label.ALIGN_CENTER
+	direct_vbox.add_child(direct_title)
+	var address_edit = LineEdit.new()
+	address_edit.name = "Address"
+	address_edit.placeholder_text = _text("address_hint")
+	direct_vbox.add_child(address_edit)
+	var port_edit = LineEdit.new()
+	port_edit.name = "Port"
+	port_edit.placeholder_text = _text("port_hint")
+	port_edit.text = str(DEFAULT_LAN_PORT)
+	direct_vbox.add_child(port_edit)
+	var direct_buttons = HBoxContainer.new()
+	direct_buttons.name = "Buttons"
+	direct_buttons.add_constant_override("separation", 12)
+	direct_vbox.add_child(direct_buttons)
+	var join_direct = Button.new()
+	join_direct.name = "Join"
+	join_direct.text = _text("join")
+	join_direct.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	direct_buttons.add_child(join_direct)
+	join_direct.connect("pressed", self, "_confirm_direct_connect")
+	_configure_runtime_button(join_direct)
+	var cancel_direct = Button.new()
+	cancel_direct.name = "Cancel"
+	cancel_direct.text = _text("cancel")
+	cancel_direct.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	direct_buttons.add_child(cancel_direct)
+	cancel_direct.connect("pressed", self, "_hide_direct_connect")
+	_configure_runtime_button(cancel_direct)
+	_direct_panel = direct_panel
+	_direct_address_edit = address_edit
+	_direct_port_edit = port_edit
+
+	_refresh_button.focus_neighbour_right = _refresh_button.get_path_to(_direct_connect_button)
+	_direct_connect_button.focus_neighbour_left = _direct_connect_button.get_path_to(_refresh_button)
+	_direct_connect_button.focus_neighbour_right = _direct_connect_button.get_path_to(_back_button)
+	_back_button.focus_neighbour_left = _back_button.get_path_to(_direct_connect_button)
 
 	_overlay = overlay
 	_overlay_parent = title_screen
@@ -680,12 +774,49 @@ func _focus_browser_refresh() -> void:
 		_refresh_button.grab_focus()
 
 
+func _show_direct_connect() -> void:
+	if _direct_panel == null:
+		return
+	_direct_panel.show()
+	if _direct_address_edit != null:
+		_direct_address_edit.grab_focus()
+
+
+func _hide_direct_connect() -> void:
+	if _direct_panel != null:
+		_direct_panel.hide()
+	if _direct_connect_button != null:
+		_direct_connect_button.grab_focus()
+
+
+func _confirm_direct_connect() -> void:
+	var address = str(_direct_address_edit.text if _direct_address_edit != null else "").strip_edges()
+	var port = int(str(_direct_port_edit.text if _direct_port_edit != null else DEFAULT_LAN_PORT))
+	if address.find(":") != -1:
+		var parts = address.split(":", false, 1)
+		address = str(parts[0]).strip_edges()
+		if parts.size() > 1 and str(parts[1]).strip_edges() != "":
+			port = int(parts[1])
+	if port <= 0 or port > 65535:
+		port = DEFAULT_LAN_PORT
+	var manager = _get_session_manager()
+	if address == "" or manager == null or not manager.has_method("join_lan"):
+		_set_status(_text("join_verify_failed"))
+		return
+	_hide_direct_connect()
+	_close_browser_overlay()
+	manager.join_lan(address, port)
+
+
 func _close_browser_overlay() -> void:
 	_overlay_open = false
 	_list_request_pending = false
 	_pending_public_join_lobby_id = 0
 	_pending_public_join_started_msec = 0
 	_clear_ping_state()
+	_hide_direct_connect()
+	if _lan_discovery != null and _lan_discovery.has_method("stop_search"):
+		_lan_discovery.stop_search()
 	if _overlay != null and is_instance_valid(_overlay):
 		_overlay.hide()
 	if _last_focus_owner != null and is_instance_valid(_last_focus_owner):
@@ -697,15 +828,16 @@ func _close_browser_overlay() -> void:
 func request_public_lobby_list() -> void:
 	if not _overlay_open or _list_request_pending:
 		return
-	if _steam == null or not _steam_has_method("requestLobbyList"):
-		_list_request_pending = false
-		_set_status(_text("steam_unavailable"))
-		return
 
 	_clear_lobby_results()
 	_set_status(_text("searching"))
-	_list_request_pending = true
 	_last_list_request_msec = OS.get_ticks_msec()
+	if _lan_discovery != null and _lan_discovery.has_method("start_search"):
+		_lan_discovery.start_search()
+	if _steam == null or not _steam_has_method("requestLobbyList"):
+		_list_request_pending = false
+		return
+	_list_request_pending = true
 
 	if _steam_has_method("addRequestLobbyListStringFilter"):
 		_steam.addRequestLobbyListStringFilter("mod", MOD_ID, LOBBY_COMPARISON_EQUAL)
@@ -720,6 +852,10 @@ func request_public_lobby_list() -> void:
 	if typeof(result) == TYPE_BOOL and not bool(result):
 		_list_request_pending = false
 		_set_status(_text("request_failed"))
+
+
+func request_lobby_list() -> void:
+	request_public_lobby_list()
 
 
 func _on_lobby_match_list(payload = null) -> void:
@@ -748,17 +884,14 @@ func _normalize_lobby_match_list_payload(payload) -> Array:
 
 
 func _build_lobby_entries(lobby_ids: Array) -> void:
-	_lobby_entries.clear()
-	var seen = {}
 	for value in lobby_ids:
 		var lobby_id = int(str(value))
-		if lobby_id == 0 or seen.has(str(lobby_id)):
+		if lobby_id == 0:
 			continue
-		seen[str(lobby_id)] = true
 		var entry = _read_lobby_entry(lobby_id)
 		if entry.empty():
 			continue
-		_lobby_entries.append(entry)
+		_upsert_lobby_entry(entry)
 
 
 func _read_lobby_entry(lobby_id: int) -> Dictionary:
@@ -780,11 +913,9 @@ func _read_lobby_entry(lobby_id: int) -> Dictionary:
 	if host_name == "":
 		host_name = host_id if host_id != "" else str(lobby_id)
 
+	# SessionManager publishes total Steam + LAN membership. Steam's native lobby
+	# count intentionally must not override this value in a mixed room.
 	var member_count = int(str(_steam.getLobbyData(lobby_id, "member_count")))
-	if _steam_has_method("getNumLobbyMembers"):
-		var live_count = int(_steam.getNumLobbyMembers(lobby_id))
-		if live_count > 0:
-			member_count = live_count
 	var member_limit = int(str(_steam.getLobbyData(lobby_id, "member_limit")))
 	if _steam_has_method("getLobbyMemberLimit"):
 		var live_limit = int(_steam.getLobbyMemberLimit(lobby_id))
@@ -795,11 +926,15 @@ func _read_lobby_entry(lobby_id: int) -> Dictionary:
 	if member_count <= 0:
 		member_count = 1
 
-	var compatible = mod_version == MOD_VERSION and game_version == GAME_VERSION
+	var compatible = mod_version == NETWORK_PROTOCOL_VERSION and game_version == GAME_VERSION
 	var joinable_state = state == "character_selection" or state == "coop_resume"
 	var full = member_count >= member_limit
 	return {
+		"source": "steam",
+		"entry_id": str(lobby_id),
+		"entry_key": "steam:" + str(lobby_id),
 		"lobby_id": lobby_id,
+		"endpoint": {"lobby_id": lobby_id},
 		"host_id": host_id,
 		"host_name": host_name,
 		"member_count": member_count,
@@ -810,6 +945,33 @@ func _read_lobby_entry(lobby_id: int) -> Dictionary:
 		"full": full,
 		"ping_ms": -1
 	}
+
+
+func _on_lan_lobby_found(entry: Dictionary) -> void:
+	if not _overlay_open or typeof(entry) != TYPE_DICTIONARY:
+		return
+	var normalized = entry.duplicate(true)
+	normalized["source"] = "lan"
+	normalized["compatible"] = str(normalized.get("mod_version", "")) == NETWORK_PROTOCOL_VERSION
+	var member_count = int(normalized.get("member_count", 1))
+	var member_limit = int(normalized.get("member_limit", 4))
+	normalized["full"] = member_count >= member_limit
+	normalized["joinable"] = bool(normalized.get("joinable", true)) and bool(normalized["compatible"]) and not bool(normalized["full"])
+	_upsert_lobby_entry(normalized)
+	_rebuild_lobby_rows()
+
+
+func _upsert_lobby_entry(entry: Dictionary) -> void:
+	var entry_key = str(entry.get("entry_key", ""))
+	if entry_key == "":
+		return
+	if _entry_by_key.has(entry_key):
+		var index = int(_entry_by_key[entry_key])
+		if index >= 0 and index < _lobby_entries.size():
+			_lobby_entries[index] = entry
+			return
+	_entry_by_key[entry_key] = _lobby_entries.size()
+	_lobby_entries.append(entry)
 
 
 func _rebuild_lobby_rows() -> void:
@@ -844,7 +1006,8 @@ func _add_lobby_row(entry: Dictionary) -> void:
 	panel.add_child(row)
 
 	var host = Label.new()
-	host.text = str(entry.get("host_name", ""))
+	var source_prefix = "[LAN] " if str(entry.get("source", "steam")) == "lan" else "[Steam] "
+	host.text = source_prefix + str(entry.get("host_name", ""))
 	host.rect_min_size = Vector2(410, 60)
 	host.valign = Label.VALIGN_CENTER
 	host.clip_text = true
@@ -861,7 +1024,7 @@ func _add_lobby_row(entry: Dictionary) -> void:
 	ping.rect_min_size = Vector2(130, 60)
 	ping.valign = Label.VALIGN_CENTER
 	row.add_child(ping)
-	_ping_label_by_lobby_id[str(entry.get("lobby_id", 0))] = ping
+	_ping_label_by_lobby_id[str(entry.get("entry_key", ""))] = ping
 
 	var state = Label.new()
 	state.text = _format_lobby_state(entry)
@@ -876,7 +1039,7 @@ func _add_lobby_row(entry: Dictionary) -> void:
 	join.focus_mode = Control.FOCUS_ALL
 	join.mouse_filter = Control.MOUSE_FILTER_STOP
 	join.disabled = not bool(entry.get("joinable", false))
-	join.connect("pressed", self, "_on_join_lobby_pressed", [int(entry.get("lobby_id", 0))])
+	join.connect("pressed", self, "_on_join_lobby_pressed", [str(entry.get("entry_key", ""))])
 	_configure_runtime_button(join)
 	row.add_child(join)
 
@@ -887,6 +1050,10 @@ func _format_lobby_state(entry: Dictionary) -> String:
 	if bool(entry.get("full", false)):
 		return _text("full")
 	var state = str(entry.get("state", "unknown"))
+	if state == "battle":
+		state = "game"
+	elif state == "menu":
+		state = "busy"
 	if state == "character_selection" or state == "coop_resume" or state == "weapon_selection" or state == "difficulty_selection" or state == "game" or state == "shop" or state == "busy":
 		return _text(state)
 	return _text("unknown")
@@ -905,6 +1072,7 @@ func _set_status(text: String) -> void:
 
 func _clear_lobby_results() -> void:
 	_lobby_entries.clear()
+	_entry_by_key.clear()
 	_clear_ping_state()
 	if _rows_container != null and is_instance_valid(_rows_container):
 		for child in _rows_container.get_children():
@@ -912,8 +1080,21 @@ func _clear_lobby_results() -> void:
 			child.queue_free()
 
 
-func _on_join_lobby_pressed(lobby_id: int) -> void:
-	if lobby_id == 0 or _pending_public_join_lobby_id != 0:
+func _on_join_lobby_pressed(entry_key: String) -> void:
+	if entry_key == "" or _pending_public_join_lobby_id != 0:
+		return
+	var entry = _find_entry(entry_key)
+	if entry.empty():
+		return
+	if str(entry.get("source", "steam")) == "lan":
+		var endpoint = entry.get("endpoint", {})
+		var manager = _get_session_manager()
+		if manager != null and manager.has_method("join_lan"):
+			_close_browser_overlay()
+			manager.join_lan(str(endpoint.get("address", "")), int(endpoint.get("port", DEFAULT_LAN_PORT)))
+		return
+	var lobby_id = int(entry.get("lobby_id", 0))
+	if lobby_id == 0:
 		return
 	if _steam == null or not _steam_has_method("requestLobbyData"):
 		_set_status(_text("steam_unavailable"))
@@ -930,6 +1111,15 @@ func _on_join_lobby_pressed(lobby_id: int) -> void:
 		_pending_public_join_lobby_id = 0
 		_pending_public_join_started_msec = 0
 		_set_status(_text("join_verify_failed"))
+
+
+func _find_entry(entry_key: String) -> Dictionary:
+	if not _entry_by_key.has(entry_key):
+		return {}
+	var index = int(_entry_by_key[entry_key])
+	if index < 0 or index >= _lobby_entries.size():
+		return {}
+	return _lobby_entries[index]
 
 
 func _on_lobby_data_update(success = false, lobby_id = 0, member_id = 0) -> void:
@@ -958,7 +1148,7 @@ func _on_lobby_data_update(success = false, lobby_id = 0, member_id = 0) -> void
 		_set_status(_text("lobby_no_longer_joinable"))
 		return
 
-	var manager = _get_steam_lobby_manager()
+	var manager = _get_session_manager()
 	if manager == null or not manager.has_method("join_lobby"):
 		_set_status(_text("steam_unavailable"))
 		return
@@ -981,6 +1171,9 @@ func _remove_lobby_entry(lobby_id: int) -> void:
 	for i in range(_lobby_entries.size() - 1, -1, -1):
 		if str(_lobby_entries[i].get("lobby_id", 0)) == str(lobby_id):
 			_lobby_entries.remove(i)
+	_entry_by_key.clear()
+	for i in range(_lobby_entries.size()):
+		_entry_by_key[str(_lobby_entries[i].get("entry_key", ""))] = i
 
 
 func _start_ping_measurements() -> void:
@@ -990,6 +1183,8 @@ func _start_ping_measurements() -> void:
 	_pending_ping_by_nonce.clear()
 	var now = OS.get_ticks_msec()
 	for entry in _lobby_entries:
+		if str(entry.get("source", "steam")) != "steam":
+			continue
 		var lobby_id = str(entry.get("lobby_id", 0))
 		var host_id = str(entry.get("host_id", ""))
 		if lobby_id == "0" or host_id == "" or host_id == "0":
@@ -1142,8 +1337,9 @@ func _update_entry_ping(lobby_key: String, ping_ms: int) -> void:
 		if str(entry.get("lobby_id", 0)) == lobby_key:
 			entry["ping_ms"] = ping_ms
 			break
-	if _ping_label_by_lobby_id.has(lobby_key):
-		var label = _ping_label_by_lobby_id[lobby_key]
+	var entry_key = "steam:" + lobby_key
+	if _ping_label_by_lobby_id.has(entry_key):
+		var label = _ping_label_by_lobby_id[entry_key]
 		if label != null and is_instance_valid(label):
 			label.text = _format_ping(ping_ms)
 
@@ -1186,7 +1382,7 @@ func _poll_host_lobby_metadata(now: int) -> void:
 		_reset_host_metadata_cache()
 		return
 
-	var manager = _get_steam_lobby_manager()
+	var manager = _get_session_manager()
 	if manager == null or not manager.has_method("get_lobby_id") or not manager.has_method("is_host"):
 		_reset_host_metadata_cache()
 		return
@@ -1202,9 +1398,7 @@ func _poll_host_lobby_metadata(now: int) -> void:
 		_published_lobby_id = lobby_id
 
 	var state = _detect_host_lobby_state()
-	var member_count = 1
-	if _steam_has_method("getNumLobbyMembers"):
-		member_count = max(1, int(_steam.getNumLobbyMembers(lobby_id)))
+	var member_count = int(manager.call("get_session_member_count")) if manager.has_method("get_session_member_count") else 1
 
 	_set_lobby_data_if_changed(lobby_id, "state", state)
 	_set_lobby_data_if_changed(lobby_id, "member_count", str(member_count))
@@ -1217,7 +1411,7 @@ func _poll_host_lobby_metadata(now: int) -> void:
 		_set_lobby_data_if_changed(lobby_id, "host_name", persona_name)
 
 	if _steam_has_method("setLobbyJoinable"):
-		var joinable = state == "character_selection" or state == "coop_resume"
+		var joinable = member_count < 4 and (state == "character_selection" or state == "coop_resume")
 		if _published_lobby_joinable == null or bool(_published_lobby_joinable) != joinable:
 			_steam.setLobbyJoinable(lobby_id, joinable)
 			_published_lobby_joinable = joinable
@@ -1254,5 +1448,17 @@ func _refresh_localized_texts() -> void:
 		_title_label.text = _text("title")
 	if _refresh_button != null and is_instance_valid(_refresh_button):
 		_refresh_button.text = _text("refresh")
+	if _direct_connect_button != null and is_instance_valid(_direct_connect_button):
+		_direct_connect_button.text = _text("direct_connect")
 	if _back_button != null and is_instance_valid(_back_button):
 		_back_button.text = _text("back")
+	if _direct_panel != null and is_instance_valid(_direct_panel):
+		var title = _direct_panel.get_node_or_null("Margin/VBox/Title")
+		var join_button = _direct_panel.get_node_or_null("Margin/VBox/Buttons/Join")
+		var cancel_button = _direct_panel.get_node_or_null("Margin/VBox/Buttons/Cancel")
+		if title != null:
+			title.text = _text("direct_title")
+		if join_button != null:
+			join_button.text = _text("join")
+		if cancel_button != null:
+			cancel_button.text = _text("cancel")

@@ -989,7 +989,7 @@ func _request_unknown_entity_resync(net_id: String, category: String, reason: St
 	if now - last < UNKNOWN_ENTITY_RESYNC_REQUEST_INTERVAL_MSEC:
 		return
 	_last_entity_resync_request_msec_by_net_id[net_id] = now
-	var steam = _get_steam_lobby_manager()
+	var steam = _get_session_manager()
 	if steam == null or not steam.has_method("send_battle_message_to_host"):
 		return
 	steam.send_battle_message_to_host({
@@ -1924,7 +1924,7 @@ func _send_entity_kill_claim(net_id: String, category: String, entity: Node = nu
 	if net_id == "" or _sent_kill_claim_ids.has(net_id):
 		return
 	_sent_kill_claim_ids[net_id] = true
-	var steam = _get_steam_lobby_manager()
+	var steam = _get_session_manager()
 	if steam == null or not steam.has_method("send_battle_message_to_host"):
 		return
 	var death_pos = Vector2.ZERO
@@ -1974,7 +1974,7 @@ func _flush_boss_damage_reports(force: bool) -> void:
 		reports.append({"net_id": id, "damage": int(_pending_boss_damage[id]), "one_shot": bool(_pending_boss_one_shots.get(id, false))})
 	_pending_boss_damage.clear()
 	_pending_boss_one_shots.clear()
-	var steam = _get_steam_lobby_manager()
+	var steam = _get_session_manager()
 	if steam != null and steam.has_method("send_battle_message_to_host"):
 		steam.send_battle_message_to_host({
 			"msg_type": "boss_damage_report",
@@ -2096,7 +2096,7 @@ func _send_owned_player_state_packet(player: Node, force_dead: bool, reason: Str
 		"reason": reason,
 		"client_time_msec": now
 	}
-	var steam = _get_steam_lobby_manager()
+	var steam = _get_session_manager()
 	if steam == null or not steam.has_method("send_battle_message_to_host"):
 		return false
 	var sent = false
@@ -4010,8 +4010,8 @@ func _get_runtime_locator() -> Node:
 	return _get_sibling_or_root_node("BrotatoOnlineRuntimeLocator")
 
 
-func _get_steam_lobby_manager() -> Node:
-	return _get_sibling_or_root_node("BrotatoOnlineSteamLobbyManager")
+func _get_session_manager() -> Node:
+	return _get_sibling_or_root_node("BrotatoOnlineSessionManager")
 
 
 func _get_slot_manager() -> Node:
@@ -4075,7 +4075,7 @@ func _get_wave_timer_label() -> Label:
 
 
 func _is_online_session_active() -> bool:
-	var steam = _get_steam_lobby_manager()
+	var steam = _get_session_manager()
 	if steam != null:
 		if steam.has_method("is_online_session_active"):
 			return bool(steam.is_online_session_active())
@@ -4085,7 +4085,7 @@ func _is_online_session_active() -> bool:
 
 
 func _is_game_host() -> bool:
-	var steam = _get_steam_lobby_manager()
+	var steam = _get_session_manager()
 	if steam != null and steam.has_method("is_game_host"):
 		return bool(steam.is_game_host())
 	return false

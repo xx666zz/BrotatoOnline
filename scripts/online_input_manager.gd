@@ -31,8 +31,8 @@ func _ready() -> void:
 
 
 func _process(_delta: float) -> void:
-	# 不在这里自动发包，因为实际 P2P 发送函数在 steam_lobby_manager.gd 里。
-	# steam_lobby_manager 每帧/定时调用 consume_local_battle_input_messages() 即可。
+	# 不在这里自动发包；SessionManager 统一选择 Steam 或 LAN Transport。
+	# SessionManager 每帧/定时调用 consume_local_battle_input_messages() 即可。
 	pass
 
 
@@ -232,7 +232,7 @@ func _get_lobby_manager() -> Node:
 	var parent = get_parent()
 	if parent == null:
 		return null
-	return parent.get_node_or_null("BrotatoOnlineSteamLobbyManager")
+	return parent.get_node_or_null("BrotatoOnlineSessionManager")
 
 
 func _has_property(obj, property_name: String) -> bool:

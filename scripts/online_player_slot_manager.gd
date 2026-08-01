@@ -413,6 +413,23 @@ func get_player_index_for_steam_id(steam_id: String) -> int:
 	return _get_player_index_for_device(device)
 
 
+# Session peer keys are transport-agnostic despite the legacy variable names.
+# Rebind in place so a new Steam or LAN connection can take over a disconnected
+# in-run slot without rebuilding CoopService.connected_players.
+func rebind_remote_peer_key(old_peer_key: String, new_peer_key: String) -> int:
+	if old_peer_key == "" or new_peer_key == "" or old_peer_key == new_peer_key:
+		return get_player_index_for_steam_id(new_peer_key)
+	if not _device_by_remote_steam_id.has(old_peer_key):
+		return -1
+	if _device_by_remote_steam_id.has(new_peer_key):
+		return get_player_index_for_steam_id(new_peer_key)
+	var device = int(_device_by_remote_steam_id[old_peer_key])
+	_device_by_remote_steam_id.erase(old_peer_key)
+	_device_by_remote_steam_id[new_peer_key] = device
+	_remote_steam_id_by_device[device] = new_peer_key
+	return _get_player_index_for_device(device)
+
+
 func apply_host_selection_layout(selection_state: Dictionary, self_steam_id: String, host_steam_id: String = "") -> void:
 	var t_apply_layout = OS.get_ticks_usec()
 	if _is_slot_mutation_locked():

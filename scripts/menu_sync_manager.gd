@@ -10357,17 +10357,27 @@ func host_auto_prime_character_selection_after_remote_join() -> bool:
 	if screen != "character_selection":
 		return false
 
+	# SOLO -> COOP on the same CharacterSelection node can leave a live entry in
+	# _latest_focused_element while _play_mode_init() has already cleared the real
+	# FocusEmulator.focused_control. Re-enable input only for Host-local slots, then
+	# validate the real emulator state instead of trusting the cached element alone.
+	_configure_online_focus_emulator_input_owners(_get_host_local_player_indices(), "selection_host_prime")
+
 	var changed = false
 	for player_index in range(RunData.get_player_count()):
 		var existing = _get_latest_focused_element(selection, player_index)
-		if _is_live_ref(existing):
+		if _focus_emulator_matches_selection_element(player_index, existing):
 			continue
 
-		var elements = _get_selectable_elements_for_player(selection, player_index, true)
-		if elements.empty():
-			continue
+		# Preserve the player's previous hover when only the actual FocusEmulator was
+		# cleared. Fall back to the first selectable entry only when the cache is empty.
+		var element = existing
+		if not _is_live_ref(element):
+			var elements = _get_selectable_elements_for_player(selection, player_index, true)
+			if elements.empty():
+				continue
+			element = elements[0]
 
-		var element = elements[0]
 		if not _is_live_ref(element):
 			continue
 
@@ -10756,6 +10766,27 @@ func _get_latest_focused_element(selection: Node, player_index: int):
 	if typeof(latest) == TYPE_ARRAY and player_index >= 0 and player_index < latest.size():
 		return latest[player_index]
 	return null
+
+
+func _focus_emulator_matches_selection_element(player_index: int, element) -> bool:
+	if not _is_live_ref(element):
+		return false
+
+	var focus_emulator = Utils.get_focus_emulator(player_index)
+	if not _is_live_ref(focus_emulator):
+		return false
+
+	var focused_control = _safe_get(focus_emulator, "focused_control", null)
+	if not _is_live_ref(focused_control):
+		return false
+	if focused_control == element:
+		return true
+
+	# Some menu elements wrap the actual Control focused by FocusEmulator. Treat a
+	# parent/child relation as the same logical selection element.
+	if focused_control is Node and element is Node:
+		return _is_node_ancestor_of(element, focused_control) or _is_node_ancestor_of(focused_control, element)
+	return false
 
 
 func _get_selected_item_for_player(selection: Node, player_index: int):

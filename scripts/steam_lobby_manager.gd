@@ -42,8 +42,8 @@ const P2P_JSON_CHUNK_SENDS_PER_FRAME = 1
 const P2P_JSON_CHUNK_RETRY_DELAY_MSEC = 100
 const P2P_JSON_CHUNK_RETRY_LOG_INTERVAL_MSEC = 1000
 const P2P_JSON_CHUNK_TTL_MSEC = 15000
-const CLIENT_HELLO_RETRY_DURATION_MSEC = 5000
-const CLIENT_HELLO_RETRY_INTERVAL_MSEC = 1000
+# Retry after 2s, then 4s, then cap at one hello every 8s until a valid Host reply arrives.
+const CLIENT_HELLO_RETRY_DELAYS_MSEC = [2000, 4000, 8000]
 const CLIENT_SETUP_DUPLICATE_SUPPRESS_MSEC = 5000
 const BATTLE_SNAPSHOT_SEND_INTERVAL_MSEC = 120
 # Diagnostic switch: do not forward broad death claims/reports or broadcast death_event packets.
@@ -135,8 +135,9 @@ var _pending_received_menu_focus_order = []
 var _online_flow_started = false
 var _online_flow_left_since_msec = 0
 var _host_known_remote_ids = []
-var _client_hello_retry_until_msec = 0
-var _last_client_hello_retry_msec = 0
+var _client_hello_retry_active = false
+var _client_hello_retry_delay_index = 0
+var _client_hello_next_retry_msec = 0
 var _sent_character_setup_key_by_steam_id = {}
 var _sent_weapon_setup_key_by_steam_id = {}
 var _sent_scene_transition_key_by_steam_id = {}
@@ -619,8 +620,7 @@ func join_lobby(lobby_id) -> void:
 		# If the first handshake was lost or suppressed by stale reliable packets, this left
 		# the client stuck until the host restarted. Treat it as a handshake refresh.
 		if not _is_game_host():
-			_client_hello_retry_until_msec = OS.get_ticks_msec() + CLIENT_HELLO_RETRY_DURATION_MSEC
-			_last_client_hello_retry_msec = 0
+			_start_client_hello_retry()
 			_send_client_hello_to_host()
 		return
 
@@ -677,8 +677,7 @@ func leave_lobby() -> void:
 	_pending_received_menu_focus_by_sender.clear()
 	_pending_received_menu_focus_order.clear()
 	_host_known_remote_ids.clear()
-	_client_hello_retry_until_msec = 0
-	_last_client_hello_retry_msec = 0
+	_stop_client_hello_retry("leave_lobby")
 	_last_broadcast_selection_key = ""
 	_sent_character_setup_key_by_steam_id.clear()
 	_sent_weapon_setup_key_by_steam_id.clear()
@@ -1024,12 +1023,10 @@ func _on_lobby_joined(lobby_id = 0, permissions = 0, locked = false, response = 
 	if _is_game_host():
 		_setup_lobby_data()
 		_setup_join_presence()
-		_client_hello_retry_until_msec = 0
-		_last_client_hello_retry_msec = 0
+		_stop_client_hello_retry("joined_as_host")
 	else:
 		_setup_client_presence()
-		_client_hello_retry_until_msec = OS.get_ticks_msec() + CLIENT_HELLO_RETRY_DURATION_MSEC
-		_last_client_hello_retry_msec = 0
+		_start_client_hello_retry()
 	_refresh_lobby_members(true)
 	_update_lobby_toggle_button_state()
 	_update_character_invite_button_state()
@@ -1736,6 +1733,7 @@ func _bump_online_session_generation(reason: String = "") -> void:
 
 
 func _reset_transient_online_state_for_new_session(reason: String = "") -> void:
+	_stop_client_hello_retry("new_session:" + str(reason))
 	_bump_online_session_generation(reason)
 	_restore_client_retry_wave_setting_override()
 	_last_online_character_selection_restage_scene_id = 0
@@ -2147,23 +2145,33 @@ func _send_client_hello_to_host() -> void:
 	}, true)
 
 
-func _stop_client_hello_retry(reason: String = "") -> void:
-	if _client_hello_retry_until_msec == 0:
+func _start_client_hello_retry() -> void:
+	if _lobby_id == 0 or _is_game_host():
 		return
-	_client_hello_retry_until_msec = 0
-	_last_client_hello_retry_msec = 0
+	_client_hello_retry_active = true
+	_client_hello_retry_delay_index = 0
+	_client_hello_next_retry_msec = OS.get_ticks_msec() + int(CLIENT_HELLO_RETRY_DELAYS_MSEC[0])
+
+
+func _stop_client_hello_retry(reason: String = "") -> void:
+	if not _client_hello_retry_active:
+		return
+	_client_hello_retry_active = false
+	_client_hello_retry_delay_index = 0
+	_client_hello_next_retry_msec = 0
 
 
 func _poll_client_hello_retry() -> void:
-	if _lobby_id == 0 or _is_game_host():
+	if _lobby_id == 0 or _is_game_host() or not _client_hello_retry_active:
 		return
 	var now = OS.get_ticks_msec()
-	if _client_hello_retry_until_msec == 0 or now > _client_hello_retry_until_msec:
+	if now < _client_hello_next_retry_msec:
 		return
-	if now - _last_client_hello_retry_msec < CLIENT_HELLO_RETRY_INTERVAL_MSEC:
-		return
-	_last_client_hello_retry_msec = now
 	_send_client_hello_to_host()
+	if _client_hello_retry_delay_index < CLIENT_HELLO_RETRY_DELAYS_MSEC.size() - 1:
+		_client_hello_retry_delay_index += 1
+	_client_hello_next_retry_msec = now + int(CLIENT_HELLO_RETRY_DELAYS_MSEC[_client_hello_retry_delay_index])
+
 
 func _poll_p2p_packets(poll_menu: bool = true, poll_battle: bool = true) -> void:
 	if _steam == null or not _steam_ready:
@@ -2638,11 +2646,11 @@ func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 	if msg_type == "host_character_setup":
 		if _is_game_host():
 			return
-		_stop_client_hello_retry("host_character_setup")
 		# Do not unlock a valid battle/shop mirror for an incomplete or misdirected
-		# setup packet. The next valid targeted setup/selection_state can recover it.
+		# setup packet. Keep hello retries active until a correctly targeted setup arrives.
 		if not _host_setup_has_valid_local_slot(message):
 			return
+		_stop_client_hello_retry("host_character_setup")
 		if _should_ignore_duplicate_host_setup(from_steam_id, msg_type, message):
 			return
 		# A fresh character setup means Host has returned to mutable staging. Clear the
@@ -2661,9 +2669,9 @@ func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 	if msg_type == "host_weapon_setup":
 		if _is_game_host():
 			return
-		_stop_client_hello_retry("host_weapon_setup")
 		if not _host_setup_has_valid_local_slot(message):
 			return
+		_stop_client_hello_retry("host_weapon_setup")
 		if _should_ignore_duplicate_host_setup(from_steam_id, msg_type, message):
 			return
 		_unlock_online_run_slots()
@@ -5979,8 +5987,11 @@ func _send_host_character_setup_to_client(steam_id: String, force: bool = false)
 	if not force and str(_sent_character_setup_key_by_steam_id.get(steam_id, "")) == key:
 		return
 
-	_sent_character_setup_key_by_steam_id[steam_id] = key
-	_send_p2p_json(steam_id, state, true)
+	var send_ok = _send_p2p_json(steam_id, state, true)
+	if send_ok:
+		_sent_character_setup_key_by_steam_id[steam_id] = key
+	else:
+		_sent_character_setup_key_by_steam_id.erase(steam_id)
 
 
 func _send_host_weapon_setup_to_client(steam_id: String, force: bool = false) -> void:
@@ -5999,8 +6010,11 @@ func _send_host_weapon_setup_to_client(steam_id: String, force: bool = false) ->
 	if not force and str(_sent_weapon_setup_key_by_steam_id.get(steam_id, "")) == key:
 		return
 
-	_sent_weapon_setup_key_by_steam_id[steam_id] = key
-	_send_p2p_json(steam_id, state, true)
+	var send_ok = _send_p2p_json(steam_id, state, true)
+	if send_ok:
+		_sent_weapon_setup_key_by_steam_id[steam_id] = key
+	else:
+		_sent_weapon_setup_key_by_steam_id.erase(steam_id)
 
 
 func _get_stable_scene_run_config(config) -> Dictionary:
@@ -6675,8 +6689,8 @@ func _steam_networking_result_name(result) -> String:
 
 func _log_steam_message_send_failure(target_steam_id: String, msg_type: String, bytes: int, send_flags: int, channel: int, result, result_name: String) -> void:
 	var retry_left = 0
-	if _client_hello_retry_until_msec > 0:
-		retry_left = max(0, _client_hello_retry_until_msec - OS.get_ticks_msec())
+	if _client_hello_retry_active and _client_hello_next_retry_msec > 0:
+		retry_left = max(0, _client_hello_next_retry_msec - OS.get_ticks_msec())
 
 
 func _get_p2p_channel_for_message_type(msg_type: String) -> int:
@@ -6717,8 +6731,7 @@ func _on_network_messages_session_failed(remote_steam_id = 0, session_error = 0,
 	else:
 		var host_id = _get_game_host_steam_id()
 		if host_id != "" and steam_id == host_id:
-			_client_hello_retry_until_msec = OS.get_ticks_msec() + CLIENT_HELLO_RETRY_DURATION_MSEC
-			_last_client_hello_retry_msec = 0
+			_start_client_hello_retry()
 			call_deferred("_send_client_hello_to_host")
 
 
@@ -7188,7 +7201,7 @@ func _should_show_joining_overlay() -> bool:
 	if _pending_join_lobby_id != 0 or _client_join_requested_lobby_id != 0:
 		return true
 	if _online_role == "client" and _lobby_id != 0:
-		if _client_hello_retry_until_msec != 0:
+		if _client_hello_retry_active:
 			return true
 		if not _is_client_in_usable_online_scene():
 			return true

@@ -84,6 +84,19 @@ func clear_remote_inputs() -> void:
 	_release_all_remote_actions()
 
 
+func clear_remote_input_for_steam_id(steam_id: String) -> void:
+	if steam_id == "":
+		return
+	var slot_manager = _get_slot_manager()
+	if slot_manager == null or not slot_manager.has_method("get_player_index_for_steam_id"):
+		return
+	var player_index = int(slot_manager.get_player_index_for_steam_id(steam_id))
+	if player_index < 0:
+		return
+	_remote_input_by_player.erase(player_index)
+	_release_player_actions(player_index)
+
+
 func _apply_remote_inputs_to_official_actions() -> void:
 	var now = OS.get_ticks_msec()
 	var active_players = {}

@@ -1,0 +1,12 @@
+; Minimal Godot 3 project used only by the headless test runner.
+; The mod itself is loaded by Brotato/ModLoader and is not a standalone project.
+
+config_version=4
+
+[application]
+
+config/name="BrotatoOnline Headless Tests"
+
+[rendering]
+
+driver/driver_name="GLES2"

@@ -3475,6 +3475,10 @@ func _prune_local_kill_ignores(now: int, active_ids: Dictionary) -> void:
 		_locally_killed_until.erase(id)
 
 
+func clear_connection_state(reason: String) -> void:
+	_clear_all(reason)
+
+
 func _clear_all(reason: String) -> void:
 	_sanitize_stats_manager_queues("clear_all_before:" + reason)
 	_latest_snapshot = {}

@@ -1,6 +1,7 @@
 extends Node
 
 
+const ONLINE_SLOT_LAYOUT = preload("res://mods-unpacked/six666-BrotatoOnline/scripts/online_slot_layout.gd")
 const MAX_REMOTE_PLAYERS = 3
 const RESTORE_CHECK_INTERVAL_MSEC = 500
 # Remote placeholders must use vanilla-mapped device ids.
@@ -341,7 +342,12 @@ func online_reset_to_offline(reason: String = "") -> void:
 	# manager created for online staging. Otherwise the next CharacterSelection
 	# scene can reopen in COOP with an empty/stale slot list, producing focus jumps
 	# or dead input until the periodic guard repairs it.
-	var was_tracking_online_slots = _host_player_joined_by_manager or not _remote_devices.empty() or _local_mirrored_player_index >= 0 or not _mirrored_connected_players.empty()
+	var was_tracking_online_slots = _host_player_joined_by_manager or not _remote_devices.empty() or _local_mirrored_player_index >= 0 or not _mirrored_connected_players.empty() or bool(RunData.is_coop_run)
+	# Only remove the remote placeholders owned by this manager. The old cleanup
+	# cleared the whole vanilla array, including local P2/P3/P4 inputs. On the next
+	# lobby open vanilla rebuilt that array asynchronously, which made the visible
+	# character-slot count alternate between three and four across repeated opens.
+	var local_players_to_preserve = ONLINE_SLOT_LAYOUT.preserve_local_slots(CoopService.connected_players, _remote_devices, _remote_steam_id_by_device)
 	_online_run_slots_locked = false
 	_online_run_connected_players_snapshot.clear()
 	_mirrored_connected_players.clear()
@@ -357,6 +363,19 @@ func online_reset_to_offline(reason: String = "") -> void:
 	_remote_devices.clear()
 
 	if _is_in_active_online_run_scene():
+		# A client leaving an active run must not carry its shifted local slot into
+		# Continue. RunData still owns the saved player count, while CoopResume must
+		# receive a fresh input and assign the next available player index.
+		if reason == "leave_lobby_client":
+			var before_continue_detach = _bo_slot_diag_players()
+			var continue_layout = ONLINE_SLOT_LAYOUT.clear_for_offline_continue(local_players_to_preserve)
+			CoopService.connected_players.clear()
+			for player in continue_layout:
+				CoopService.connected_players.append(player)
+			CoopService.listening_for_inputs = false
+			_bo_resume_emit_scene_id = 0
+			_bo_resume_last_emitted_count = -1
+			_bo_slot_diag_log("OFFLINE_CONTINUE_DETACH", "reason=" + reason + " before=" + before_continue_detach + " after=" + _bo_slot_diag_players() + " saved_run_players=" + str(RunData.get_player_count()))
 		# Do not shrink RunData during an active battle/shop; that can corrupt the run.
 		dump_slots()
 		return
@@ -364,9 +383,11 @@ func online_reset_to_offline(reason: String = "") -> void:
 	var restored_selection_to_solo = false
 	if was_tracking_online_slots:
 		CoopService.connected_players.clear()
+		for player in local_players_to_preserve:
+			CoopService.connected_players.append(player)
 		CoopService.listening_for_inputs = false
 		if RunData.has_method("set_player_count"):
-			RunData.set_player_count(1)
+			RunData.set_player_count(max(1, local_players_to_preserve.size()))
 		RunData.play_mode = RunData.PlayMode.SOLO
 		RunData.set_coop_run(false)
 		_bo_emit_connected_players_updated("generic_emit")

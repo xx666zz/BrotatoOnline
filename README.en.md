@@ -24,7 +24,13 @@ The mod uses Steam lobbies and network synchronization to allow players to play 
 
 ## Installation
 
-Subscribe to the mod through the Steam Workshop.
+Subscribe through Steam Workshop for normal use. To test a local build, keep the corresponding Workshop item subscribed and replace the mod archive inside that subscribed item directory with the generated ZIP:
+
+```text
+<SteamLibrary>/steamapps/workshop/content/1942280/<WorkshopItemId>/<existing-workshop-archive-name>.zip
+```
+
+Replace the archive that already exists in the subscribed item directory; do not add a second ZIP beside it, because ModLoader will treat it as a duplicate or malformed mod. Do not place the test ZIP directly under `content/1942280/`, and do not create an unsubscribed stand-in item directory. The ZIP itself always uses `mods-unpacked/six666-BrotatoOnline/` as its internal root.
 
 ## Basic Synchronization Model
 
@@ -150,9 +156,31 @@ Third-party mods should not directly access Brotato Online's internal manager no
 
 - Multiplayer platform: Steam
 
+- Mod version: 4.1.1
+
+- Network protocol: v2 only (all players must use the same version)
+
 ## Compatibility Notes
 
 Brotato Online applies several runtime extensions to the original game flow. Compatibility with other mods therefore depends on which parts of the game those mods modify.
+
+## Tests
+
+The repository includes a repeatable local test entry point. A network-disabled Godot 3.5.3 Docker container directly tests the production protocol core, send scheduler, and Steam callback driver, then parses the real manager scripts:
+
+```bash
+./tools/run_tests.sh
+```
+
+Release verification also checks version consistency, reproducible ZIP bytes, CRCs, the runtime file allowlist, and per-file hashes:
+
+```bash
+make test-godot
+make verify
+make package
+```
+
+The Godot test only mounts the required production scripts and test entry point from a temporary directory, read-only. Logs and release artifacts are not exposed to the container. A real Brotato/Steam two-instance reconnect regression still requires a game and ModLoader environment.
 
 ## Documentation
 

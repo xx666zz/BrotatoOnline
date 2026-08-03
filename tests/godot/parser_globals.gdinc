@@ -1,0 +1,60 @@
+# Parser-only shadows for Brotato autoloads. This file is inserted into temporary
+# copies of the ModLoader scripts; it is never shipped or executed by the mod.
+var ProgressData = null
+var RunData = null
+var MenuData = null
+var CoopService = null
+var ItemService = null
+var WeaponService = null
+var ZoneService = null
+var MusicManager = null
+var PopupManager = null
+var OnlineCatalog = null
+var PlayerRunData = null
+var Utils = null
+var Text = null
+var Keys = null
+var Category = null
+var Effect = null
+var PlayMode = null
+var LoadStatus = null
+var WeaponType = null
+var FocusEmulatorSignal = null
+var ConsumableToProcess = null
+var UpgradeToProcess = null
+var WeaponGainStatForEveryStatEffect = null
+var UpgradesUI = null
+var CoopUpgradesUIPlayerContainer = null
+var CoopShopPlayerContainer = null
+var ShopItemsContainer = null
+var Inventory = null
+var FocusEmulator = null
+var Main = null
+var BaseShop = null
+var BaseEndRun = null
+var CharacterSelection = null
+var CoopShop = null
+
+class UpgradeData:
+	extends Resource
+
+class WeaponData:
+	extends Resource
+
+class ConsumableData:
+	extends Resource
+
+class CharacterData:
+	extends Resource
+
+class ItemData:
+	extends Resource
+
+class ShopItem:
+	extends Control
+
+class Enemy:
+	extends Node
+
+class EntityType:
+	enum { ENEMY, BOSS, NEUTRAL, STRUCTURE, PET }

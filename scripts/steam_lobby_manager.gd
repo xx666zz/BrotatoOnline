@@ -1,9 +1,22 @@
 extends Node
 
+const ProtocolConfig = preload("res://mods-unpacked/six666-BrotatoOnline/scripts/network_protocol_config.gd")
 
 const BROTATO_APP_ID = 1942280
 const MAX_LOBBY_MEMBERS = 4
-const MOD_VERSION = "4.0.0"
+const MOD_VERSION = ProtocolConfig.MOD_VERSION
+const NETWORK_PROTOCOL_VERSION = ProtocolConfig.PROTOCOL_VERSION
+const SESSION_STATE_DISCONNECTED = "DISCONNECTED"
+const SESSION_STATE_LOBBY_JOINING = "LOBBY_JOINING"
+const SESSION_STATE_LOBBY_CONNECTED = "LOBBY_CONNECTED"
+const SESSION_STATE_SESSION_NEGOTIATING = "SESSION_NEGOTIATING"
+const SESSION_STATE_SYNCING = "SYNCING"
+const SESSION_STATE_READY = "READY"
+const SESSION_STATE_IN_SHOP = "IN_SHOP"
+const SESSION_STATE_IN_BATTLE = "IN_BATTLE"
+const SESSION_STATE_RECONNECTING = "RECONNECTING"
+const SESSION_STATE_RESYNCING = "RESYNCING"
+const SESSION_STATE_FAILED = "FAILED"
 const META_AUTO_JOIN_HOST_PLAYER = "brotato_online_auto_join_host_player"
 const META_PUBLIC_LOBBY_ENABLED = "brotato_online_public_lobby_enabled"
 
@@ -36,7 +49,7 @@ const FORCE_ALL_STEAM_MESSAGES_RELIABLE = true
 # Keep each chunk well below 64KB after the JSON/base64 wrapper is added.
 const P2P_JSON_CHUNK_TRIGGER_BYTES = 400 * 1024
 const P2P_JSON_CHUNK_RAW_BYTES = 44000
-const P2P_JSON_CHUNK_SENDS_PER_FRAME = 1
+const P2P_JSON_CHUNK_SENDS_PER_FRAME = 4
 # When SteamNetworkingMessages refuses a reliable chunk because the send buffer is
 # full, keep the packet at the head of the queue and retry after a few frames.
 const P2P_JSON_CHUNK_RETRY_DELAY_MSEC = 100
@@ -95,6 +108,13 @@ const BO_NET_DIAG_LARGE_PACKET_BYTES = 65536
 const BO_NET_DIAG_LARGE_BATCH_BYTES = 131072
 const BO_NET_DIAG_PENDING_QUEUE_WARN = 4
 const BO_NET_DIAG_PENDING_AGE_WARN_MSEC = 500
+const P2P_JSON_MAX_PENDING_PER_PEER = 48
+const P2P_JSON_MAX_PENDING_TOTAL = 192
+const P2P_JSON_MAX_PENDING_AGE_MSEC = 15000
+const P2P_JSON_MAX_REASSEMBLED_BYTES = 2 * 1024 * 1024
+const P2P_JSON_MAX_CHUNKS_PER_MESSAGE = 48
+const P2P_JSON_MAX_ASSEMBLIES_PER_PEER = 4
+const P2P_JSON_MAX_ASSEMBLIES_TOTAL = 12
 
 var _steam = null
 var _steam_ready = false
@@ -123,6 +143,7 @@ var _last_selection_broadcast_msec = 0
 var _last_broadcast_selection_key = ""
 var _last_client_menu_input_poll_msec = 0
 var _last_steam_callback_poll_usec = 0
+var _steam_callbacks_auto_driven = false
 var _last_p2p_battle_poll_usec = 0
 var _last_p2p_menu_poll_usec = 0
 var _last_menu_action_poll_usec = 0
@@ -145,7 +166,12 @@ var _full_item_list_scene_sync_required_by_steam_id = {}
 var _host_scene_transition_payload_cache_key = ""
 var _host_scene_transition_payload_cache_msec = 0
 var _host_scene_transition_payload_cache_state = {}
-var _pending_p2p_chunk_sends = []
+var _network_send_scheduler_script = null
+var _network_send_scheduler = null
+var _capturing_reconnect_full_state_peer = ""
+var _captured_reconnect_full_state_messages = []
+var _steam_callback_driver_script = null
+var _steam_callback_driver = null
 var _incoming_p2p_chunks = {}
 var _p2p_chunk_seq = 0
 var _seen_client_hello_by_steam_id = {}
@@ -178,6 +204,7 @@ var _client_last_game_scene_apply_msec = 0
 var _pending_client_game_scene_ready_start_id = 0
 var _sent_client_game_scene_ready_start_id = 0
 var _local_run_page_action_seq = 0
+var _local_run_page_action_seq_by_stream = {}
 var _direct_upgrade_ui_instance_id = 0
 var _direct_upgrade_action_seq = 0
 var _direct_upgrade_local_actions = {}
@@ -260,6 +287,20 @@ var _client_active_retry_context_key = ""
 var _pending_client_game_scene_ready_requires_new_scene = false
 var _pending_client_game_scene_ready_old_scene_id = 0
 var _online_session_generation = 0
+var _network_session_script = null
+var _peer_session_by_steam_id = {}
+var _host_action_relay_session = null
+var _client_connection_generation = 0
+var _client_connection_nonce = ""
+var _client_session_state = SESSION_STATE_DISCONNECTED
+var _client_reconnect_ack_sent_generation = 0
+var _client_reconnect_state_revision = 0
+var _next_connection_generation = 0
+var _client_reconnect_ack_pending = false
+var _client_reconnect_ack_next_retry_msec = 0
+var _client_reconnect_ack_payload = {}
+var _p2p_channel_override_by_peer = {}
+var _reconnect_revision_override_by_peer = {}
 var _last_online_character_selection_restage_scene_id = 0
 var _bo_net_diag_cost_stats_by_scope = {}
 var _bo_net_diag_last_state_key_by_tag = {}
@@ -270,6 +311,14 @@ func _bo_net_diag_log(tag: String, msg: String) -> void:
 	if not BO_NET_DIAG_ENABLED:
 		return
 	print("[BO_LAG][NET][" + tag + "] " + msg)
+
+
+func _bo_conn_log(event: String, msg: String) -> void:
+	print("[BO_CONN][" + event + "] " + msg)
+
+
+func _bo_exit_log(reason: String, msg: String = "") -> void:
+	print("[BO_EXIT][" + reason + "] " + msg)
 
 
 
@@ -342,6 +391,185 @@ func _bo_net_diag_log_large_or_queued_send(target_steam_id: String, msg_type: St
 	_bo_net_diag_state_change("SEND", key, "reason=" + reason + " type=" + msg_type + " bytes=" + str(payload_size) + " channel=" + str(channel) + " reliable=" + str(reliable) + " pending=" + str(pending_count) + " target=" + target_steam_id, 1000)
 
 
+func _new_network_session(steam_id: String):
+	if _network_session_script == null:
+		return null
+	return _network_session_script.new(steam_id)
+
+
+func _get_peer_network_session(steam_id: String, create: bool = false):
+	if steam_id == "" or steam_id == "0":
+		return null
+	var session = _peer_session_by_steam_id.get(steam_id, null)
+	if session == null and create:
+		session = _new_network_session(steam_id)
+		if session != null:
+			_peer_session_by_steam_id[steam_id] = session
+	return session
+
+
+func _get_peer_connection_generation(steam_id: String) -> int:
+	if not _is_game_host() and steam_id == _get_game_host_steam_id():
+		return int(_client_connection_generation)
+	var session = _get_peer_network_session(steam_id, false)
+	if session == null:
+		return 0
+	return int(session.connection_generation)
+
+
+func _get_peer_connection_nonce(steam_id: String) -> String:
+	if not _is_game_host() and steam_id == _get_game_host_steam_id():
+		return _client_connection_nonce
+	var session = _get_peer_network_session(steam_id, false)
+	if session == null:
+		return ""
+	return str(session.connection_nonce)
+
+
+func _new_connection_nonce() -> String:
+	var rng = RandomNumberGenerator.new()
+	rng.randomize()
+	return "%08x%08x%08x%08x" % [rng.randi(), rng.randi(), rng.randi(), rng.randi()]
+
+
+func _set_network_session_state(next_state: String, reason: String = "") -> void:
+	if _client_session_state == next_state and reason == "":
+		return
+	_client_session_state = next_state
+	_bo_conn_log("STATE", "local_steam_id=" + _self_steam_id + " lobby_id=" + str(_lobby_id) + " state=" + next_state + " generation=" + str(_client_connection_generation) + " reason=" + reason)
+	_bo_net_diag_state_change("SESSION_STATE", next_state + ":" + reason, "state=" + next_state + " generation=" + str(_client_connection_generation) + " reason=" + reason, 500)
+
+
+func _clear_peer_transport_state(steam_id: String, reason: String = "", preserve_protocol_attempt: bool = false) -> void:
+	var session = _get_peer_network_session(steam_id, false)
+	if not preserve_protocol_attempt and session != null and session.has_method("clear_transport"):
+		session.clear_transport()
+	if _network_send_scheduler != null:
+		_network_send_scheduler.clear_peer(steam_id)
+	_p2p_channel_override_by_peer.erase(steam_id)
+	_reconnect_revision_override_by_peer.erase(steam_id)
+	for assembly_key in _incoming_p2p_chunks.keys():
+		if str(assembly_key).begins_with(steam_id + ":"):
+			_incoming_p2p_chunks.erase(assembly_key)
+	for key in [_sent_character_setup_key_by_steam_id, _sent_weapon_setup_key_by_steam_id, _sent_scene_transition_key_by_steam_id, _last_battle_snapshot_sent_tick_by_steam_id, _last_battle_reliable_sent_key_by_steam_id, _last_battle_terminal_state_key_by_steam_id, _last_battle_terminal_state_msec_by_steam_id]:
+		key.erase(steam_id)
+	var menu_sync = _get_menu_sync_manager()
+	if menu_sync != null and menu_sync.has_method("clear_connection_action_state"):
+		menu_sync.clear_connection_action_state(steam_id)
+	if _is_game_host():
+		var input_manager = _get_online_input_manager()
+		if input_manager != null and input_manager.has_method("clear_remote_input_for_steam_id"):
+			input_manager.clear_remote_input_for_steam_id(steam_id)
+	if not _is_game_host() and steam_id == _get_game_host_steam_id():
+		_local_run_page_action_seq = 0
+		_local_run_page_action_seq_by_stream.clear()
+		var battle_replica = _get_battle_replica_manager()
+		if battle_replica != null and battle_replica.has_method("clear_connection_state"):
+			battle_replica.clear_connection_state("peer_transport_reset:" + reason)
+	_bo_net_diag_log("PEER_TRANSPORT_RESET", "remote_steam_id=" + steam_id + " reason=" + reason + " pending=" + str(_pending_p2p_send_count()))
+
+
+func _pending_p2p_send_count() -> int:
+	return int(_network_send_scheduler.size()) if _network_send_scheduler != null else 0
+
+
+func _pending_p2p_sends_empty() -> bool:
+	return _network_send_scheduler == null or int(_network_send_scheduler.size()) <= 0
+
+
+func _begin_client_connection_generation(reason: String = "") -> int:
+	if _is_game_host() or _lobby_id == 0:
+		return 0
+	_client_connection_generation = 0
+	_client_connection_nonce = _new_connection_nonce()
+	_client_reconnect_ack_sent_generation = 0
+	_client_reconnect_state_revision = 0
+	_client_reconnect_ack_pending = false
+	_client_reconnect_ack_next_retry_msec = 0
+	_client_reconnect_ack_payload = {}
+	_set_network_session_state(SESSION_STATE_RECONNECTING, reason)
+	var host_id = _get_game_host_steam_id()
+	if host_id != "":
+		var session = _get_peer_network_session(host_id, true)
+		if session != null:
+			_clear_peer_transport_state(host_id, "client_generation:" + reason)
+			session.begin_client_attempt(_client_connection_nonce)
+	_bo_net_diag_log("PEER_ATTEMPT_CHANGED", "local_steam_id=" + _self_steam_id + " remote_steam_id=" + host_id + " connection_generation=0 connection_nonce=" + _client_connection_nonce + " reason=" + reason)
+	_bo_conn_log("GENERATION", "local_steam_id=" + _self_steam_id + " remote_steam_id=" + host_id + " connection_generation=0 connection_nonce=" + _client_connection_nonce + " reason=" + reason)
+	return _client_connection_generation
+
+
+func _host_register_peer_generation(steam_id: String, incoming_nonce: String, reason: String = "hello") -> Dictionary:
+	var session = _get_peer_network_session(steam_id, true)
+	if session == null or incoming_nonce == "":
+		return {"accepted": false, "new_generation": false, "generation": 0}
+	var registration = session.host_accept_hello(incoming_nonce, max(1, _online_session_generation))
+	if not bool(registration.get("accepted", false)):
+		return {"accepted": false, "new_generation": false, "generation": int(session.connection_generation)}
+	var is_new_generation = bool(registration.get("new_attempt", false))
+	var generation = int(registration.get("generation", 0))
+	if is_new_generation:
+		_clear_peer_transport_state(steam_id, "host_generation:" + reason, true)
+		_bo_net_diag_log("PEER_GENERATION_CHANGED", "remote_steam_id=" + steam_id + " connection_generation=" + str(generation) + " connection_nonce=" + incoming_nonce + " reason=" + reason)
+		_bo_conn_log("GENERATION", "remote_steam_id=" + steam_id + " connection_generation=" + str(generation) + " connection_nonce=" + incoming_nonce + " reason=" + reason)
+	return {"accepted": true, "new_generation": is_new_generation, "already_ready": bool(registration.get("already_ready", false)), "generation": generation, "nonce": incoming_nonce, "state_revision": int(registration.get("state_revision", 0)), "resend_phase": str(registration.get("resend_phase", "challenge"))}
+
+
+func _is_peer_session_ready(steam_id: String) -> bool:
+	if steam_id == "" or steam_id == "0":
+		return false
+	if not _is_game_host() and steam_id == _get_game_host_steam_id():
+		return _client_session_state == SESSION_STATE_READY
+	var session = _get_peer_network_session(steam_id, false)
+	return session != null and bool(session.can_send_input) and str(session.state) == SESSION_STATE_READY
+
+
+func _is_reconnect_control_message(msg_type: String) -> bool:
+	return ["hello", "protocol_reject", "reconnect_required", "reconnect_challenge", "reconnect_confirm", "reconnect_full_state_begin", "reconnect_full_state", "reconnect_full_state_ack", "reconnect_complete", "request_selection_state"].has(msg_type)
+
+
+func _mark_client_reconnect_state_received(message: Dictionary, reason: String) -> void:
+	if _is_game_host() or _client_connection_generation <= 0:
+		return
+	var generation = int(message.get("connection_generation", 0))
+	var nonce = str(message.get("connection_nonce", ""))
+	if generation != _client_connection_generation or nonce == "" or nonce != _client_connection_nonce:
+		return
+	var revision = int(message.get("state_revision", message.get("revision", 1)))
+	if revision <= 0:
+		revision = 1
+	_client_reconnect_state_revision = max(_client_reconnect_state_revision, revision)
+	var host_session = _get_peer_network_session(_get_game_host_steam_id(), false)
+	if host_session == null:
+		return
+	if reason != "reconnect_full_state":
+		host_session.apply_periodic_revision(revision)
+		if str(host_session.state) != "READY":
+			var component = _reconnect_component_for_message_type(reason)
+			if component != "":
+				host_session.mark_full_state_component_revision(nonce, generation, revision, component)
+			_set_network_session_state(SESSION_STATE_RESYNCING, reason)
+		return
+	if not host_session.can_ack_full_state(nonce, generation, revision):
+		_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + _get_game_host_steam_id() + " msg_type=reconnect_full_state reason=FULL_STATE_INCOMPLETE connection_generation=" + str(generation) + " connection_nonce=" + nonce + " revision=" + str(revision))
+		return
+	_set_network_session_state(SESSION_STATE_RESYNCING, reason)
+	_queue_client_reconnect_ack({
+		"msg_type": "reconnect_full_state_ack",
+		"state_revision": _client_reconnect_state_revision,
+		"connection_generation": generation,
+		"connection_nonce": nonce,
+		"handshake": "CLIENT_FULL_STATE_ACK"
+	})
+	_bo_net_diag_log("RESYNC_COMPLETE", "local_steam_id=" + _self_steam_id + " remote_steam_id=" + _get_game_host_steam_id() + " connection_generation=" + str(generation) + " revision=" + str(_client_reconnect_state_revision) + " reason=" + reason)
+
+
+func _reconnect_component_for_message_type(msg_type: String) -> String:
+	if ["host_character_setup", "host_weapon_setup", "menu_scene_state", "selection_state", "battle_snapshot"].has(msg_type):
+		return msg_type
+	return ""
+
+
 func _connect_ui_language_signal() -> void:
 	if ProgressData == null:
 		return
@@ -386,12 +614,29 @@ func _ready() -> void:
 	pause_mode = Node.PAUSE_MODE_PROCESS
 	set_process(true)
 	set_process_input(true)
+	_network_session_script = load("res://mods-unpacked/six666-BrotatoOnline/scripts/network_session_state.gd")
+	if _network_session_script == null:
+		_network_session_script = load("res://scripts/network_session_state.gd")
+	if _network_session_script != null:
+		_host_action_relay_session = _network_session_script.new("host-action-relay")
+	_network_send_scheduler_script = load("res://mods-unpacked/six666-BrotatoOnline/scripts/network_send_scheduler.gd")
+	if _network_send_scheduler_script == null:
+		_network_send_scheduler_script = load("res://scripts/network_send_scheduler.gd")
+	if _network_send_scheduler_script != null:
+		_network_send_scheduler = _network_send_scheduler_script.new(P2P_JSON_MAX_PENDING_PER_PEER, P2P_JSON_MAX_PENDING_TOTAL, P2P_JSON_MAX_PENDING_AGE_MSEC, P2P_JSON_CHUNK_RETRY_DELAY_MSEC)
+	_steam_callback_driver_script = load("res://mods-unpacked/six666-BrotatoOnline/scripts/steam_callback_driver.gd")
+	if _steam_callback_driver_script == null:
+		_steam_callback_driver_script = load("res://scripts/steam_callback_driver.gd")
+	if _steam_callback_driver_script != null:
+		_steam_callback_driver = _steam_callback_driver_script.new()
 	_connect_ui_language_signal()
 	_setup_steam()
 	_connect_steam_signals()
 	_clear_stale_join_presence_at_boot()
 	call_deferred("_check_launch_join_args")
 	_update_online_session_runtime_flag()
+	_set_network_session_state(SESSION_STATE_DISCONNECTED, "ready")
+	_bo_conn_log("BOOT", "protocol=" + str(NETWORK_PROTOCOL_VERSION) + " mod_version=" + MOD_VERSION)
 
 
 func _input(_event: InputEvent) -> void:
@@ -410,7 +655,9 @@ func _process(_delta: float) -> void:
 	if callback_poll_due:
 		_last_steam_callback_poll_usec = now_usec
 		var t_callbacks = OS.get_ticks_usec()
-		_run_steam_callbacks()
+		_refresh_steam_callback_owner()
+		if not _steam_callbacks_auto_driven:
+			_run_steam_callbacks()
 		_bo_net_diag_cost("steam_callbacks", t_callbacks)
 
 	# Scene/UI/phase discovery is deliberately slow. These paths perform node searches,
@@ -465,6 +712,7 @@ func _process(_delta: float) -> void:
 		_poll_client_game_start_commit()
 		_poll_client_game_scene_ready()
 		_poll_client_hello_retry()
+		_poll_client_reconnect_ack_retry()
 		_bo_net_diag_cost("poll_game_start_sync", t_start)
 
 	# Receive menu and battle traffic independently. Browser probes share the menu
@@ -478,11 +726,11 @@ func _process(_delta: float) -> void:
 			_last_p2p_battle_poll_usec = now_usec
 		var t_p2p = OS.get_ticks_usec()
 		_poll_p2p_packets(menu_receive_due, battle_receive_due)
-		_bo_net_diag_cost("poll_p2p_packets", t_p2p, "menu=" + str(menu_receive_due) + " battle=" + str(battle_receive_due) + " pending_chunks=" + str(_pending_p2p_chunk_sends.size()))
+		_bo_net_diag_cost("poll_p2p_packets", t_p2p, "menu=" + str(menu_receive_due) + " battle=" + str(battle_receive_due) + " pending_chunks=" + str(_pending_p2p_send_count()))
 
 	var t_chunks = OS.get_ticks_usec()
 	_poll_pending_p2p_chunk_sends()
-	_bo_net_diag_cost("poll_pending_chunks", t_chunks, "pending_chunks=" + str(_pending_p2p_chunk_sends.size()))
+	_bo_net_diag_cost("poll_pending_chunks", t_chunks, "pending_chunks=" + str(_pending_p2p_send_count()))
 
 	# Menu input/actions remain responsive without scanning their queues every frame.
 	var menu_action_due = _last_menu_action_poll_usec == 0 or now_usec - _last_menu_action_poll_usec >= MENU_ACTION_POLL_INTERVAL_USEC
@@ -506,7 +754,7 @@ func _process(_delta: float) -> void:
 		_poll_and_broadcast_selection_state()
 		_poll_online_flow_lifecycle()
 		_bo_net_diag_cost("poll_phase_selection", t_phase)
-	_bo_net_diag_cost("steam_process_total", process_start_usec, "in_game=" + str(_cached_in_game_scene) + " pending_chunks=" + str(_pending_p2p_chunk_sends.size()))
+	_bo_net_diag_cost("steam_process_total", process_start_usec, "in_game=" + str(_cached_in_game_scene) + " pending_chunks=" + str(_pending_p2p_send_count()))
 
 func create_lobby_and_invite(open_overlay_after_create: bool = false) -> void:
 	# F6, the Run Options toggle, and the invite button share this path.
@@ -620,12 +868,14 @@ func join_lobby(lobby_id) -> void:
 		# If the first handshake was lost or suppressed by stale reliable packets, this left
 		# the client stuck until the host restarted. Treat it as a handshake refresh.
 		if not _is_game_host():
+			if not _is_peer_session_ready(_get_game_host_steam_id()):
+				_begin_client_connection_generation("same_lobby_join_refresh")
 			_start_client_hello_retry()
 			_send_client_hello_to_host()
 		return
 
 	if _lobby_id != 0:
-		leave_lobby()
+		leave_lobby("join_lobby_replace")
 
 	_reset_transient_online_state_for_new_session("join_lobby")
 	_client_join_requested_lobby_id = target_lobby_id
@@ -641,9 +891,22 @@ func join_lobby(lobby_id) -> void:
 		_show_join_failure(_ui_text("join_failed_steam_unavailable"))
 
 
-func leave_lobby() -> void:
+func leave_lobby(reason: String = "user") -> void:
 	var leaving_lobby_id = _lobby_id
+	var was_online_client = _online_role == "client"
+	_bo_exit_log(reason, "local_steam_id=" + _self_steam_id + " lobby_id=" + str(leaving_lobby_id) + " role=" + _online_role)
 	_bump_online_session_generation("leave_lobby")
+	for peer_id in _peer_session_by_steam_id.keys():
+		_clear_peer_transport_state(str(peer_id), "leave_lobby")
+	_peer_session_by_steam_id.clear()
+	_client_connection_generation = 0
+	_client_connection_nonce = ""
+	_client_reconnect_ack_sent_generation = 0
+	_client_reconnect_state_revision = 0
+	_client_reconnect_ack_pending = false
+	_client_reconnect_ack_next_retry_msec = 0
+	_client_reconnect_ack_payload = {}
+	_set_network_session_state(SESSION_STATE_DISCONNECTED, "leave_lobby")
 	_restore_client_retry_wave_setting_override()
 	_close_tracked_p2p_sessions()
 	_lobby_toggle_pending_create = false
@@ -683,7 +946,8 @@ func leave_lobby() -> void:
 	_sent_weapon_setup_key_by_steam_id.clear()
 	_sent_scene_transition_key_by_steam_id.clear()
 	_full_item_list_scene_sync_required_by_steam_id.clear()
-	_pending_p2p_chunk_sends.clear()
+	if _network_send_scheduler != null:
+		_network_send_scheduler.clear()
 	_incoming_p2p_chunks.clear()
 	_seen_client_hello_by_steam_id.clear()
 	_client_seen_host_setup_key_by_sender.clear()
@@ -707,7 +971,7 @@ func leave_lobby() -> void:
 	var slot_manager = _get_slot_manager()
 	if slot_manager != null:
 		if slot_manager.has_method("online_reset_to_offline"):
-			slot_manager.online_reset_to_offline("leave_lobby")
+			slot_manager.online_reset_to_offline("leave_lobby_client" if was_online_client else "leave_lobby")
 		elif slot_manager.has_method("online_clear_remote_players"):
 			slot_manager.online_clear_remote_players()
 
@@ -867,13 +1131,42 @@ func _try_init_steam() -> void:
 	# Do not call Steam.loggedOn() here. Some Brotato/GodotSteam builds expose the
 	# method name but fail at runtime with "User class not found when calling loggedOn".
 	# steamInitEx/steamInit plus getSteamID() is enough for this mod stage.
-	if _steam_has_method("steamInitEx"):
-		var init_result = _steam.steamInitEx(BROTATO_APP_ID, true)
-	elif _steam_has_method("steamInit"):
-		var init_result2 = _steam.steamInit()
+	var tree = get_tree()
+	var existing_auto_callback_owner = false
+	if tree != null and tree.has_method("is_connected"):
+		if _steam_has_method("run_callbacks"):
+			existing_auto_callback_owner = tree.is_connected("idle_frame", _steam, "run_callbacks")
+		if _steam_has_method("runCallbacks"):
+			existing_auto_callback_owner = existing_auto_callback_owner or tree.is_connected("idle_frame", _steam, "runCallbacks")
+	_steam_callbacks_auto_driven = existing_auto_callback_owner
+	if not existing_auto_callback_owner:
+		if _steam_has_method("steamInitEx"):
+			var init_result = _steam.steamInitEx(BROTATO_APP_ID, true)
+		elif _steam_has_method("steamInit"):
+			var init_result2 = _steam.steamInit()
 
 	if _steam_has_method("initRelayNetworkAccess"):
 		_steam.initRelayNetworkAccess()
+
+	# GodotSteam can attach run_callbacks to SceneTree.idle_frame when the
+	# second steamInitEx argument is true, or require a manual caller. Detect the
+	# actual connection so both callback owners are never active at once.
+	_steam_callbacks_auto_driven = false
+	if tree != null and tree.has_method("is_connected"):
+		if _steam_has_method("run_callbacks"):
+			_steam_callbacks_auto_driven = tree.is_connected("idle_frame", _steam, "run_callbacks")
+		if _steam_has_method("runCallbacks"):
+			_steam_callbacks_auto_driven = _steam_callbacks_auto_driven or tree.is_connected("idle_frame", _steam, "runCallbacks")
+	_bo_net_diag_log("STEAM_CALLBACK_OWNER", "auto_driven=" + str(_steam_callbacks_auto_driven) + " manual_poll=" + str(not _steam_callbacks_auto_driven))
+
+
+func _refresh_steam_callback_owner() -> void:
+	if _steam_callback_driver == null:
+		return
+	var next_auto_driven = not bool(_steam_callback_driver.should_run_manual(get_tree(), _steam))
+	if next_auto_driven != _steam_callbacks_auto_driven:
+		_steam_callbacks_auto_driven = next_auto_driven
+		_bo_net_diag_log("STEAM_CALLBACK_OWNER", "auto_driven=" + str(_steam_callbacks_auto_driven) + " manual_poll=" + str(not _steam_callbacks_auto_driven) + " reason=dynamic_owner_check")
 
 
 func _connect_steam_signals() -> void:
@@ -929,6 +1222,7 @@ func _on_lobby_created(connect_result = 0, lobby_id = 0) -> void:
 	_is_lobby_owner = true
 	_online_role = "host"
 	_game_host_steam_id = _self_steam_id
+	_set_network_session_state(SESSION_STATE_LOBBY_CONNECTED, "lobby_created")
 	_unlock_online_run_slots()
 	_online_flow_started = true
 	_online_flow_left_since_msec = 0
@@ -939,6 +1233,7 @@ func _on_lobby_created(connect_result = 0, lobby_id = 0) -> void:
 	_last_selection_request_reply_msec_by_steam_id.clear()
 	_last_selection_request_setup_msec_by_steam_id.clear()
 	_direct_upgrade_ui_instance_id = 0
+	_local_run_page_action_seq_by_stream.clear()
 	_direct_upgrade_local_actions.clear()
 	_direct_upgrade_seen_action_ids.clear()
 	_direct_upgrade_pending_remote_actions.clear()
@@ -958,7 +1253,7 @@ func _on_lobby_created(connect_result = 0, lobby_id = 0) -> void:
 
 	if _lobby_toggle_close_after_create:
 		_lobby_toggle_close_after_create = false
-		leave_lobby()
+		leave_lobby("lobby_toggle_close_after_create")
 		return
 
 	_update_lobby_toggle_button_state()
@@ -990,6 +1285,13 @@ func _on_lobby_joined(lobby_id = 0, permissions = 0, locked = false, response = 
 	_pending_join_lobby_id = 0
 	_online_flow_left_since_msec = 0
 	_update_self_steam_id()
+	var compatibility = _validate_joined_lobby_compatibility(lobby_id)
+	if not bool(compatibility.get("accepted", false)):
+		var failure_text = "Brotato Online lobby requires Mod " + MOD_VERSION + " / protocol v" + str(NETWORK_PROTOCOL_VERSION) + ". Update every player before joining."
+		_bo_conn_log("PROTOCOL_REJECT", "lobby_id=" + str(lobby_id) + " local_mod_version=" + MOD_VERSION + " local_protocol=" + str(NETWORK_PROTOCOL_VERSION) + " remote_mod_version=" + str(compatibility.get("mod_version", "")) + " remote_protocol=" + str(compatibility.get("protocol_version", 0)) + " reason=" + str(compatibility.get("reason", "INCOMPATIBLE_LOBBY")))
+		leave_lobby("incompatible_lobby")
+		_show_join_failure(failure_text)
+		return
 	_update_lobby_owner_state()
 	var lobby_host_id = _read_lobby_game_host_steam_id()
 	var owner_id = _get_lobby_owner_id()
@@ -1004,7 +1306,7 @@ func _on_lobby_joined(lobby_id = 0, permissions = 0, locked = false, response = 
 			_game_host_steam_id = owner_id
 			_online_role = "client"
 		else:
-			leave_lobby()
+			leave_lobby("stale_lobby")
 			_show_join_failure(_ui_text("join_failed_stale"))
 			return
 	else:
@@ -1024,8 +1326,10 @@ func _on_lobby_joined(lobby_id = 0, permissions = 0, locked = false, response = 
 		_setup_lobby_data()
 		_setup_join_presence()
 		_stop_client_hello_retry("joined_as_host")
+		_set_network_session_state(SESSION_STATE_LOBBY_CONNECTED, "joined_as_host")
 	else:
 		_setup_client_presence()
+		_begin_client_connection_generation("lobby_joined")
 		_start_client_hello_retry()
 	_refresh_lobby_members(true)
 	_update_lobby_toggle_button_state()
@@ -1036,6 +1340,21 @@ func _on_lobby_joined(lobby_id = 0, permissions = 0, locked = false, response = 
 	_update_online_session_runtime_flag()
 	if not _is_game_host():
 		_send_client_hello_to_host()
+
+
+func _validate_joined_lobby_compatibility(lobby_id) -> Dictionary:
+	if _steam == null or not _steam_has_method("getLobbyData"):
+		return {"accepted": false, "reason": "LOBBY_METADATA_UNAVAILABLE"}
+	var mod_id = str(_steam.getLobbyData(lobby_id, "mod"))
+	var mod_version = str(_steam.getLobbyData(lobby_id, "mod_version"))
+	var protocol_version = int(str(_steam.getLobbyData(lobby_id, "protocol_version")))
+	if mod_id != ProtocolConfig.MOD_ID:
+		return {"accepted": false, "reason": "MOD_ID_MISMATCH", "mod_version": mod_version, "protocol_version": protocol_version}
+	if mod_version != MOD_VERSION:
+		return {"accepted": false, "reason": "MOD_VERSION_MISMATCH", "mod_version": mod_version, "protocol_version": protocol_version}
+	if protocol_version != NETWORK_PROTOCOL_VERSION:
+		return {"accepted": false, "reason": "PROTOCOL_MISMATCH", "mod_version": mod_version, "protocol_version": protocol_version}
+	return {"accepted": true, "reason": "OK", "mod_version": mod_version, "protocol_version": protocol_version}
 
 
 func _clear_pending_join_request() -> void:
@@ -1182,6 +1501,7 @@ func _setup_lobby_data() -> void:
 			host_name = host_name.substr(0, 64)
 		_steam.setLobbyData(_lobby_id, "mod", "six666-BrotatoOnline")
 		_steam.setLobbyData(_lobby_id, "mod_version", MOD_VERSION)
+		_steam.setLobbyData(_lobby_id, "protocol_version", str(NETWORK_PROTOCOL_VERSION))
 		_steam.setLobbyData(_lobby_id, "game_version", "1.1.15.4")
 		_steam.setLobbyData(_lobby_id, "state", "character_selection")
 		_steam.setLobbyData(_lobby_id, "host", _self_steam_id)
@@ -1274,9 +1594,18 @@ func _refresh_lobby_members(force_slot_sync: bool = false) -> void:
 
 	current_member_ids.sort()
 	var membership_changed = to_json(previous_member_ids) != to_json(current_member_ids)
+	for previous_id in previous_member_ids:
+		var departed_id = str(previous_id)
+		if departed_id == "" or departed_id == _self_steam_id or current_member_ids.has(departed_id):
+			continue
+		_clear_peer_transport_state(departed_id, "lobby_member_left")
+		_peer_session_by_steam_id.erase(departed_id)
+		_accepted_p2p_sessions.erase(departed_id)
+		_host_known_remote_ids.erase(departed_id)
+		_bo_exit_log("peer_left", "remote_steam_id=" + departed_id + " lobby_id=" + str(_lobby_id))
 
 	if not _is_game_host() and _game_host_steam_id != "" and not _member_list_has_steam_id(_game_host_steam_id):
-		leave_lobby()
+		leave_lobby("host_left_lobby")
 		return
 
 	# Ordinary lobby metadata updates (state, host name, visibility, etc.) must not
@@ -1541,9 +1870,15 @@ func _poll_and_send_local_run_page_actions() -> void:
 			continue
 		# Shop/upgrade focus packets are cosmetic. Receivers apply shop focus visual-only
 		# and clients ignore their own echoed focus packets.
-		_local_run_page_action_seq += 1
+		var action_stream = _get_run_page_action_stream(msg)
+		var next_stream_seq = int(_local_run_page_action_seq_by_stream.get(action_stream, 0)) + 1
+		_local_run_page_action_seq_by_stream[action_stream] = next_stream_seq
+		_local_run_page_action_seq = max(_local_run_page_action_seq, next_stream_seq)
 		msg["origin_steam_id"] = _self_steam_id
-		msg["action_id"] = _self_steam_id + ":" + str(_local_run_page_action_seq)
+		msg["action_stream"] = action_stream
+		msg["stream"] = action_stream
+		msg["sequence"] = next_stream_seq
+		msg["action_id"] = _self_steam_id + ":" + action_stream + ":" + str(next_stream_seq)
 		if _is_game_host():
 			_broadcast_run_page_action_sync(msg, "")
 		else:
@@ -1552,6 +1887,8 @@ func _poll_and_send_local_run_page_actions() -> void:
 
 func _client_should_drop_stale_menu_scene_state(message: Dictionary) -> bool:
 	if _is_game_host():
+		return false
+	if bool(message.get("reconnect_sync", false)):
 		return false
 	var screen = str(message.get("screen", ""))
 	if screen == "":
@@ -1667,6 +2004,9 @@ func _route_host_shop_buy_result(from_steam_id: String, request: Dictionary, res
 	base.erase("host_states_after")
 	if result.has("steal_extra_enemies_next_wave"):
 		base["steal_extra_enemies_next_wave"] = result.get("steal_extra_enemies_next_wave", []).duplicate(true)
+	base = _prepare_host_relay_run_page_action(base)
+	if base.empty():
+		return
 
 	if bool(result.get("host_applied", false)):
 		# The requester already executed the real purchase. Send only an acknowledgement
@@ -1700,13 +2040,48 @@ func _route_host_shop_buy_result(from_steam_id: String, request: Dictionary, res
 func _broadcast_run_page_action_sync(message: Dictionary, except_steam_id: String = "") -> void:
 	if not _is_game_host() or _lobby_id == 0:
 		return
+	var outbound = _prepare_host_relay_run_page_action(message)
+	if outbound.empty():
+		return
 	for member in _members:
 		var steam_id = str(member.get("steam_id", ""))
 		if steam_id == "" or steam_id == _self_steam_id:
 			continue
 		if except_steam_id != "" and steam_id == except_steam_id:
 			continue
-		_send_p2p_json(steam_id, message, true)
+		_send_p2p_json(steam_id, outbound, true)
+
+
+func _prepare_host_relay_run_page_action(message: Dictionary) -> Dictionary:
+	if typeof(message) != TYPE_DICTIONARY or message.empty():
+		return {}
+	var outbound = message.duplicate(true)
+	if bool(outbound.get("_host_relay_sequence", false)):
+		return outbound
+	var origin = str(outbound.get("origin_steam_id", ""))
+	var stream = str(outbound.get("action_stream", ""))
+	if origin == "" or stream == "" or _host_action_relay_session == null:
+		return {}
+	var relay_sequence = int(_host_action_relay_session.next_outbound_stream_sequence(origin, stream))
+	if relay_sequence <= 0:
+		return {}
+	outbound["origin_sequence"] = int(outbound.get("sequence", 0))
+	outbound["sequence"] = relay_sequence
+	outbound["action_id"] = origin + ":" + stream + ":" + str(relay_sequence)
+	outbound["_host_relay_sequence"] = true
+	outbound.erase("_bo_sequence_validated")
+	return outbound
+
+
+func _get_run_page_action_stream(message: Dictionary) -> String:
+	var action_type = str(message.get("action_type", ""))
+	if action_type == "shop_focus" or action_type == "upgrade_focus":
+		return "state"
+	if action_type.begins_with("shop_"):
+		return "shop_event"
+	if action_type.begins_with("upgrade_") or action_type.begins_with("item_box_"):
+		return "progression_event"
+	return "control"
 
 
 func _clear_focus_input_transition_guards() -> void:
@@ -1735,6 +2110,17 @@ func _bump_online_session_generation(reason: String = "") -> void:
 func _reset_transient_online_state_for_new_session(reason: String = "") -> void:
 	_stop_client_hello_retry("new_session:" + str(reason))
 	_bump_online_session_generation(reason)
+	_peer_session_by_steam_id.clear()
+	if _host_action_relay_session != null:
+		_host_action_relay_session.clear_transport()
+	_client_connection_generation = 0
+	_client_connection_nonce = ""
+	_client_reconnect_ack_sent_generation = 0
+	_client_reconnect_state_revision = 0
+	_client_reconnect_ack_pending = false
+	_client_reconnect_ack_next_retry_msec = 0
+	_client_reconnect_ack_payload = {}
+	_set_network_session_state(SESSION_STATE_LOBBY_CONNECTED, "new_session:" + str(reason))
 	_restore_client_retry_wave_setting_override()
 	_last_online_character_selection_restage_scene_id = 0
 	# Clear per-lobby runtime state before accepting a new lobby/session. Steam reliable P2P
@@ -1749,7 +2135,8 @@ func _reset_transient_online_state_for_new_session(reason: String = "") -> void:
 	_sent_weapon_setup_key_by_steam_id.clear()
 	_sent_scene_transition_key_by_steam_id.clear()
 	_full_item_list_scene_sync_required_by_steam_id.clear()
-	_pending_p2p_chunk_sends.clear()
+	if _network_send_scheduler != null:
+		_network_send_scheduler.clear()
 	_incoming_p2p_chunks.clear()
 	_pending_received_menu_focus_by_sender.clear()
 	_pending_received_menu_focus_order.clear()
@@ -1774,6 +2161,7 @@ func _reset_transient_online_state_for_new_session(reason: String = "") -> void:
 	_pending_client_game_scene_ready_start_id = 0
 	_sent_client_game_scene_ready_start_id = 0
 	_direct_upgrade_ui_instance_id = 0
+	_local_run_page_action_seq_by_stream.clear()
 	_direct_upgrade_local_actions.clear()
 	_direct_upgrade_seen_action_ids.clear()
 	_direct_upgrade_pending_remote_actions.clear()
@@ -1786,8 +2174,11 @@ func _reset_transient_online_state_for_new_session(reason: String = "") -> void:
 		battle_replica._clear_all("new_session:" + str(reason))
 
 
-func _annotate_online_session_message(message: Dictionary) -> Dictionary:
+func _annotate_online_session_message(message: Dictionary, target_steam_id: String = "") -> Dictionary:
 	var wire = message.duplicate(true)
+	wire.erase("_bo_sequence_validated")
+	wire.erase("_host_relay_sequence")
+	wire["protocol_version"] = NETWORK_PROTOCOL_VERSION
 	if _lobby_id != 0:
 		wire["lobby_id"] = str(_lobby_id)
 		wire["session_lobby_id"] = str(_lobby_id)
@@ -1796,6 +2187,19 @@ func _annotate_online_session_message(message: Dictionary) -> Dictionary:
 		wire["game_host_steam_id"] = host_id
 	if _self_steam_id != "":
 		wire["sender_steam_id"] = _self_steam_id
+	var generation = _get_peer_connection_generation(target_steam_id)
+	if generation > 0:
+		wire["connection_generation"] = generation
+		wire["session_epoch"] = generation
+	var connection_nonce = _get_peer_connection_nonce(target_steam_id)
+	if connection_nonce != "":
+		wire["connection_nonce"] = connection_nonce
+	if _reconnect_revision_override_by_peer.has(target_steam_id):
+		wire["state_revision"] = int(_reconnect_revision_override_by_peer[target_steam_id])
+	elif _is_game_host() and not wire.has("state_revision"):
+		wire["state_revision"] = max(1, _online_session_generation)
+	if _p2p_channel_override_by_peer.has(target_steam_id) and _reconnect_component_for_message_type(str(wire.get("msg_type", ""))) != "":
+		wire["reconnect_sync"] = true
 	_annotate_battle_generation_fields(wire)
 	return wire
 
@@ -1913,11 +2317,11 @@ func _get_message_lobby_id(message: Dictionary) -> String:
 
 
 func _is_known_online_message_type(msg_type: String) -> bool:
-	return msg_type == "hello" or msg_type == "request_selection_state" or msg_type == "menu_focus" or msg_type == "select_character" or msg_type == "select_weapon" or msg_type == "select_difficulty" or msg_type == "select_zone" or msg_type == "host_character_setup" or msg_type == "host_weapon_setup" or msg_type == "game_start_prepare" or msg_type == "game_start_time_ack" or msg_type == "client_game_scene_ready" or msg_type == "game_start_commit" or msg_type == "retry_wave_confirm" or msg_type == "retry_wave_decline" or msg_type == "retry_wave_state" or msg_type == "retry_wave_end" or msg_type == "menu_scene_state" or msg_type == "run_page_action_sync" or msg_type == "quick_chat" or msg_type == "battle_reliable_events" or msg_type == "battle_snapshot" or msg_type == "battle_terminal_state" or msg_type == "selection_state" or msg_type == "battle_input" or msg_type == "damage_claim_batch" or msg_type == "player_hp_state" or msg_type == "player_state" or msg_type == "entity_kill_claim" or msg_type == "boss_damage_report" or msg_type == "pickup_claim" or msg_type == "battle_entity_resync_request" or msg_type == "upgrade_direct_action" or msg_type == "bo_mod_message"
+	return msg_type == "hello" or msg_type == "protocol_reject" or msg_type == "reconnect_required" or msg_type == "reconnect_challenge" or msg_type == "reconnect_confirm" or msg_type == "reconnect_full_state_begin" or msg_type == "reconnect_full_state" or msg_type == "reconnect_full_state_ack" or msg_type == "reconnect_complete" or msg_type == "request_selection_state" or msg_type == "menu_focus" or msg_type == "select_character" or msg_type == "select_weapon" or msg_type == "select_difficulty" or msg_type == "select_zone" or msg_type == "host_character_setup" or msg_type == "host_weapon_setup" or msg_type == "game_start_prepare" or msg_type == "game_start_time_ack" or msg_type == "client_game_scene_ready" or msg_type == "game_start_commit" or msg_type == "retry_wave_confirm" or msg_type == "retry_wave_decline" or msg_type == "retry_wave_state" or msg_type == "retry_wave_end" or msg_type == "menu_scene_state" or msg_type == "run_page_action_sync" or msg_type == "quick_chat" or msg_type == "battle_reliable_events" or msg_type == "battle_snapshot" or msg_type == "battle_terminal_state" or msg_type == "selection_state" or msg_type == "battle_input" or msg_type == "damage_claim_batch" or msg_type == "player_hp_state" or msg_type == "player_state" or msg_type == "entity_kill_claim" or msg_type == "boss_damage_report" or msg_type == "pickup_claim" or msg_type == "battle_entity_resync_request" or msg_type == "upgrade_direct_action" or msg_type == "bo_mod_message"
 
 
 func _is_host_authoritative_message_type(msg_type: String) -> bool:
-	return msg_type == "host_character_setup" or msg_type == "host_weapon_setup" or msg_type == "game_start_prepare" or msg_type == "game_start_commit" or msg_type == "retry_wave_state" or msg_type == "retry_wave_end" or msg_type == "menu_scene_state" or msg_type == "run_page_action_sync" or msg_type == "quick_chat" or msg_type == "battle_reliable_events" or msg_type == "battle_snapshot" or msg_type == "battle_terminal_state" or msg_type == "selection_state" or msg_type == "upgrade_direct_action"
+	return msg_type == "protocol_reject" or msg_type == "reconnect_required" or msg_type == "reconnect_challenge" or msg_type == "reconnect_full_state_begin" or msg_type == "reconnect_full_state" or msg_type == "reconnect_complete" or msg_type == "host_character_setup" or msg_type == "host_weapon_setup" or msg_type == "game_start_prepare" or msg_type == "game_start_commit" or msg_type == "retry_wave_state" or msg_type == "retry_wave_end" or msg_type == "menu_scene_state" or msg_type == "run_page_action_sync" or msg_type == "quick_chat" or msg_type == "battle_reliable_events" or msg_type == "battle_snapshot" or msg_type == "battle_terminal_state" or msg_type == "selection_state" or msg_type == "upgrade_direct_action"
 
 
 func _should_drop_p2p_message_for_session(from_steam_id: String, message: Dictionary) -> bool:
@@ -1930,9 +2334,65 @@ func _should_drop_p2p_message_for_session(from_steam_id: String, message: Dictio
 
 	var message_lobby_id = _get_message_lobby_id(message)
 	if message_lobby_id == "":
+		_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + from_steam_id + " msg_type=" + msg_type + " reason=MISSING_LOBBY")
 		return true
 	if message_lobby_id != str(_lobby_id):
+		_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + from_steam_id + " msg_type=" + msg_type + " reason=LOBBY_MISMATCH incoming=" + message_lobby_id + " expected=" + str(_lobby_id))
 		return true
+	var incoming_protocol = int(message.get("protocol_version", 0))
+	if incoming_protocol != NETWORK_PROTOCOL_VERSION:
+		_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + from_steam_id + " msg_type=" + msg_type + " reason=PROTOCOL_MISMATCH incoming=" + str(incoming_protocol) + " expected=" + str(NETWORK_PROTOCOL_VERSION))
+		if _is_game_host() and msg_type == "hello" and _is_current_lobby_remote_member(from_steam_id):
+			_send_protocol_reject(from_steam_id, incoming_protocol)
+		return true
+	if str(message.get("sender_steam_id", "")) != from_steam_id:
+		_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + from_steam_id + " msg_type=" + msg_type + " reason=SENDER_MISMATCH envelope=" + str(message.get("sender_steam_id", "")))
+		return true
+	var expected_host_id = _get_game_host_steam_id()
+	if expected_host_id != "" and str(message.get("game_host_steam_id", "")) != expected_host_id:
+		_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + from_steam_id + " msg_type=" + msg_type + " reason=HOST_MISMATCH incoming=" + str(message.get("game_host_steam_id", "")) + " expected=" + expected_host_id)
+		return true
+
+	# Hello establishes a new Host-assigned generation. Validate membership and nonce,
+	# but never compare it against the previous generation before registration.
+	if msg_type == "hello":
+		if not _is_game_host() or str(message.get("connection_nonce", "")) == "":
+			return true
+		return not _is_current_lobby_remote_member(from_steam_id)
+
+	if not _is_game_host() and (msg_type == "protocol_reject" or msg_type == "reconnect_required"):
+		return from_steam_id != expected_host_id
+
+	# Challenge is the only message that assigns a generation to the active client
+	# attempt. Its nonce must already match the Hello attempt.
+	if not _is_game_host() and msg_type == "reconnect_challenge":
+		var challenge_nonce = str(message.get("connection_nonce", ""))
+		return from_steam_id != expected_host_id or challenge_nonce == "" or challenge_nonce != _client_connection_nonce or int(message.get("connection_generation", 0)) <= 0
+
+	var incoming_generation = int(message.get("connection_generation", message.get("session_epoch", 0)))
+	var expected_generation = _get_peer_connection_generation(from_steam_id)
+	if expected_generation > 0 and incoming_generation <= 0:
+		_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + from_steam_id + " msg_type=" + msg_type + " reason=MISSING_GENERATION expected=" + str(expected_generation))
+		return true
+	if incoming_generation <= 0 or expected_generation <= 0 or incoming_generation != expected_generation:
+		_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + from_steam_id + " msg_type=" + msg_type + " reason=STALE_GENERATION incoming=" + str(incoming_generation) + " expected=" + str(expected_generation))
+		return true
+	var session = _get_peer_network_session(from_steam_id, false)
+	if session == null:
+		return true
+	var envelope_result = session.validate_envelope(message, {
+		"protocol_version": NETWORK_PROTOCOL_VERSION,
+		"lobby_id": str(_lobby_id),
+		"host_steam_id": expected_host_id,
+		"sender_steam_id": from_steam_id
+	})
+	if not bool(envelope_result.get("accepted", false)):
+		_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + from_steam_id + " msg_type=" + msg_type + " reason=" + str(envelope_result.get("reason", "INVALID_ENVELOPE")) + " generation=" + str(incoming_generation) + " connection_nonce=" + str(message.get("connection_nonce", "")))
+		return true
+	if _is_game_host() and not _is_reconnect_control_message(msg_type):
+		if not _is_peer_session_ready(from_steam_id):
+			_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + from_steam_id + " msg_type=" + msg_type + " reason=SESSION_NOT_READY generation=" + str(expected_generation))
+			return true
 
 	# Client hello is sent only after Steam reports lobby_joined. The helper also
 	# queries Steam directly when the cached member list has not received its chat
@@ -1944,6 +2404,21 @@ func _should_drop_p2p_message_for_session(from_steam_id: String, message: Dictio
 		var host_id = _get_game_host_steam_id()
 		if host_id != "" and from_steam_id != host_id:
 			return true
+
+	if msg_type == "run_page_action_sync":
+		var action_origin = str(message.get("origin_steam_id", ""))
+		var action_stream = str(message.get("action_stream", ""))
+		var action_sequence = int(message.get("sequence", 0))
+		if action_origin == "" or action_stream == "" or action_sequence <= 0:
+			_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + from_steam_id + " msg_type=" + msg_type + " reason=MALFORMED_ACTION_SEQUENCE")
+			return true
+		if _is_game_host() and action_origin != from_steam_id:
+			_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + from_steam_id + " msg_type=" + msg_type + " reason=ACTION_ORIGIN_MISMATCH origin=" + action_origin)
+			return true
+		if not session.accept_stream_sequence(action_origin, action_stream, action_sequence):
+			_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + from_steam_id + " msg_type=" + msg_type + " reason=STALE_ACTION origin=" + action_origin + " stream=" + action_stream + " sequence=" + str(action_sequence))
+			return true
+		message["_bo_sequence_validated"] = true
 
 	return false
 
@@ -1964,6 +2439,7 @@ func _close_tracked_p2p_sessions() -> void:
 		if steam_id == "" or steam_id == "0" or steam_id == _self_steam_id:
 			continue
 		var ok = _steam.closeSessionWithUser(int(steam_id))
+		_bo_conn_log("SESSION_CLOSE", "local_steam_id=" + _self_steam_id + " remote_steam_id=" + steam_id + " lobby_id=" + str(_lobby_id) + " result=" + str(ok))
 
 
 func _drain_stale_p2p_packets() -> void:
@@ -2056,6 +2532,9 @@ func send_menu_message_to_host(message: Dictionary) -> void:
 	var owner_id = _get_game_host_steam_id()
 	if owner_id == "":
 		return
+	if not _is_peer_session_ready(owner_id):
+		_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + owner_id + " msg_type=" + str(message.get("msg_type", "")) + " reason=SESSION_NOT_READY")
+		return
 
 	_send_p2p_json(owner_id, message, true)
 
@@ -2074,6 +2553,9 @@ func send_battle_message_to_host(message: Dictionary, reliable: bool = true) -> 
 	var owner_id = _get_game_host_steam_id()
 	if owner_id == "":
 		return false
+	if not _is_peer_session_ready(owner_id):
+		_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + owner_id + " msg_type=" + msg_type + " reason=SESSION_NOT_READY")
+		return false
 	return _send_p2p_json(owner_id, message, reliable)
 
 
@@ -2088,7 +2570,11 @@ func send_or_broadcast_quick_chat(message: Dictionary) -> bool:
 	if _is_game_host():
 		_broadcast_quick_chat(wire, "")
 		return true
-	return _send_p2p_json(_get_game_host_steam_id(), wire, true)
+	var host_id = _get_game_host_steam_id()
+	if not _is_peer_session_ready(host_id):
+		_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + host_id + " msg_type=quick_chat reason=SESSION_NOT_READY")
+		return false
+	return _send_p2p_json(host_id, wire, true)
 
 
 func _broadcast_quick_chat(message: Dictionary, except_steam_id: String = "") -> void:
@@ -2137,12 +2623,29 @@ func _send_client_hello_to_host() -> void:
 
 	_send_p2p_json(owner_id, {
 		"msg_type": "hello",
+		"handshake": "CLIENT_RECONNECT_HELLO",
+		"protocol_version": NETWORK_PROTOCOL_VERSION,
+		"connection_generation": 0,
+		"session_epoch": 0,
+		"connection_nonce": _client_connection_nonce,
 		"role": "client",
 		"steam_id": _self_steam_id,
 		"mod": "six666-BrotatoOnline",
 		"mod_version": MOD_VERSION,
+		"client_known_revision": _client_reconnect_state_revision,
 		"content_capability": _build_client_content_capability_for_hello()
 	}, true)
+
+
+func _send_protocol_reject(target_steam_id: String, incoming_protocol: int) -> void:
+	_send_p2p_json(target_steam_id, {
+		"msg_type": "protocol_reject",
+		"required_protocol_version": NETWORK_PROTOCOL_VERSION,
+		"required_mod_version": MOD_VERSION,
+		"incoming_protocol_version": incoming_protocol,
+		"reason": "UPDATE_REQUIRED"
+	}, true)
+	_bo_conn_log("PROTOCOL_REJECT", "remote_steam_id=" + target_steam_id + " incoming_protocol=" + str(incoming_protocol) + " required_protocol=" + str(NETWORK_PROTOCOL_VERSION) + " required_mod_version=" + MOD_VERSION)
 
 
 func _start_client_hello_retry() -> void:
@@ -2171,6 +2674,29 @@ func _poll_client_hello_retry() -> void:
 	if _client_hello_retry_delay_index < CLIENT_HELLO_RETRY_DELAYS_MSEC.size() - 1:
 		_client_hello_retry_delay_index += 1
 	_client_hello_next_retry_msec = now + int(CLIENT_HELLO_RETRY_DELAYS_MSEC[_client_hello_retry_delay_index])
+
+
+func _queue_client_reconnect_ack(message: Dictionary) -> void:
+	_client_reconnect_ack_payload = message.duplicate(true)
+	_client_reconnect_ack_pending = true
+	_client_reconnect_ack_next_retry_msec = 0
+	_poll_client_reconnect_ack_retry()
+
+
+func _poll_client_reconnect_ack_retry() -> void:
+	if not _client_reconnect_ack_pending or _lobby_id == 0 or _is_game_host():
+		return
+	var now = OS.get_ticks_msec()
+	if now < _client_reconnect_ack_next_retry_msec:
+		return
+	var host_id = _get_game_host_steam_id()
+	if host_id == "" or _client_reconnect_ack_payload.empty():
+		return
+	var sent = _send_p2p_json(host_id, _client_reconnect_ack_payload, true)
+	_client_reconnect_ack_next_retry_msec = now + 1000
+	if sent:
+		_client_reconnect_ack_sent_generation = _client_connection_generation
+	_bo_net_diag_log("RECONNECT_ACK_SEND", "remote_steam_id=" + host_id + " connection_generation=" + str(_client_connection_generation) + " connection_nonce=" + _client_connection_nonce + " sent=" + str(sent) + " retry_pending=true")
 
 
 func _poll_p2p_packets(poll_menu: bool = true, poll_battle: bool = true) -> void:
@@ -2532,6 +3058,153 @@ func _should_ignore_duplicate_host_setup(from_steam_id: String, msg_type: String
 	return false
 
 
+func _get_host_mapping_for_peer(steam_id: String) -> Dictionary:
+	var player_index = -1
+	var slot_manager = _get_slot_manager()
+	if slot_manager != null and slot_manager.has_method("get_player_index_for_steam_id"):
+		player_index = int(slot_manager.get_player_index_for_steam_id(steam_id))
+	var device_id = -1
+	if player_index >= 0 and player_index < CoopService.connected_players.size():
+		var entry = CoopService.connected_players[player_index]
+		if typeof(entry) == TYPE_ARRAY and not entry.empty():
+			device_id = int(entry[0])
+	return {
+		"player_index": player_index,
+		"slot_index": player_index,
+		"device_id": device_id,
+		"controller_index": device_id
+	}
+
+
+func _send_reconnect_challenge_to_client(steam_id: String, generation: int) -> void:
+	if not _is_game_host() or steam_id == "" or steam_id == _self_steam_id or generation <= 0:
+		return
+	var mapping = _get_host_mapping_for_peer(steam_id)
+	var session = _get_peer_network_session(steam_id, false)
+	var nonce = str(session.connection_nonce) if session != null else ""
+	if nonce == "":
+		return
+	_send_p2p_json(steam_id, {
+		"msg_type": "reconnect_challenge",
+		"handshake": "HOST_RECONNECT_CHALLENGE",
+		"connection_generation": generation,
+		"connection_nonce": nonce,
+		"target_client_steam_id": steam_id,
+		"host_steam_id": _self_steam_id,
+		"lobby_id": str(_lobby_id),
+		"player_index": int(mapping.get("player_index", -1)),
+		"slot_index": int(mapping.get("slot_index", -1)),
+		"device_id": int(mapping.get("device_id", -1)),
+		"controller_index": int(mapping.get("controller_index", -1)),
+		"game_phase": _get_menu_sync_manager().get_current_menu_screen() if _get_menu_sync_manager() != null and _get_menu_sync_manager().has_method("get_current_menu_screen") else "none",
+		"wave": int(RunData.current_wave),
+		"state_revision": int(session.expected_revision)
+	}, true)
+	_bo_net_diag_log("RECONNECT_HANDSHAKE", "local_steam_id=" + _self_steam_id + " remote_steam_id=" + steam_id + " connection_generation=" + str(generation) + " connection_nonce=" + nonce + " handshake=HOST_RECONNECT_CHALLENGE player_index=" + str(mapping.get("player_index", -1)))
+	_bo_conn_log("HANDSHAKE", "local_steam_id=" + _self_steam_id + " remote_steam_id=" + steam_id + " connection_generation=" + str(generation) + " connection_nonce=" + nonce + " message=HOST_RECONNECT_CHALLENGE")
+
+
+func _send_reconnect_full_state_to_client(steam_id: String) -> void:
+	if not _is_game_host() or steam_id == "" or steam_id == _self_steam_id:
+		return
+	var session = _get_peer_network_session(steam_id, false)
+	if session == null or int(session.connection_generation) <= 0:
+		return
+	var generation = int(session.connection_generation)
+	var nonce = str(session.connection_nonce)
+	var revision = int(session.expected_revision)
+	if revision <= 0:
+		return
+	var menu_sync = _get_menu_sync_manager()
+	var screen = menu_sync.get_current_menu_screen() if menu_sync != null and menu_sync.has_method("get_current_menu_screen") else "none"
+	if screen == "shop" and _is_in_official_coop_resume_scene() and not _official_continue_players_ready():
+		# Do not announce a FullState manifest before vanilla Continue has built the
+		# authoritative shop slots. The phase message would otherwise be absent while
+		# the manifest still makes the client wait for it before ACKing.
+		_bo_net_diag_log("RESYNC_WAIT", "remote_steam_id=" + steam_id + " reason=COOP_RESUME_NOT_READY")
+		return
+	var required_components = []
+	if screen == "character_selection":
+		required_components = ["host_character_setup", "selection_state"]
+	elif screen == "weapon_selection":
+		required_components = ["host_weapon_setup", "selection_state"]
+	elif screen == "difficulty_selection" or screen == "game" or screen == "shop":
+		required_components = ["menu_scene_state"]
+	var snapshot = {}
+	if _is_in_game_scene():
+		var snapshot_manager = _get_state_snapshot_manager()
+		if snapshot_manager != null and snapshot_manager.has_method("get_last_snapshot_message"):
+			snapshot = snapshot_manager.get_last_snapshot_message()
+			if typeof(snapshot) == TYPE_DICTIONARY and not snapshot.empty():
+				required_components.append("battle_snapshot")
+	if not session.begin_full_state(nonce, generation, revision, required_components):
+		return
+	_capturing_reconnect_full_state_peer = steam_id
+	_captured_reconnect_full_state_messages = []
+	_p2p_channel_override_by_peer[steam_id] = P2P_CHANNEL_MENU
+	_reconnect_revision_override_by_peer[steam_id] = revision
+	_send_p2p_json(steam_id, {
+		"msg_type": "reconnect_full_state_begin",
+		"handshake": "HOST_FULL_STATE_BEGIN",
+		"connection_generation": generation,
+		"connection_nonce": nonce,
+		"state_revision": revision,
+		"required_components": required_components,
+		"game_phase": screen,
+		"wave": int(RunData.current_wave)
+	}, true)
+	var phase_sent = _send_host_phase_setup_to_client(steam_id, true)
+	if screen == "character_selection":
+		if phase_sent:
+			session.mark_full_state_component_revision(nonce, generation, revision, "host_character_setup")
+	elif screen == "weapon_selection":
+		if phase_sent:
+			session.mark_full_state_component_revision(nonce, generation, revision, "host_weapon_setup")
+	elif screen == "difficulty_selection" or screen == "game" or screen == "shop":
+		if phase_sent:
+			session.mark_full_state_component_revision(nonce, generation, revision, "menu_scene_state")
+	var selection_sent = _send_selection_state_to_client(steam_id, true)
+	if required_components.has("selection_state") and selection_sent:
+		session.mark_full_state_component_revision(nonce, generation, revision, "selection_state")
+	if typeof(snapshot) == TYPE_DICTIONARY and not snapshot.empty():
+		var snapshot_sent = _send_p2p_json(steam_id, _make_battle_snapshot_wire_message(snapshot), true)
+		if snapshot_sent:
+			session.mark_full_state_component_revision(nonce, generation, revision, "battle_snapshot")
+	if not session.can_ack_full_state(nonce, generation, revision):
+		# Keep the begin/components that were accepted, but do not let a final marker
+		# overtake a phase message that was unavailable or rejected. A later Hello or
+		# phase poll can retry the missing component against the same revision.
+		var incomplete_staged_messages = _captured_reconnect_full_state_messages.duplicate(true)
+		_capturing_reconnect_full_state_peer = ""
+		_captured_reconnect_full_state_messages.clear()
+		_p2p_channel_override_by_peer.erase(steam_id)
+		_reconnect_revision_override_by_peer.erase(steam_id)
+		if not incomplete_staged_messages.empty():
+			session.stage_full_state_messages(nonce, generation, revision, incomplete_staged_messages)
+			_pump_staged_reconnect_full_state_for_peer(steam_id)
+		_bo_net_diag_log("RESYNC_WAIT", "remote_steam_id=" + steam_id + " reason=FULL_STATE_COMPONENT_PENDING revision=" + str(revision))
+		return
+	_send_p2p_json(steam_id, {
+		"msg_type": "reconnect_full_state",
+		"handshake": "HOST_FULL_STATE",
+		"connection_generation": generation,
+		"connection_nonce": nonce,
+		"state_revision": revision,
+		"game_phase": screen,
+		"wave": int(RunData.current_wave)
+	}, true)
+	var staged_messages = _captured_reconnect_full_state_messages.duplicate(true)
+	_capturing_reconnect_full_state_peer = ""
+	_captured_reconnect_full_state_messages.clear()
+	_p2p_channel_override_by_peer.erase(steam_id)
+	_reconnect_revision_override_by_peer.erase(steam_id)
+	if not session.stage_full_state_messages(nonce, generation, revision, staged_messages):
+		_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + steam_id + " msg_type=reconnect_full_state reason=STAGE_FULL_STATE_FAILED")
+		return
+	_pump_staged_reconnect_full_state_for_peer(steam_id)
+	_bo_net_diag_log("RESYNC_BEGIN", "local_steam_id=" + _self_steam_id + " remote_steam_id=" + steam_id + " connection_generation=" + str(generation) + " connection_nonce=" + nonce + " revision=" + str(revision) + " required_components=" + to_json(required_components))
+
+
 func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 	var msg_type = str(message.get("msg_type", ""))
 
@@ -2555,6 +3228,132 @@ func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 			api.receive_mod_message(from_steam_id, message)
 		return
 
+	if msg_type == "protocol_reject":
+		if _is_game_host() or from_steam_id != _get_game_host_steam_id():
+			return
+		var required_version = str(message.get("required_mod_version", MOD_VERSION))
+		leave_lobby("protocol_reject")
+		_show_join_failure("Brotato Online version mismatch. Update every player to Mod " + required_version + " / protocol v" + str(NETWORK_PROTOCOL_VERSION) + ".")
+		return
+
+	if msg_type == "reconnect_required":
+		if _is_game_host() or from_steam_id != _get_game_host_steam_id():
+			return
+		_begin_client_connection_generation("host_reconnect_required")
+		_start_client_hello_retry()
+		_send_client_hello_to_host()
+		return
+
+	if msg_type == "reconnect_challenge":
+		if _is_game_host():
+			return
+		if from_steam_id != _get_game_host_steam_id():
+			return
+		var challenge_generation = int(message.get("connection_generation", 0))
+		var challenge_nonce = str(message.get("connection_nonce", ""))
+		var target_id = str(message.get("target_client_steam_id", _self_steam_id))
+		if target_id != "" and target_id != _self_steam_id:
+			_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + from_steam_id + " msg_type=reconnect_challenge reason=WRONG_TARGET target=" + target_id)
+			return
+		if challenge_nonce == "" or challenge_nonce != _client_connection_nonce or challenge_generation <= 0:
+			_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + from_steam_id + " msg_type=reconnect_challenge reason=STALE_ATTEMPT incoming_generation=" + str(challenge_generation) + " incoming_nonce=" + challenge_nonce + " expected_nonce=" + _client_connection_nonce)
+			return
+		var host_session = _get_peer_network_session(from_steam_id, true)
+		var challenge_revision = int(message.get("state_revision", 0))
+		if host_session == null or not host_session.client_accept_challenge(challenge_nonce, challenge_generation, challenge_revision, int(message.get("player_index", -1)), int(message.get("slot_index", -1)), int(message.get("device_id", -1))):
+			return
+		_client_connection_generation = challenge_generation
+		_set_network_session_state(SESSION_STATE_SESSION_NEGOTIATING, "challenge")
+		_send_p2p_json(from_steam_id, {
+			"msg_type": "reconnect_confirm",
+			"handshake": "CLIENT_RECONNECT_CONFIRM",
+			"connection_generation": challenge_generation,
+			"connection_nonce": challenge_nonce,
+			"player_index": int(message.get("player_index", -1)),
+			"slot_index": int(message.get("slot_index", -1)),
+			"device_id": int(message.get("device_id", -1)),
+			"controller_index": int(message.get("controller_index", -1)),
+			"state_revision": int(message.get("state_revision", 1))
+		}, true)
+		_bo_net_diag_log("RECONNECT_HANDSHAKE", "local_steam_id=" + _self_steam_id + " remote_steam_id=" + from_steam_id + " connection_generation=" + str(challenge_generation) + " handshake=CLIENT_RECONNECT_CONFIRM")
+		_bo_conn_log("HANDSHAKE", "local_steam_id=" + _self_steam_id + " remote_steam_id=" + from_steam_id + " connection_generation=" + str(challenge_generation) + " message=CLIENT_RECONNECT_CONFIRM")
+		return
+
+	if msg_type == "reconnect_confirm":
+		if not _is_game_host():
+			return
+		var confirm_generation = int(message.get("connection_generation", 0))
+		var confirm_nonce = str(message.get("connection_nonce", ""))
+		var confirm_session = _get_peer_network_session(from_steam_id, false)
+		var confirm_revision = int(message.get("state_revision", 0))
+		if confirm_session == null or not confirm_session.host_accept_confirm(confirm_nonce, confirm_generation, confirm_revision):
+			_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + from_steam_id + " msg_type=reconnect_confirm reason=STALE_ATTEMPT")
+			return
+		_send_reconnect_full_state_to_client(from_steam_id)
+		return
+
+	if msg_type == "reconnect_full_state_begin":
+		if _is_game_host():
+			return
+		var begin_generation = int(message.get("connection_generation", 0))
+		var begin_nonce = str(message.get("connection_nonce", ""))
+		var begin_revision = int(message.get("state_revision", 0))
+		var begin_components = message.get("required_components", [])
+		if typeof(begin_components) != TYPE_ARRAY:
+			return
+		var begin_session = _get_peer_network_session(from_steam_id, false)
+		if begin_session == null or not begin_session.begin_full_state(begin_nonce, begin_generation, begin_revision, begin_components):
+			return
+		_set_network_session_state(SESSION_STATE_RESYNCING, "full_state_begin")
+		return
+
+	if msg_type == "reconnect_full_state":
+		if _is_game_host():
+			return
+		if from_steam_id != _get_game_host_steam_id() or int(message.get("connection_generation", 0)) != _client_connection_generation:
+			return
+		_mark_client_reconnect_state_received(message, "reconnect_full_state")
+		return
+
+	if msg_type == "reconnect_full_state_ack":
+		if not _is_game_host():
+			return
+		var ack_session = _get_peer_network_session(from_steam_id, false)
+		var ack_generation = int(message.get("connection_generation", 0))
+		var ack_nonce = str(message.get("connection_nonce", ""))
+		var ack_revision = int(message.get("state_revision", 0))
+		if ack_session == null or not ack_session.host_accept_ack(ack_nonce, ack_generation, ack_revision):
+			_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + from_steam_id + " msg_type=reconnect_full_state_ack reason=STALE_OR_INCOMPLETE_ACK connection_generation=" + str(ack_generation) + " connection_nonce=" + ack_nonce + " revision=" + str(ack_revision))
+			return
+		_send_p2p_json(from_steam_id, {
+			"msg_type": "reconnect_complete",
+			"handshake": "HOST_RECONNECT_COMPLETE",
+			"connection_generation": ack_generation,
+			"connection_nonce": ack_nonce,
+			"state_revision": ack_revision
+		}, true)
+		_bo_net_diag_log("RECONNECT_ACK", "local_steam_id=" + _self_steam_id + " remote_steam_id=" + from_steam_id + " connection_generation=" + str(ack_generation) + " state=READY")
+		_bo_conn_log("HANDSHAKE", "local_steam_id=" + _self_steam_id + " remote_steam_id=" + from_steam_id + " connection_generation=" + str(ack_generation) + " message=HOST_RECONNECT_COMPLETE state=READY")
+		return
+
+	if msg_type == "reconnect_complete":
+		if _is_game_host():
+			return
+		var complete_generation = int(message.get("connection_generation", 0))
+		var complete_nonce = str(message.get("connection_nonce", ""))
+		var complete_revision = int(message.get("state_revision", 0))
+		var complete_session = _get_peer_network_session(from_steam_id, true)
+		if complete_session == null or not complete_session.client_receive_complete(complete_nonce, complete_generation, complete_revision):
+			return
+		_set_network_session_state(SESSION_STATE_READY, "reconnect_complete")
+		_client_reconnect_ack_pending = false
+		_client_reconnect_ack_next_retry_msec = 0
+		_client_reconnect_ack_payload = {}
+		_stop_client_hello_retry("reconnect_complete")
+		_bo_net_diag_log("RECONNECT_ACK", "local_steam_id=" + _self_steam_id + " remote_steam_id=" + from_steam_id + " connection_generation=" + str(complete_generation) + " state=READY")
+		_bo_conn_log("HANDSHAKE", "local_steam_id=" + _self_steam_id + " remote_steam_id=" + from_steam_id + " connection_generation=" + str(complete_generation) + " message=HOST_RECONNECT_COMPLETE state=READY")
+		return
+
 	if _should_drop_stale_client_battle_packet(from_steam_id, message):
 		return
 
@@ -2568,8 +3367,30 @@ func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 		var send_setup_usec = 0
 		var send_selection_usec = 0
 		var broadcast_usec = 0
-		var first_hello = not _seen_client_hello_by_steam_id.has(from_steam_id)
-		_seen_client_hello_by_steam_id[from_steam_id] = true
+		var incoming_nonce = str(message.get("connection_nonce", ""))
+		var registration = _host_register_peer_generation(from_steam_id, incoming_nonce, "hello")
+		if not bool(registration.get("accepted", false)):
+			return
+		var incoming_generation = int(registration.get("generation", 0))
+		var first_hello = bool(registration.get("new_generation", false))
+		if bool(registration.get("already_ready", false)):
+			_send_p2p_json(from_steam_id, {
+				"msg_type": "reconnect_complete",
+				"handshake": "HOST_RECONNECT_COMPLETE",
+				"connection_generation": incoming_generation,
+				"connection_nonce": incoming_nonce,
+				"state_revision": int(registration.get("state_revision", 0))
+			}, true)
+			return
+		if not first_hello and str(registration.get("resend_phase", "")) == "full_state":
+			var retry_session = _get_peer_network_session(from_steam_id, false)
+			if _network_send_scheduler != null:
+				_network_send_scheduler.clear_peer(from_steam_id)
+			if retry_session != null and retry_session.has_method("cancel_staged_full_state_messages"):
+				retry_session.cancel_staged_full_state_messages()
+			_send_reconnect_full_state_to_client(from_steam_id)
+			return
+		_seen_client_hello_by_steam_id[from_steam_id + ":" + str(incoming_generation)] = true
 		var client_content_changed = false
 		var menu_sync_for_capability = _get_menu_sync_manager()
 		var stage_start_usec = OS.get_ticks_usec()
@@ -2602,15 +3423,10 @@ func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 					menu_sync_for_capability.apply_host_dlc_gate_now()
 			dlc_gate_usec = OS.get_ticks_usec() - stage_start_usec
 			stage_start_usec = OS.get_ticks_usec()
-			_send_host_phase_setup_to_client(from_steam_id, first_hello or client_content_changed)
+			_send_reconnect_challenge_to_client(from_steam_id, incoming_generation)
 			send_setup_usec = OS.get_ticks_usec() - stage_start_usec
-			stage_start_usec = OS.get_ticks_usec()
-			_send_selection_state_to_client(from_steam_id, first_hello or client_content_changed)
-			send_selection_usec = OS.get_ticks_usec() - stage_start_usec
-			stage_start_usec = OS.get_ticks_usec()
 			if client_content_changed:
-				_send_host_phase_messages_to_all(true, from_steam_id)
-				_broadcast_selection_state(true)
+				_last_broadcast_selection_key = ""
 			broadcast_usec = OS.get_ticks_usec() - stage_start_usec
 		var hello_total_usec = OS.get_ticks_usec() - hello_start_usec
 		if hello_total_usec >= BO_NET_DIAG_SINGLE_COST_USEC:
@@ -2650,8 +3466,7 @@ func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 		# setup packet. Keep hello retries active until a correctly targeted setup arrives.
 		if not _host_setup_has_valid_local_slot(message):
 			return
-		_stop_client_hello_retry("host_character_setup")
-		if _should_ignore_duplicate_host_setup(from_steam_id, msg_type, message):
+		if not bool(message.get("reconnect_sync", false)) and _should_ignore_duplicate_host_setup(from_steam_id, msg_type, message):
 			return
 		# A fresh character setup means Host has returned to mutable staging. Clear the
 		# previous battle/shop lock before MenuSync asks OnlinePlayerSlotManager to
@@ -2664,6 +3479,7 @@ func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 			_online_flow_started = true
 			_online_flow_left_since_msec = 0
 			menu_sync_setup.receive_host_character_setup_from_host(message, _self_steam_id, _get_game_host_steam_id())
+		_mark_client_reconnect_state_received(message, "host_character_setup")
 		return
 
 	if msg_type == "host_weapon_setup":
@@ -2671,8 +3487,7 @@ func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 			return
 		if not _host_setup_has_valid_local_slot(message):
 			return
-		_stop_client_hello_retry("host_weapon_setup")
-		if _should_ignore_duplicate_host_setup(from_steam_id, msg_type, message):
+		if not bool(message.get("reconnect_sync", false)) and _should_ignore_duplicate_host_setup(from_steam_id, msg_type, message):
 			return
 		_unlock_online_run_slots()
 		_sync_slot_manager_lock_flag()
@@ -2682,6 +3497,7 @@ func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 			_online_flow_started = true
 			_online_flow_left_since_msec = 0
 			menu_sync_weapon_setup.receive_host_weapon_setup_from_host(message, _self_steam_id, _get_game_host_steam_id())
+		_mark_client_reconnect_state_received(message, "host_weapon_setup")
 		return
 
 	if msg_type == "game_start_prepare":
@@ -2731,7 +3547,6 @@ func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 			return
 		if _client_should_drop_stale_menu_scene_state(message):
 			return
-		_stop_client_hello_retry("menu_scene_state")
 		_apply_host_zone_sync_for_client(message, "menu_scene_state")
 		var menu_sync_scene_client = _get_menu_sync_manager()
 		if menu_sync_scene_client != null and menu_sync_scene_client.has_method("receive_menu_scene_state_from_host"):
@@ -2745,6 +3560,7 @@ func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 			menu_sync_scene_client.receive_menu_scene_state_from_host(message, _self_steam_id, _get_game_host_steam_id())
 			if screen == "game" or screen.find("shop") != -1:
 				_lock_online_run_slots("client_scene_state:" + screen)
+			_mark_client_reconnect_state_received(message, "menu_scene_state")
 			# game_start_commit is the preferred path. A direct screen=game scene-state is kept as a fallback
 			# for older hosts or duplicate broadcasts after the Host has already entered battle.
 		return
@@ -2766,28 +3582,28 @@ func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 	if msg_type == "battle_reliable_events":
 		if _is_game_host():
 			return
-		if _should_drop_stale_retry_battle_packet(message):
+		if not bool(message.get("reconnect_sync", false)) and _should_drop_stale_retry_battle_packet(message):
 			return
-		_stop_client_hello_retry("battle_reliable_events")
 		_handle_battle_reliable_events_from_host(message)
+		_mark_client_reconnect_state_received(message, "battle_reliable_events")
 		return
 
 	if msg_type == "battle_terminal_state":
 		if _is_game_host():
 			return
-		if _should_drop_stale_retry_battle_packet(message):
+		if not bool(message.get("reconnect_sync", false)) and _should_drop_stale_retry_battle_packet(message):
 			return
-		_stop_client_hello_retry("battle_terminal_state")
 		_handle_battle_terminal_state_from_host(message)
+		_mark_client_reconnect_state_received(message, "battle_terminal_state")
 		return
 
 	if msg_type == "battle_snapshot":
 		if _is_game_host():
 			return
-		if _should_drop_stale_retry_battle_packet(message):
+		if not bool(message.get("reconnect_sync", false)) and _should_drop_stale_retry_battle_packet(message):
 			return
-		_stop_client_hello_retry("battle_snapshot")
 		_handle_battle_snapshot_from_host(message)
+		_mark_client_reconnect_state_received(message, "battle_snapshot")
 		return
 
 	if msg_type == "selection_state":
@@ -2798,9 +3614,9 @@ func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 			if (state_screen == "character_selection" or state_screen == "weapon_selection") and menu_sync_client != null and menu_sync_client.has_method("has_host_catalog_for_screen") and not menu_sync_client.has_host_catalog_for_screen(state_screen):
 				_send_client_hello_to_host()
 				return
-			_stop_client_hello_retry("selection_state")
 		if menu_sync_client != null and menu_sync_client.has_method("receive_selection_state_from_host"):
 			menu_sync_client.receive_selection_state_from_host(message, _self_steam_id, _get_game_host_steam_id())
+			_mark_client_reconnect_state_received(message, "selection_state")
 		return
 
 	if msg_type == "battle_input":
@@ -5948,73 +6764,76 @@ func _send_host_phase_messages_to_all(force: bool = false, except_steam_id: Stri
 		_send_host_phase_setup_to_client(steam_id, force)
 
 
-func _send_host_phase_setup_to_client(steam_id: String, force: bool = false) -> void:
+func _send_host_phase_setup_to_client(steam_id: String, force: bool = false) -> bool:
 	if not _is_game_host() or _lobby_id == 0:
-		return
+		return false
 	if steam_id == "" or steam_id == _self_steam_id:
-		return
+		return false
 
 	var menu_sync = _get_menu_sync_manager()
 	if menu_sync == null or not menu_sync.has_method("get_current_menu_screen"):
-		return
+		return false
 
 	var screen = str(menu_sync.get_current_menu_screen())
 	if screen == "shop" and _is_in_official_coop_resume_scene() and not _official_continue_players_ready():
 		# Official CoopResume has not collected all saved-run players yet. Do not send
 		# clients to CoopShop before the Host's vanilla Continue flow advances.
-		return
+		return false
 	if screen == "character_selection":
-		_send_host_character_setup_to_client(steam_id, force)
+		return _send_host_character_setup_to_client(steam_id, force)
 	elif screen == "weapon_selection":
-		_send_host_weapon_setup_to_client(steam_id, force)
+		return _send_host_weapon_setup_to_client(steam_id, force)
 	elif screen == "difficulty_selection" or screen == "game" or screen == "shop":
-		_send_host_scene_transition_to_client(steam_id, force)
+		return _send_host_scene_transition_to_client(steam_id, force)
+	return false
 
 
-func _send_host_character_setup_to_client(steam_id: String, force: bool = false) -> void:
+func _send_host_character_setup_to_client(steam_id: String, force: bool = false) -> bool:
 	var menu_sync = _get_menu_sync_manager()
 	if menu_sync == null or not menu_sync.has_method("build_host_character_setup_state"):
-		return
+		return false
 
 	var state = menu_sync.build_host_character_setup_state(steam_id, _self_steam_id)
 	var current_scene = get_tree().current_scene
 	state["host_scene_instance_id"] = current_scene.get_instance_id() if current_scene != null else 0
 	_augment_host_zone_sync_payload(state)
 	if str(state.get("screen", "")) != "character_selection":
-		return
+		return false
 
 	var key = _get_host_phase_setup_stable_key(state)
 	if not force and str(_sent_character_setup_key_by_steam_id.get(steam_id, "")) == key:
-		return
+		return true
 
 	var send_ok = _send_p2p_json(steam_id, state, true)
 	if send_ok:
 		_sent_character_setup_key_by_steam_id[steam_id] = key
 	else:
 		_sent_character_setup_key_by_steam_id.erase(steam_id)
+	return send_ok
 
 
-func _send_host_weapon_setup_to_client(steam_id: String, force: bool = false) -> void:
+func _send_host_weapon_setup_to_client(steam_id: String, force: bool = false) -> bool:
 	var menu_sync = _get_menu_sync_manager()
 	if menu_sync == null or not menu_sync.has_method("build_host_weapon_setup_state"):
-		return
+		return false
 
 	var state = menu_sync.build_host_weapon_setup_state(steam_id, _self_steam_id)
 	var current_scene = get_tree().current_scene
 	state["host_scene_instance_id"] = current_scene.get_instance_id() if current_scene != null else 0
 	_augment_host_zone_sync_payload(state)
 	if str(state.get("screen", "")) != "weapon_selection":
-		return
+		return false
 
 	var key = _get_host_phase_setup_stable_key(state)
 	if not force and str(_sent_weapon_setup_key_by_steam_id.get(steam_id, "")) == key:
-		return
+		return true
 
 	var send_ok = _send_p2p_json(steam_id, state, true)
 	if send_ok:
 		_sent_weapon_setup_key_by_steam_id[steam_id] = key
 	else:
 		_sent_weapon_setup_key_by_steam_id.erase(steam_id)
+	return send_ok
 
 
 func _get_stable_scene_run_config(config) -> Dictionary:
@@ -6085,24 +6904,24 @@ func _is_complete_shop_scene_transition_state(state: Dictionary) -> bool:
 	return true
 
 
-func _send_host_scene_transition_to_client(steam_id: String, force: bool = false) -> void:
+func _send_host_scene_transition_to_client(steam_id: String, force: bool = false) -> bool:
 	var menu_sync = _get_menu_sync_manager()
 	if menu_sync == null or not menu_sync.has_method("build_menu_scene_state"):
-		return
+		return false
 
 	var force_full_item_list = _should_force_full_item_list_for_scene_sync_to_client(steam_id)
 	var state = menu_sync.build_menu_scene_state(false, false, force_full_item_list)
 	_augment_host_zone_sync_payload(state)
 	var screen = str(state.get("screen", ""))
 	if screen == "" or screen == "none" or screen == "character_selection" or screen == "weapon_selection":
-		return
+		return false
 
 	# Once a synced game start is pending, game_start_prepare/game_start_commit is the
 	# authoritative transition path. Suppress old difficulty/shop scene-state packets;
 	# otherwise reliable delivery can make the Client bounce back to the previous page
 	# after it has already loaded main.tscn.
 	if not _pending_host_game_start.empty() and screen != "game":
-		return
+		return false
 
 	# For difficulty/game keep the existing scene-state message; no unlock catalog is needed here.
 	if screen == "game" or screen.find("shop") != -1:
@@ -6116,7 +6935,7 @@ func _send_host_scene_transition_to_client(steam_id: String, force: bool = false
 	state.erase("availability")
 	var key = _get_menu_scene_state_stable_key(state)
 	if not force and not force_full_item_list and str(_sent_scene_transition_key_by_steam_id.get(steam_id, "")) == key:
-		return
+		return true
 
 	var full_payload_cache_key = screen + "|" + key + "|full_items=" + str(force_full_item_list)
 	var now = OS.get_ticks_msec()
@@ -6141,7 +6960,7 @@ func _send_host_scene_transition_to_client(steam_id: String, force: bool = false
 			_host_scene_transition_payload_cache_key = ""
 			_host_scene_transition_payload_cache_msec = 0
 			_host_scene_transition_payload_cache_state = {}
-		return
+		return false
 
 	if not force and not loaded_from_payload_cache:
 		_host_scene_transition_payload_cache_key = full_payload_cache_key
@@ -6155,6 +6974,7 @@ func _send_host_scene_transition_to_client(steam_id: String, force: bool = false
 			_clear_full_item_list_scene_sync_requirement_for_client(steam_id)
 	else:
 		_sent_scene_transition_key_by_steam_id.erase(steam_id)
+	return send_ok
 
 
 func _get_host_phase_setup_stable_key(state: Dictionary) -> String:
@@ -6192,27 +7012,25 @@ func _add_target_client_slot_to_selection_state(state: Dictionary, steam_id: Str
 	state["client_player_index"] = player_index
 
 
-func _send_selection_state_to_client(steam_id: String, force: bool = false) -> void:
+func _send_selection_state_to_client(steam_id: String, force: bool = false) -> bool:
 	if not _is_game_host() or _lobby_id == 0:
-		return
+		return false
 
 	var menu_sync = _get_menu_sync_manager()
 	if menu_sync == null or not menu_sync.has_method("build_selection_state"):
-		return
+		return false
 	if menu_sync.has_method("get_current_menu_screen"):
 		var screen = str(menu_sync.get_current_menu_screen())
 		if not _is_selection_state_broadcast_screen(screen):
-			return
+			return false
 
 	var state = menu_sync.build_selection_state()
 	_augment_host_zone_sync_payload(state)
 	_add_target_client_slot_to_selection_state(state, steam_id)
 	if str(state.get("screen", "")) == "none":
-		return
+		return false
 
-	_send_p2p_json(steam_id, state, true)
-	if force:
-		pass
+	return _send_p2p_json(steam_id, state, true)
 
 func _poll_and_broadcast_selection_state() -> void:
 	if not _is_game_host() or _lobby_id == 0:
@@ -6293,6 +7111,12 @@ func _reset_steam_messages_session_with_peer(steam_id: String, reason: String = 
 
 
 func _send_p2p_json(target_steam_id: String, message: Dictionary, reliable: bool = true) -> bool:
+	if target_steam_id != "" and target_steam_id == _capturing_reconnect_full_state_peer:
+		_captured_reconnect_full_state_messages.append({
+			"message": message.duplicate(true),
+			"reliable": reliable
+		})
+		return true
 	if not _ensure_steam_ready():
 		return false
 
@@ -6304,13 +7128,16 @@ func _send_p2p_json(target_steam_id: String, message: Dictionary, reliable: bool
 
 	_prepare_steam_messages_session_with_peer(target_steam_id, "send")
 
-	var wire_message = _annotate_online_session_message(message)
+	var wire_message = _annotate_online_session_message(message, target_steam_id)
 	var msg_type = str(wire_message.get("msg_type", ""))
+	if _is_known_online_message_type(msg_type) and not _is_reconnect_control_message(msg_type) and not bool(wire_message.get("reconnect_sync", false)) and not _is_peer_session_ready(target_steam_id):
+		_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + target_steam_id + " msg_type=" + msg_type + " reason=SESSION_NOT_READY direction=outbound generation=" + str(_get_peer_connection_generation(target_steam_id)))
+		return false
 	var payload = to_json(wire_message).to_utf8()
 	var send_flags = STEAM_NETWORKING_SEND_RELIABLE if (reliable or FORCE_ALL_STEAM_MESSAGES_RELIABLE) else 0
-	var channel = _get_p2p_channel_for_message_type(msg_type)
+	var channel = int(_p2p_channel_override_by_peer.get(target_steam_id, _get_p2p_channel_for_message_type(msg_type)))
 	var coalesce_key = _get_p2p_send_queue_coalesce_key(target_steam_id, wire_message, channel)
-	_bo_net_diag_log_large_or_queued_send(target_steam_id, msg_type, payload.size(), channel, reliable or FORCE_ALL_STEAM_MESSAGES_RELIABLE, "large_payload", _pending_p2p_chunk_sends.size())
+	_bo_net_diag_log_large_or_queued_send(target_steam_id, msg_type, payload.size(), channel, reliable or FORCE_ALL_STEAM_MESSAGES_RELIABLE, "large_payload", _pending_p2p_send_count())
 
 	# Only pre-chunk very large messages. Medium reliable packets should keep Steam's
 	# native message ordering; if Steam refuses one, fall back to the frame-paced chunk
@@ -6324,7 +7151,7 @@ func _send_p2p_json(target_steam_id: String, message: Dictionary, reliable: bool
 	# shop_focus/shop_reroll goes out immediately, making the Host see a higher
 	# action seq first and reject the delayed buy as stale.
 	if _has_pending_p2p_send_for_target_channel(target_steam_id, channel):
-		_bo_net_diag_log_large_or_queued_send(target_steam_id, msg_type, payload.size(), channel, reliable or FORCE_ALL_STEAM_MESSAGES_RELIABLE, "queued_behind_pending", _pending_p2p_chunk_sends.size())
+		_bo_net_diag_log_large_or_queued_send(target_steam_id, msg_type, payload.size(), channel, reliable or FORCE_ALL_STEAM_MESSAGES_RELIABLE, "queued_behind_pending", _pending_p2p_send_count())
 		var queued_behind = _queue_p2p_json_direct_after_pending(target_steam_id, payload, msg_type, send_flags, channel, coalesce_key)
 		return queued_behind
 
@@ -6333,28 +7160,25 @@ func _send_p2p_json(target_steam_id: String, message: Dictionary, reliable: bool
 	var ok = _steam_networking_send_ok(result)
 	var result_name = _steam_networking_result_name(result)
 	if not ok:
-		_bo_net_diag_log_large_or_queued_send(target_steam_id, msg_type, payload.size(), channel, reliable or FORCE_ALL_STEAM_MESSAGES_RELIABLE, "send_failed", _pending_p2p_chunk_sends.size())
+		_bo_net_diag_log_large_or_queued_send(target_steam_id, msg_type, payload.size(), channel, reliable or FORCE_ALL_STEAM_MESSAGES_RELIABLE, "send_failed", _pending_p2p_send_count())
 		_log_steam_message_send_failure(target_steam_id, msg_type, payload.size(), send_flags, channel, result, result_name)
 		if payload.size() > P2P_JSON_CHUNK_RAW_BYTES:
 			return _queue_p2p_json_chunks(target_steam_id, payload, msg_type, send_flags, channel, coalesce_key)
-		if coalesce_key != "":
+		# Reliable control messages must survive transient Steam backpressure too.
+		# The scheduler retries them with control priority and bounded lifetime.
+		if send_flags != 0:
 			return _queue_p2p_json_direct_after_pending(target_steam_id, payload, msg_type, send_flags, channel, coalesce_key)
 	return ok
 
 
 func _has_pending_p2p_send_for_target_channel(target_steam_id: String, channel: int) -> bool:
-	for queued in _pending_p2p_chunk_sends:
-		if typeof(queued) != TYPE_DICTIONARY:
-			continue
-		if str(queued.get("target_steam_id", "")) == target_steam_id and int(queued.get("channel", P2P_CHANNEL_MENU)) == channel:
-			return true
-	return false
+	return _network_send_scheduler != null and _network_send_scheduler.has_pending(target_steam_id, channel)
 
 
 func _get_p2p_send_queue_coalesce_key(target_steam_id: String, message: Dictionary, channel: int) -> String:
 	# Only coalesce packets that describe a latest UI position/state. Normal sends are
 	# untouched; this key is used only when Steam send buffering forces the packet into
-	# _pending_p2p_chunk_sends.
+	# the production per-peer/channel scheduler.
 	if typeof(message) != TYPE_DICTIONARY or message.empty():
 		return ""
 	var msg_type = str(message.get("msg_type", ""))
@@ -6372,19 +7196,39 @@ func _get_p2p_send_queue_coalesce_key(target_steam_id: String, message: Dictiona
 
 
 func _drop_pending_p2p_coalesced_sends(coalesce_key: String, target_steam_id: String, channel: int) -> int:
-	if coalesce_key == "":
+	if coalesce_key == "" or _network_send_scheduler == null:
 		return 0
-	var removed = 0
-	var i = _pending_p2p_chunk_sends.size() - 1
-	while i >= 0:
-		var queued = _pending_p2p_chunk_sends[i]
-		if typeof(queued) == TYPE_DICTIONARY and str(queued.get("coalesce_key", "")) == coalesce_key and str(queued.get("target_steam_id", "")) == target_steam_id and int(queued.get("channel", P2P_CHANNEL_MENU)) == channel:
-			_pending_p2p_chunk_sends.remove(i)
-			removed += 1
-		i -= 1
+	var removed = int(_network_send_scheduler.drop_coalesced(target_steam_id, channel, coalesce_key))
 	if removed > 0:
 		_bo_net_diag_state_change("SEND_COALESCE", coalesce_key + ":" + str(removed), "removed=" + str(removed) + " key=" + coalesce_key, 500)
 	return removed
+
+
+func _pending_p2p_send_count_for_peer(target_steam_id: String) -> int:
+	if _network_send_scheduler == null:
+		return 0
+	return int(_network_send_scheduler.count_for_peer(target_steam_id))
+
+
+func _get_p2p_send_priority(msg_type: String, coalesce_key: String, reconnect_sync: bool = false) -> int:
+	if _network_send_scheduler_script == null:
+		return 1
+	if reconnect_sync or _is_reconnect_control_message(msg_type) or msg_type == "protocol_reject" or msg_type == "reconnect_required":
+		return _network_send_scheduler_script.PRIORITY_CONTROL
+	if coalesce_key != "":
+		return _network_send_scheduler_script.PRIORITY_REPLACEABLE
+	if msg_type == "battle_input" or msg_type == "menu_focus":
+		return _network_send_scheduler_script.PRIORITY_TRANSIENT
+	return _network_send_scheduler_script.PRIORITY_EVENT
+
+
+func _enqueue_pending_p2p_send(packet: Dictionary) -> bool:
+	if _network_send_scheduler == null:
+		return false
+	var ok = bool(_network_send_scheduler.enqueue(packet))
+	if not ok:
+		_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + str(packet.get("target_steam_id", "")) + " msg_type=" + str(packet.get("final_msg_type", "")) + " reason=QUEUE_LIMIT pending=" + str(_pending_p2p_send_count()) + " per_peer=" + str(_pending_p2p_send_count_for_peer(str(packet.get("target_steam_id", "")))) + " priority=" + str(packet.get("priority", -1)))
+	return ok
 
 
 func _queue_p2p_json_direct_after_pending(target_steam_id: String, payload: PoolByteArray, msg_type: String, send_flags: int, channel: int, coalesce_key: String = "") -> bool:
@@ -6396,9 +7240,8 @@ func _queue_p2p_json_direct_after_pending(target_steam_id: String, payload: Pool
 	# ordering behind the already-pending sends.
 	if payload.size() > P2P_JSON_CHUNK_RAW_BYTES:
 		return _queue_p2p_json_chunks(target_steam_id, payload, msg_type, send_flags, channel, coalesce_key)
-	_drop_pending_p2p_coalesced_sends(coalesce_key, target_steam_id, channel)
 	var now = OS.get_ticks_msec()
-	_pending_p2p_chunk_sends.append({
+	return _enqueue_pending_p2p_send({
 		"target_steam_id": target_steam_id,
 		"payload": payload,
 		"send_flags": send_flags,
@@ -6412,9 +7255,11 @@ func _queue_p2p_json_direct_after_pending(target_steam_id: String, payload: Pool
 		"next_send_msec": now,
 		"retry_count": 0,
 		"last_retry_log_msec": 0,
-		"coalesce_key": coalesce_key
+		"coalesce_key": coalesce_key,
+		"priority": _get_p2p_send_priority(msg_type, coalesce_key, _reconnect_component_for_message_type(msg_type) != "" and _reconnect_revision_override_by_peer.has(target_steam_id)),
+		"connection_generation": _get_peer_connection_generation(target_steam_id),
+		"connection_nonce": _get_peer_connection_nonce(target_steam_id)
 	})
-	return true
 
 
 func _queue_p2p_json_chunks(target_steam_id: String, payload: PoolByteArray, msg_type: String, send_flags: int, channel: int, coalesce_key: String = "") -> bool:
@@ -6424,10 +7269,19 @@ func _queue_p2p_json_chunks(target_steam_id: String, payload: PoolByteArray, msg
 	var now = OS.get_ticks_msec()
 	var chunk_id = str(_self_steam_id) + ":" + str(_p2p_chunk_seq) + ":" + str(OS.get_ticks_usec()) + ":" + msg_type
 	var chunk_count = int(ceil(float(payload.size()) / float(P2P_JSON_CHUNK_RAW_BYTES)))
-	if chunk_count <= 1:
+	if chunk_count <= 1 or chunk_count > P2P_JSON_MAX_CHUNKS_PER_MESSAGE or payload.size() > P2P_JSON_MAX_REASSEMBLED_BYTES:
+		_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + target_steam_id + " msg_type=" + msg_type + " reason=OUTBOUND_CHUNK_LIMIT chunks=" + str(chunk_count) + " bytes=" + str(payload.size()))
 		return false
+	var priority = _get_p2p_send_priority(msg_type, coalesce_key, _reconnect_component_for_message_type(msg_type) != "" and _reconnect_revision_override_by_peer.has(target_steam_id))
+	if _network_send_scheduler == null or not _network_send_scheduler.reserve_capacity(target_steam_id, chunk_count, priority):
+		_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + target_steam_id + " msg_type=" + msg_type + " reason=QUEUE_LIMIT_CHUNK_BATCH chunks=" + str(chunk_count) + " pending=" + str(_pending_p2p_send_count()))
+		return false
+	# Keep the previous coalesced group until the complete replacement batch has
+	# secured capacity. If admission fails, the old group remains deliverable.
 	_drop_pending_p2p_coalesced_sends(coalesce_key, target_steam_id, channel)
-	_bo_net_diag_log_large_or_queued_send(target_steam_id, msg_type, payload.size(), channel, true, "chunk_queue", _pending_p2p_chunk_sends.size() + chunk_count)
+	_bo_net_diag_log_large_or_queued_send(target_steam_id, msg_type, payload.size(), channel, true, "chunk_queue", _pending_p2p_send_count() + chunk_count)
+	var generation = _get_peer_connection_generation(target_steam_id)
+	var nonce = _get_peer_connection_nonce(target_steam_id)
 	for chunk_index in range(chunk_count):
 		var start = chunk_index * P2P_JSON_CHUNK_RAW_BYTES
 		var length = min(P2P_JSON_CHUNK_RAW_BYTES, payload.size() - start)
@@ -6441,9 +7295,9 @@ func _queue_p2p_json_chunks(target_steam_id: String, payload: PoolByteArray, msg
 			"original_bytes": payload.size(),
 			"payload_b64": Marshalls.raw_to_base64(raw_chunk)
 		}
-		var chunk_wire = _annotate_online_session_message(chunk_message)
+		var chunk_wire = _annotate_online_session_message(chunk_message, target_steam_id)
 		var chunk_payload = to_json(chunk_wire).to_utf8()
-		_pending_p2p_chunk_sends.append({
+		var queued = _enqueue_pending_p2p_send({
 			"target_steam_id": target_steam_id,
 			"payload": chunk_payload,
 			"send_flags": send_flags,
@@ -6456,37 +7310,46 @@ func _queue_p2p_json_chunks(target_steam_id: String, payload: PoolByteArray, msg
 			"next_send_msec": now,
 			"retry_count": 0,
 			"last_retry_log_msec": 0,
-			"coalesce_key": coalesce_key
+			"coalesce_key": coalesce_key,
+			"preserve_coalesce_group": true,
+			"priority": priority,
+			"connection_generation": generation,
+			"connection_nonce": nonce
 		})
+		if not queued:
+			# Capacity was checked for the entire batch. A failure here means the
+			# scheduler rejected malformed state; remove the partial message.
+			_drop_pending_p2p_coalesced_sends(coalesce_key, target_steam_id, channel)
+			return false
 	return true
 
 
 func _poll_pending_p2p_chunk_sends() -> void:
-	if _pending_p2p_chunk_sends.empty():
+	_poll_staged_reconnect_full_state_sends()
+	if _pending_p2p_sends_empty():
 		return
 	var poll_start_usec = OS.get_ticks_usec()
 	if _steam == null or not _steam_ready or not _steam_has_method("sendMessageToUser"):
 		return
 	var now = OS.get_ticks_msec()
 	var sent = 0
-	var head_age = 0
-	if not _pending_p2p_chunk_sends.empty() and typeof(_pending_p2p_chunk_sends[0]) == TYPE_DICTIONARY:
-		head_age = now - int(_pending_p2p_chunk_sends[0].get("queued_msec", now))
-	if _pending_p2p_chunk_sends.size() >= BO_NET_DIAG_PENDING_QUEUE_WARN or head_age >= BO_NET_DIAG_PENDING_AGE_WARN_MSEC:
-		_bo_net_diag_state_change("SEND_QUEUE", str(_pending_p2p_chunk_sends.size()) + ":" + str(head_age), "pending=" + str(_pending_p2p_chunk_sends.size()) + " head_age_ms=" + str(head_age), 1000)
-	while sent < P2P_JSON_CHUNK_SENDS_PER_FRAME and not _pending_p2p_chunk_sends.empty():
-		var queued = _pending_p2p_chunk_sends[0]
-		if typeof(queued) != TYPE_DICTIONARY:
-			_pending_p2p_chunk_sends.pop_front()
-			continue
-		var next_send_msec = int(queued.get("next_send_msec", 0))
-		if next_send_msec > now:
-			# Keep strict ordering for this peer/channel. If the head packet hit
-			# Steam's send-buffer limit, later packets must not jump ahead.
+	var expired = int(_network_send_scheduler.prune_expired(now))
+	if expired > 0:
+		_bo_net_diag_log("MESSAGE_DROP", "reason=QUEUE_AGE_LIMIT count=" + str(expired))
+	var blocked_peer_channels = {}
+	var attempts = 0
+	while attempts < P2P_JSON_CHUNK_SENDS_PER_FRAME and not _pending_p2p_sends_empty():
+		var queued = _network_send_scheduler.take_next_ready(now, blocked_peer_channels)
+		if typeof(queued) != TYPE_DICTIONARY or queued.empty():
 			break
-		queued = _pending_p2p_chunk_sends.pop_front()
+		attempts += 1
 		var target_steam_id = str(queued.get("target_steam_id", ""))
 		if target_steam_id == "" or target_steam_id == "0":
+			continue
+		var queued_generation = int(queued.get("connection_generation", 0))
+		var queued_nonce = str(queued.get("connection_nonce", ""))
+		if queued_generation != _get_peer_connection_generation(target_steam_id) or queued_nonce != _get_peer_connection_nonce(target_steam_id):
+			_bo_net_diag_log("STALE_GENERATION", "remote_steam_id=" + target_steam_id + " msg_type=" + str(queued.get("final_msg_type", "")) + " queued_generation=" + str(queued_generation) + " current_generation=" + str(_get_peer_connection_generation(target_steam_id)) + " reason=QUEUE_ATTEMPT_MISMATCH")
 			continue
 		_prepare_steam_messages_session_with_peer(target_steam_id, "send_chunk")
 		var payload = queued.get("payload", PoolByteArray())
@@ -6502,15 +7365,45 @@ func _poll_pending_p2p_chunk_sends() -> void:
 			var result_name = _steam_networking_result_name(result)
 			var log_type = final_msg_type if is_direct else "p2p_json_chunk:" + final_msg_type
 			_log_steam_message_send_failure(target_steam_id, log_type, payload.size(), send_flags, channel, result, result_name)
-			var retry_count = int(queued.get("retry_count", 0)) + 1
-			queued["retry_count"] = retry_count
 			queued["last_result"] = result
 			queued["last_result_name"] = result_name
-			queued["next_send_msec"] = now + P2P_JSON_CHUNK_RETRY_DELAY_MSEC
-			_pending_p2p_chunk_sends.insert(0, queued)
-			break
+			_network_send_scheduler.report_failure(queued, now)
+			blocked_peer_channels[target_steam_id + "|" + str(channel)] = true
+			continue
+		_network_send_scheduler.report_success(queued)
 		sent += 1
-	_bo_net_diag_cost("poll_pending_chunk_send_loop", poll_start_usec, "sent=" + str(sent) + " pending=" + str(_pending_p2p_chunk_sends.size()) + " head_age_ms=" + str(head_age))
+	_poll_staged_reconnect_full_state_sends()
+	_bo_net_diag_cost("poll_pending_chunk_send_loop", poll_start_usec, "attempts=" + str(attempts) + " sent=" + str(sent) + " pending=" + str(_pending_p2p_send_count()))
+
+
+func _poll_staged_reconnect_full_state_sends() -> void:
+	if not _is_game_host():
+		return
+	for peer_value in _peer_session_by_steam_id.keys():
+		_pump_staged_reconnect_full_state_for_peer(str(peer_value))
+
+
+func _pump_staged_reconnect_full_state_for_peer(steam_id: String) -> void:
+	var session = _get_peer_network_session(steam_id, false)
+	if session == null or not session.has_method("has_staged_full_state_messages"):
+		return
+	var attempts = 0
+	while session.has_staged_full_state_messages() and attempts < 16:
+		if _network_send_scheduler != null and _network_send_scheduler.has_pending(steam_id, P2P_CHANNEL_MENU):
+			return
+		var staged = session.peek_full_state_message()
+		if typeof(staged) != TYPE_DICTIONARY or typeof(staged.get("message", null)) != TYPE_DICTIONARY:
+			session.mark_full_state_message_sent()
+			continue
+		_p2p_channel_override_by_peer[steam_id] = P2P_CHANNEL_MENU
+		_reconnect_revision_override_by_peer[steam_id] = int(session.expected_revision)
+		var accepted = _send_p2p_json(steam_id, staged["message"], bool(staged.get("reliable", true)))
+		_p2p_channel_override_by_peer.erase(steam_id)
+		_reconnect_revision_override_by_peer.erase(steam_id)
+		if not accepted:
+			return
+		session.mark_full_state_message_sent()
+		attempts += 1
 
 func _slice_pool_byte_array(bytes: PoolByteArray, start: int, length: int) -> PoolByteArray:
 	var out = PoolByteArray()
@@ -6523,38 +7416,74 @@ func _slice_pool_byte_array(bytes: PoolByteArray, start: int, length: int) -> Po
 
 
 func _receive_p2p_json_chunk(from_steam_id: String, message: Dictionary) -> Dictionary:
-	var message_lobby_id = _get_message_lobby_id(message)
-	if _lobby_id != 0 and message_lobby_id != str(_lobby_id):
+	var session = _get_peer_network_session(from_steam_id, false)
+	if session == null or not _is_current_lobby_remote_member(from_steam_id):
+		_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + from_steam_id + " msg_type=p2p_json_chunk reason=NON_MEMBER_OR_NO_SESSION")
 		return {}
+	var envelope_result = session.validate_envelope(message, {
+		"protocol_version": NETWORK_PROTOCOL_VERSION,
+		"lobby_id": str(_lobby_id),
+		"host_steam_id": _get_game_host_steam_id(),
+		"sender_steam_id": from_steam_id
+	})
+	if not bool(envelope_result.get("accepted", false)):
+		_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + from_steam_id + " msg_type=p2p_json_chunk reason=" + str(envelope_result.get("reason", "INVALID_ENVELOPE")))
+		return {}
+	var incoming_generation = int(message.get("connection_generation", message.get("session_epoch", 0)))
+	var incoming_nonce = str(message.get("connection_nonce", ""))
 	var chunk_id = str(message.get("chunk_id", ""))
 	var chunk_index = int(message.get("chunk_index", -1))
 	var chunk_count = int(message.get("chunk_count", 0))
-	if chunk_id == "" or chunk_index < 0 or chunk_count <= 1 or chunk_index >= chunk_count:
+	var original_bytes = int(message.get("original_bytes", 0))
+	if chunk_id == "" or chunk_id.length() > 256 or chunk_index < 0 or chunk_index >= chunk_count:
+		return {}
+	var payload_b64 = str(message.get("payload_b64", ""))
+	if payload_b64 == "" or payload_b64.length() > 60000:
 		return {}
 	var now = OS.get_ticks_msec()
 	_prune_stale_p2p_json_chunks(now)
-	var key = from_steam_id + ":" + chunk_id
+	var key = from_steam_id + ":" + str(incoming_generation) + ":" + incoming_nonce + ":" + chunk_id
 	var entry = _incoming_p2p_chunks.get(key, {})
 	if typeof(entry) != TYPE_DICTIONARY or entry.empty():
+		var peer_assemblies = 0
+		for active_key in _incoming_p2p_chunks.keys():
+			if str(active_key).begins_with(from_steam_id + ":"):
+				peer_assemblies += 1
+		var admission = session.validate_chunk_metadata(chunk_count, original_bytes, peer_assemblies, _incoming_p2p_chunks.size())
+		if not bool(admission.get("accepted", false)):
+			_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + from_steam_id + " msg_type=p2p_json_chunk reason=" + str(admission.get("reason", "CHUNK_LIMIT")) + " chunks=" + str(chunk_count) + " bytes=" + str(original_bytes) + " peer_assemblies=" + str(peer_assemblies) + " total_assemblies=" + str(_incoming_p2p_chunks.size()))
+			return {}
 		entry = {
 			"chunk_count": chunk_count,
 			"final_msg_type": str(message.get("final_msg_type", "")),
-			"original_bytes": int(message.get("original_bytes", 0)),
+			"original_bytes": original_bytes,
+			"connection_generation": incoming_generation,
+			"connection_nonce": incoming_nonce,
 			"chunks": {},
+			"received_bytes": 0,
 			"created_msec": now,
 			"last_msec": now
 		}
 		_incoming_p2p_chunks[key] = entry
-	if int(entry.get("chunk_count", 0)) != chunk_count:
+	if int(entry.get("chunk_count", 0)) != chunk_count or int(entry.get("original_bytes", 0)) != original_bytes or str(entry.get("final_msg_type", "")) != str(message.get("final_msg_type", "")):
+		_incoming_p2p_chunks.erase(key)
 		return {}
 	var chunks = entry.get("chunks", {})
 	if typeof(chunks) != TYPE_DICTIONARY:
 		chunks = {}
-	var raw_chunk = Marshalls.base64_to_raw(str(message.get("payload_b64", "")))
-	if raw_chunk.size() <= 0:
+	var raw_chunk = Marshalls.base64_to_raw(payload_b64)
+	if raw_chunk.size() <= 0 or raw_chunk.size() > P2P_JSON_CHUNK_RAW_BYTES:
+		return {}
+	var previous_size = 0
+	if chunks.has(chunk_index) and typeof(chunks[chunk_index]) == TYPE_RAW_ARRAY:
+		previous_size = chunks[chunk_index].size()
+	var next_received_bytes = int(entry.get("received_bytes", 0)) - previous_size + raw_chunk.size()
+	if next_received_bytes > original_bytes or next_received_bytes > P2P_JSON_MAX_REASSEMBLED_BYTES:
+		_incoming_p2p_chunks.erase(key)
 		return {}
 	chunks[chunk_index] = raw_chunk
 	entry["chunks"] = chunks
+	entry["received_bytes"] = next_received_bytes
 	entry["last_msec"] = now
 	_incoming_p2p_chunks[key] = entry
 	if chunks.size() < chunk_count:
@@ -6569,12 +7498,14 @@ func _receive_p2p_json_chunk(from_steam_id: String, message: Dictionary) -> Dict
 		for j in range(part.size()):
 			full_payload.append(part[j])
 	_incoming_p2p_chunks.erase(key)
-	var original_bytes = int(entry.get("original_bytes", 0))
-	if original_bytes > 0 and full_payload.size() != original_bytes:
+	if full_payload.size() != original_bytes:
 		return {}
 	var text = full_payload.get_string_from_utf8()
 	var parsed = parse_json(text)
 	if typeof(parsed) != TYPE_DICTIONARY:
+		return {}
+	if int(parsed.get("protocol_version", 0)) != NETWORK_PROTOCOL_VERSION or _get_message_lobby_id(parsed) != str(_lobby_id) or str(parsed.get("game_host_steam_id", "")) != _get_game_host_steam_id() or str(parsed.get("sender_steam_id", "")) != from_steam_id or int(parsed.get("connection_generation", parsed.get("session_epoch", 0))) != incoming_generation or str(parsed.get("connection_nonce", "")) != incoming_nonce:
+		_bo_net_diag_log("MESSAGE_DROP", "remote_steam_id=" + from_steam_id + " msg_type=" + str(parsed.get("msg_type", "")) + " reason=REASSEMBLED_ENVELOPE_MISMATCH")
 		return {}
 	return parsed
 
@@ -6691,6 +7622,9 @@ func _log_steam_message_send_failure(target_steam_id: String, msg_type: String, 
 	var retry_left = 0
 	if _client_hello_retry_active and _client_hello_next_retry_msec > 0:
 		retry_left = max(0, _client_hello_next_retry_msec - OS.get_ticks_msec())
+	var generation = _get_peer_connection_generation(target_steam_id)
+	var queue_age = 0
+	_bo_net_diag_log("SEND_FAIL", "local_steam_id=" + _self_steam_id + " remote_steam_id=" + target_steam_id + " lobby_id=" + str(_lobby_id) + " connection_generation=" + str(generation) + " connection_nonce=" + _get_peer_connection_nonce(target_steam_id) + " session_state=" + str(_client_session_state) + " message_type=" + msg_type + " payload_bytes=" + str(bytes) + " reliable=" + str(send_flags != 0) + " channel=" + str(channel) + " queue_length=" + str(_pending_p2p_send_count()) + " oldest_queue_age_ms=" + str(queue_age) + " retry_until_ms=" + str(retry_left) + " send_result=" + str(result_name) + " raw_result=" + str(result))
 
 
 func _get_p2p_channel_for_message_type(msg_type: String) -> int:
@@ -6706,6 +7640,8 @@ func _on_network_messages_session_request(remote_steam_id = 0) -> void:
 	if _steam != null and _steam_has_method("acceptSessionWithUser") and steam_id != "" and steam_id != "0":
 		var ok = _steam.acceptSessionWithUser(int(steam_id))
 		_accepted_p2p_sessions[steam_id] = ok
+		_bo_net_diag_log("SESSION_ACCEPT", "local_steam_id=" + _self_steam_id + " remote_steam_id=" + steam_id + " lobby_id=" + str(_lobby_id) + " result=" + str(ok))
+		_bo_conn_log("SESSION_ACCEPT", "local_steam_id=" + _self_steam_id + " remote_steam_id=" + steam_id + " lobby_id=" + str(_lobby_id) + " result=" + str(ok))
 
 
 func _on_network_messages_session_failed(remote_steam_id = 0, session_error = 0, end_reason = 0, debug_message = "") -> void:
@@ -6720,6 +7656,8 @@ func _on_network_messages_session_failed(remote_steam_id = 0, session_error = 0,
 		return
 
 	_reset_steam_messages_session_with_peer(steam_id, "session_failed")
+	_bo_net_diag_log("SESSION_FAILED", "local_steam_id=" + _self_steam_id + " remote_steam_id=" + steam_id + " lobby_id=" + str(_lobby_id) + " session_error=" + str(session_error) + " end_reason=" + str(end_reason) + " debug=" + str(debug_message))
+	_bo_conn_log("SESSION_FAILED", "local_steam_id=" + _self_steam_id + " remote_steam_id=" + steam_id + " lobby_id=" + str(_lobby_id) + " session_error=" + str(session_error) + " end_reason=" + str(end_reason) + " debug=" + str(debug_message))
 
 	if _lobby_id == 0:
 		return
@@ -6727,10 +7665,21 @@ func _on_network_messages_session_failed(remote_steam_id = 0, session_error = 0,
 	if _is_game_host():
 		if _member_list_has_steam_id(steam_id):
 			_remember_host_remote_id(steam_id)
-			_schedule_host_phase_resend_after_session_recovery(steam_id)
+			var peer_session = _get_peer_network_session(steam_id, true)
+			if peer_session != null and int(peer_session.connection_generation) > 0:
+				peer_session.state = SESSION_STATE_FAILED
+				peer_session.can_send_input = false
+				_clear_peer_transport_state(steam_id, "session_failed")
+				_send_p2p_json(steam_id, {
+					"msg_type": "reconnect_required",
+					"reason": "steam_session_failed",
+					"connection_generation": int(peer_session.connection_generation),
+					"connection_nonce": str(peer_session.connection_nonce)
+				}, true)
 	else:
 		var host_id = _get_game_host_steam_id()
 		if host_id != "" and steam_id == host_id:
+			_begin_client_connection_generation("session_failed")
 			_start_client_hello_retry()
 			call_deferred("_send_client_hello_to_host")
 
@@ -6754,6 +7703,10 @@ func _resend_host_phase_after_session_recovery(steam_id: String) -> void:
 	if steam_id == "" or steam_id == _self_steam_id:
 		return
 	if not _member_list_has_steam_id(steam_id):
+		return
+	var peer_session = _get_peer_network_session(steam_id, false)
+	if peer_session != null and str(peer_session.state) != SESSION_STATE_READY:
+		_send_reconnect_challenge_to_client(steam_id, int(peer_session.connection_generation))
 		return
 	_prepare_steam_messages_session_with_peer(steam_id, "session_recovery_resend")
 	_send_host_phase_setup_to_client(steam_id, true)
@@ -6830,7 +7783,7 @@ func _on_online_end_run_exit_pressed() -> void:
 	var scene = get_tree().current_scene
 	if not _is_live_node(scene) or not _is_in_end_run_scene():
 		return
-	leave_lobby()
+	leave_lobby("end_run_exit")
 	if _is_live_node(scene) and scene.has_method("_on_ExitButton_pressed"):
 		scene._on_ExitButton_pressed()
 		return
@@ -6878,7 +7831,7 @@ func _poll_online_flow_lifecycle() -> void:
 		return
 
 	if now - _online_flow_left_since_msec >= 1200:
-		leave_lobby()
+		leave_lobby("online_flow_exit")
 
 
 func _handle_online_character_selection_restage_after_new_run() -> void:
@@ -7893,7 +8846,7 @@ func _on_lobby_toggle_button_toggled(button_pressed: bool) -> void:
 		return
 
 	if _lobby_id != 0 or _has_active_online_session():
-		leave_lobby()
+		leave_lobby("lobby_toggle_off")
 	else:
 		_clear_join_presence()
 	_update_lobby_toggle_button_state()

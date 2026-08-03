@@ -1,11 +1,14 @@
 extends Node
 
+const ProtocolConfig = preload("res://mods-unpacked/six666-BrotatoOnline/scripts/network_protocol_config.gd")
+
 # Public-lobby discovery and UI are kept separate from the gameplay replication
 # path. The SteamLobbyManager remains the single owner of lobby join/leave state.
 
-const MOD_ID = "six666-BrotatoOnline"
-const MOD_VERSION = "4.0.0"
-const GAME_VERSION = "1.1.15.4"
+const MOD_ID = ProtocolConfig.MOD_ID
+const MOD_VERSION = ProtocolConfig.MOD_VERSION
+const NETWORK_PROTOCOL_VERSION = ProtocolConfig.PROTOCOL_VERSION
+const GAME_VERSION = ProtocolConfig.GAME_VERSION
 const META_PUBLIC_LOBBY_ENABLED = "brotato_online_public_lobby_enabled"
 const SETTINGS_FILE_PATH = "user://brotato_online_settings.cfg"
 const SETTINGS_SECTION = "network"
@@ -769,6 +772,7 @@ func _read_lobby_entry(lobby_id: int) -> Dictionary:
 	if mod_id != MOD_ID or visibility != "public":
 		return {}
 	var mod_version = str(_steam.getLobbyData(lobby_id, "mod_version"))
+	var protocol_version = int(str(_steam.getLobbyData(lobby_id, "protocol_version")))
 	var game_version = str(_steam.getLobbyData(lobby_id, "game_version"))
 	var state = str(_steam.getLobbyData(lobby_id, "state"))
 	if state == "":
@@ -795,7 +799,7 @@ func _read_lobby_entry(lobby_id: int) -> Dictionary:
 	if member_count <= 0:
 		member_count = 1
 
-	var compatible = mod_version == MOD_VERSION and game_version == GAME_VERSION
+	var compatible = mod_version == MOD_VERSION and protocol_version == NETWORK_PROTOCOL_VERSION and game_version == GAME_VERSION
 	var joinable_state = state == "character_selection" or state == "coop_resume"
 	var full = member_count >= member_limit
 	return {

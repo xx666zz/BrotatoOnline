@@ -129,6 +129,7 @@ var _last_local_run_page_focus_key = {}
 var _last_local_run_page_state_key_by_player = {}
 var _client_progression_intercept_container_id = 0
 var _processed_run_page_action_ids = {}
+var _processed_run_page_action_origin_by_id = {}
 var _last_run_page_action_seq_by_origin = {}
 var _applying_remote_run_page_action = false
 var _last_progression_options_processed_key = ""
@@ -541,7 +542,9 @@ func reset_online_session_state(reason: String = "") -> void:
 	_pending_client_prime_screen = ""
 	_pending_client_prime_until_msec = 0
 	_processed_run_page_action_ids.clear()
+	_processed_run_page_action_origin_by_id.clear()
 	_last_run_page_action_seq_by_origin.clear()
+	_recent_mutating_run_page_action_keys.clear()
 	_applying_remote_run_page_action = false
 	_client_scene_change_in_flight_screen = ""
 	_client_scene_change_in_flight_path = ""
@@ -553,6 +556,25 @@ func reset_online_session_state(reason: String = "") -> void:
 	_run_page_game_start_guard_logged_key = ""
 	_reset_run_page_runtime_state_for_game_start(true)
 	restore_progress_mirror()
+
+
+func clear_connection_action_state(origin_steam_id: String = "") -> void:
+	if origin_steam_id == "":
+		_processed_run_page_action_ids.clear()
+		_processed_run_page_action_origin_by_id.clear()
+		_last_run_page_action_seq_by_origin.clear()
+		_recent_mutating_run_page_action_keys.clear()
+		return
+	for action_id in _processed_run_page_action_origin_by_id.keys():
+		if str(_processed_run_page_action_origin_by_id[action_id]) == origin_steam_id:
+			_processed_run_page_action_origin_by_id.erase(action_id)
+			_processed_run_page_action_ids.erase(action_id)
+	for sequence_key in _last_run_page_action_seq_by_origin.keys():
+		if str(sequence_key).begins_with(origin_steam_id + "|"):
+			_last_run_page_action_seq_by_origin.erase(sequence_key)
+	for mutation_key in _recent_mutating_run_page_action_keys.keys():
+		if str(mutation_key).begins_with(origin_steam_id + "|"):
+			_recent_mutating_run_page_action_keys.erase(mutation_key)
 
 
 func has_host_catalog_for_screen(screen: String) -> bool:
@@ -758,12 +780,16 @@ func consume_local_run_page_action_messages() -> Array:
 func receive_run_page_action_sync(from_steam_id: String, message: Dictionary, self_steam_id: String) -> Dictionary:
 	var action_type = str(message.get("action_type", ""))
 	var action_id = str(message.get("action_id", ""))
+	var origin_steam_id = str(message.get("origin_steam_id", ""))
+	if origin_steam_id == "":
+		origin_steam_id = from_steam_id
 	if action_id != "":
 		if _processed_run_page_action_ids.has(action_id):
 			return {}
-		if _is_stale_run_page_action(action_id):
+		if _is_stale_run_page_action(action_id, message):
 			return {}
 		_processed_run_page_action_ids[action_id] = OS.get_ticks_msec()
+		_processed_run_page_action_origin_by_id[action_id] = origin_steam_id
 		_trim_processed_run_page_actions()
 
 	if _is_game_start_guard_active() and _is_guarded_run_page_action(action_type):
@@ -775,9 +801,6 @@ func receive_run_page_action_sync(from_steam_id: String, message: Dictionary, se
 			_end_game_start_guard("accept_progression_action:" + action_type)
 		else:
 			return {}
-	var origin_steam_id = str(message.get("origin_steam_id", ""))
-	if origin_steam_id == "":
-		origin_steam_id = from_steam_id
 	if action_id == "" and _is_duplicate_mutating_run_page_action(message, origin_steam_id):
 		return {}
 
@@ -7717,18 +7740,24 @@ func _build_all_progression_visible_options(ui: Node = null, include_marker_stat
 	return states
 
 
-func _is_stale_run_page_action(action_id: String) -> bool:
-	var parts = action_id.split(":")
-	if parts.size() < 2:
+func _is_stale_run_page_action(action_id: String, message: Dictionary = {}) -> bool:
+	if typeof(message) != TYPE_DICTIONARY:
+		return true
+	# SteamLobbyManager's production protocol core owns normal wire sequencing.
+	# Keep this explicit-field fallback for direct internal callers; action_id is an
+	# opaque idempotency key and is never parsed as protocol state.
+	if bool(message.get("_bo_sequence_validated", false)):
 		return false
-	var origin = str(parts[0])
-	var seq = int(parts[1])
-	if origin == "" or seq <= 0:
-		return false
-	var last_seq = int(_last_run_page_action_seq_by_origin.get(origin, 0))
+	var origin = str(message.get("origin_steam_id", ""))
+	var stream = str(message.get("action_stream", ""))
+	var seq = int(message.get("sequence", 0))
+	if origin == "" or stream == "" or seq <= 0:
+		return true
+	var sequence_key = origin + "|" + stream
+	var last_seq = int(_last_run_page_action_seq_by_origin.get(sequence_key, 0))
 	if seq <= last_seq:
 		return true
-	_last_run_page_action_seq_by_origin[origin] = seq
+	_last_run_page_action_seq_by_origin[sequence_key] = seq
 	return false
 
 
@@ -7791,6 +7820,7 @@ func _trim_processed_run_page_actions() -> void:
 	for key in _processed_run_page_action_ids.keys():
 		if now - int(_processed_run_page_action_ids[key]) > 30000:
 			_processed_run_page_action_ids.erase(key)
+			_processed_run_page_action_origin_by_id.erase(key)
 
 
 func _get_steam_lobby_manager() -> Node:

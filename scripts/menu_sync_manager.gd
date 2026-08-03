@@ -18,6 +18,7 @@ const SHOP_HELD_ITEMS_SYNC_INCREMENTAL_ONLY = "incremental_only"
 const ENDLESS_INCREMENTAL_ITEMS_ONLY_START_WAVE = 21
 const SHOP_ITEMS_RESYNC_REQUEST_COOLDOWN_MSEC = 1500
 const SHOP_CUSTOM_POPUP_BUTTON_ACTION = "shop_custom_popup_button"
+const FOCUS_CONTROL_GUARD = preload("res://mods-unpacked/six666-BrotatoOnline/scripts/focus_control_guard.gd")
 
 # ItemService.TierData indexes. The enum is internal to ItemService, so mirror only
 # the stable fields required to validate its unlocked pools before opening a shop.
@@ -5466,8 +5467,9 @@ func _get_current_shop_focus_target(shop: Node, player_index: int) -> String:
 	if not _is_valid_shop_node(shop):
 		return ""
 	var focus_emulator = Utils.get_focus_emulator(player_index)
+	var focus_emulator_available = _is_live_ref(focus_emulator)
 	var focused_control = _safe_get(focus_emulator, "focused_control", null)
-	if _is_live_ref(focused_control):
+	if focus_emulator_available and _is_live_ref(focused_control):
 		var reroll_button = shop._get_reroll_button(player_index) if shop.has_method("_get_reroll_button") else null
 		if _is_live_ref(reroll_button) and focused_control == reroll_button:
 			return "reroll"
@@ -5489,6 +5491,11 @@ func _get_current_shop_focus_target(shop: Node, player_index: int) -> String:
 		if inv_target != "":
 			return inv_target
 
+	# A live FocusEmulator with no recognized control means there is no current
+	# user focus. Do not resurrect the vanilla shop cache from a prior shop page.
+	if focus_emulator_available:
+		return FOCUS_CONTROL_GUARD.resolve_shop_focus_target(true, "", "")
+
 	# Fallback for the vanilla shop state variable. This only tracks shop buy items,
 	# not inventory weapons/items, so keep it after the actual FocusEmulator check.
 	var focused_items = _safe_get(shop, "_focused_shop_item", [])
@@ -5496,8 +5503,8 @@ func _get_current_shop_focus_target(shop: Node, player_index: int) -> String:
 		var focused_shop_item = focused_items[player_index]
 		var idx = _get_shop_item_index(focused_shop_item, player_index)
 		if idx >= 0:
-			return "item_" + str(idx)
-	return ""
+			return FOCUS_CONTROL_GUARD.resolve_shop_focus_target(false, "", "item_" + str(idx))
+	return FOCUS_CONTROL_GUARD.resolve_shop_focus_target(false, "", "")
 
 
 func _get_shop_focus_target_stable_identity(shop: Node, player_index: int, target: String) -> Dictionary:
@@ -5664,7 +5671,7 @@ func _get_shop_inventory_elements(shop: Node, player_index: int, is_weapon: bool
 
 
 func _set_focus_emulator_control_safely(focus_emulator, control) -> bool:
-	if not _is_live_ref(focus_emulator) or not _is_live_ref(control):
+	if not _is_live_ref(focus_emulator) or not FOCUS_CONTROL_GUARD.can_apply_focus_control(control):
 		return false
 
 	# FocusEmulator._set_focused_control_with_style(control, false) intentionally
@@ -10251,10 +10258,9 @@ func _apply_focus_element_for_host_display(selection: Node, player_index: int, e
 
 
 func _apply_focus_visual_only(player_index: int, element) -> void:
-	if not _is_live_ref(element):
+	if not FOCUS_CONTROL_GUARD.can_apply_focus_control(element):
 		return
 
-	FocusEmulatorSignal.set_expected_control(element, player_index)
 	var focus_emulator = Utils.get_focus_emulator(player_index)
 	if _is_live_ref(focus_emulator):
 		if focus_emulator is CanvasItem:
@@ -10269,6 +10275,8 @@ func _apply_focus_visual_only(player_index: int, element) -> void:
 
 	var fallback_focus = Utils.get_focus_emulator(player_index)
 	if _is_live_ref(fallback_focus):
+		if FOCUS_CONTROL_GUARD.should_expect_focus_signal_after_direct_assignment(false):
+			FocusEmulatorSignal.set_expected_control(element, player_index)
 		Utils.focus_player_control(element, player_index, fallback_focus)
 
 

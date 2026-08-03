@@ -44,6 +44,7 @@ run_godot_tests() {
 	cp "$ROOT_DIR/scripts/online_slot_layout.gd" "$test_project/scripts/online_slot_layout.gd"
 	mkdir -p "$test_project/mods-unpacked/six666-BrotatoOnline/scripts"
 	cp "$ROOT_DIR/scripts/network_protocol_config.gd" "$test_project/mods-unpacked/six666-BrotatoOnline/scripts/network_protocol_config.gd"
+	cp "$ROOT_DIR/scripts/focus_control_guard.gd" "$test_project/mods-unpacked/six666-BrotatoOnline/scripts/focus_control_guard.gd"
 	cp "$ROOT_DIR/scripts/online_slot_layout.gd" "$test_project/mods-unpacked/six666-BrotatoOnline/scripts/online_slot_layout.gd"
 	sed -i '1r tests/godot/parser_globals.gdinc' "$test_project/scripts/steam_lobby_manager.gd"
 	sed -i '1r tests/godot/parser_globals.gdinc' "$test_project/scripts/menu_sync_manager.gd"
@@ -92,7 +93,9 @@ run_godot_tests() {
 		steam_callback_driver_switching \
 		protocol_config \
 		focus_control_guard \
-		online_slot_reset_preserves_local_layout; do
+		shop_focus_target_fallback_policy \
+		online_slot_reset_preserves_local_layout \
+		host_proxy_death_cleanup_policy; do
 		if ! grep -Fq "[BO_TEST_CASE_COMPLETE] $marker" "$godot_output"; then
 			echo "Missing Godot test completion marker: $marker" >&2
 			return 1

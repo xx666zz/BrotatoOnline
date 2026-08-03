@@ -15,7 +15,10 @@ func _init() -> void:
 	_test_steam_callback_driver_switching()
 	_test_protocol_config()
 	_test_focus_control_guard_rejects_off_tree_controls()
+	_test_shop_focus_target_fallback_policy()
+	_test_focus_application_policy()
 	_test_online_slot_reset_preserves_local_layout()
+	_test_host_proxy_death_cleanup_policy()
 	_finish()
 
 
@@ -347,6 +350,35 @@ func _test_focus_control_guard_rejects_off_tree_controls() -> void:
 	print("[BO_TEST_CASE_COMPLETE] focus_control_guard")
 
 
+func _test_shop_focus_target_fallback_policy() -> void:
+	var guard_script = _load_source_script(_source_root + "/scripts/focus_control_guard.gd")
+	_assert(guard_script != null, "focus target policy loads")
+	if guard_script == null:
+		return
+	_assert(str(guard_script.resolve_shop_focus_target(true, "", "item_0")) == "", "live focus emulator does not fall back to stale shop item")
+	_assert(str(guard_script.resolve_shop_focus_target(true, "go", "item_0")) == "go", "live focus emulator keeps the actual target")
+	_assert(str(guard_script.resolve_shop_focus_target(false, "", "item_0")) == "item_0", "missing focus emulator keeps legacy fallback")
+	print("[BO_TEST_CASE_COMPLETE] shop_focus_target_fallback_policy")
+
+
+func _test_focus_application_policy() -> void:
+	var guard_script = _load_source_script(_source_root + "/scripts/focus_control_guard.gd")
+	_assert(guard_script != null, "focus application policy loads")
+	if guard_script == null:
+		return
+	var scene_root = Node.new()
+	get_root().add_child(scene_root)
+	var control = Button.new()
+	_assert(not guard_script.can_apply_focus_control(control), "detached controls are rejected before focus application")
+	scene_root.add_child(control)
+	_assert(guard_script.can_apply_focus_control(control), "attached visible controls can receive focus application")
+	_assert(not guard_script.should_expect_focus_signal_after_direct_assignment(true), "direct focus assignment does not wait for a focus signal")
+	_assert(guard_script.should_expect_focus_signal_after_direct_assignment(false), "engine focus calls still wait for a focus signal")
+	control.queue_free()
+	scene_root.queue_free()
+	print("[BO_TEST_CASE_COMPLETE] focus_application_policy")
+
+
 func _test_online_slot_reset_preserves_local_layout() -> void:
 	var layout_script = _load_source_script(_source_root + "/scripts/online_slot_layout.gd")
 	_assert(layout_script != null, "online slot layout helper loads")
@@ -369,6 +401,23 @@ func _test_online_slot_reset_preserves_local_layout() -> void:
 	second_reopen.append([1, 1])
 	_assert(second_reopen.size() == 4, "repeated create/leave/create keeps the four-slot lobby layout")
 	print("[BO_TEST_CASE_COMPLETE] online_slot_reset_preserves_local_layout")
+
+
+func _test_host_proxy_death_cleanup_policy() -> void:
+	var replica_script = _load_source_script(_source_root + "/scripts/battle_replica_manager.gd")
+	_assert(replica_script != null, "battle replica manager loads for proxy death policy")
+	if replica_script == null:
+		return
+	var replica = replica_script.new()
+	_assert(replica != null, "battle replica manager can instantiate for proxy death policy")
+	if replica == null:
+		return
+	_assert(replica.should_remove_dead_host_proxy("pet", false, false), "client removes a dead pet Host proxy when death sync is disabled")
+	_assert(not replica.should_remove_dead_host_proxy("enemy", false, false), "client keeps enemy spawner bookkeeping on a local enemy death")
+	_assert(not replica.should_remove_dead_host_proxy("pet", true, false), "Host does not remove its own entity through the client proxy policy")
+	_assert(not replica.should_remove_dead_host_proxy("pet", false, true), "delayed death sync keeps the pet proxy for the death animation path")
+	replica.queue_free()
+	print("[BO_TEST_CASE_COMPLETE] host_proxy_death_cleanup_policy")
 
 
 func _load_source_script(script_path: String):

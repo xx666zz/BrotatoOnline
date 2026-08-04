@@ -18,6 +18,7 @@ const SHOP_HELD_ITEMS_SYNC_INCREMENTAL_ONLY = "incremental_only"
 const ENDLESS_INCREMENTAL_ITEMS_ONLY_START_WAVE = 21
 const SHOP_ITEMS_RESYNC_REQUEST_COOLDOWN_MSEC = 1500
 const SHOP_CUSTOM_POPUP_BUTTON_ACTION = "shop_custom_popup_button"
+const FOCUS_CONTROL_GUARD = preload("res://mods-unpacked/six666-BrotatoOnline/scripts/focus_control_guard.gd")
 
 # ItemService.TierData indexes. The enum is internal to ItemService, so mirror only
 # the stable fields required to validate its unlocked pools before opening a shop.
@@ -129,6 +130,7 @@ var _last_local_run_page_focus_key = {}
 var _last_local_run_page_state_key_by_player = {}
 var _client_progression_intercept_container_id = 0
 var _processed_run_page_action_ids = {}
+var _processed_run_page_action_origin_by_id = {}
 var _last_run_page_action_seq_by_origin = {}
 var _applying_remote_run_page_action = false
 var _last_progression_options_processed_key = ""
@@ -541,7 +543,9 @@ func reset_online_session_state(reason: String = "") -> void:
 	_pending_client_prime_screen = ""
 	_pending_client_prime_until_msec = 0
 	_processed_run_page_action_ids.clear()
+	_processed_run_page_action_origin_by_id.clear()
 	_last_run_page_action_seq_by_origin.clear()
+	_recent_mutating_run_page_action_keys.clear()
 	_applying_remote_run_page_action = false
 	_client_scene_change_in_flight_screen = ""
 	_client_scene_change_in_flight_path = ""
@@ -553,6 +557,25 @@ func reset_online_session_state(reason: String = "") -> void:
 	_run_page_game_start_guard_logged_key = ""
 	_reset_run_page_runtime_state_for_game_start(true)
 	restore_progress_mirror()
+
+
+func clear_connection_action_state(origin_steam_id: String = "") -> void:
+	if origin_steam_id == "":
+		_processed_run_page_action_ids.clear()
+		_processed_run_page_action_origin_by_id.clear()
+		_last_run_page_action_seq_by_origin.clear()
+		_recent_mutating_run_page_action_keys.clear()
+		return
+	for action_id in _processed_run_page_action_origin_by_id.keys():
+		if str(_processed_run_page_action_origin_by_id[action_id]) == origin_steam_id:
+			_processed_run_page_action_origin_by_id.erase(action_id)
+			_processed_run_page_action_ids.erase(action_id)
+	for sequence_key in _last_run_page_action_seq_by_origin.keys():
+		if str(sequence_key).begins_with(origin_steam_id + "|"):
+			_last_run_page_action_seq_by_origin.erase(sequence_key)
+	for mutation_key in _recent_mutating_run_page_action_keys.keys():
+		if str(mutation_key).begins_with(origin_steam_id + "|"):
+			_recent_mutating_run_page_action_keys.erase(mutation_key)
 
 
 func has_host_catalog_for_screen(screen: String) -> bool:
@@ -758,12 +781,16 @@ func consume_local_run_page_action_messages() -> Array:
 func receive_run_page_action_sync(from_steam_id: String, message: Dictionary, self_steam_id: String) -> Dictionary:
 	var action_type = str(message.get("action_type", ""))
 	var action_id = str(message.get("action_id", ""))
+	var origin_steam_id = str(message.get("origin_steam_id", ""))
+	if origin_steam_id == "":
+		origin_steam_id = from_steam_id
 	if action_id != "":
 		if _processed_run_page_action_ids.has(action_id):
 			return {}
-		if _is_stale_run_page_action(action_id):
+		if _is_stale_run_page_action(action_id, message):
 			return {}
 		_processed_run_page_action_ids[action_id] = OS.get_ticks_msec()
+		_processed_run_page_action_origin_by_id[action_id] = origin_steam_id
 		_trim_processed_run_page_actions()
 
 	if _is_game_start_guard_active() and _is_guarded_run_page_action(action_type):
@@ -775,9 +802,6 @@ func receive_run_page_action_sync(from_steam_id: String, message: Dictionary, se
 			_end_game_start_guard("accept_progression_action:" + action_type)
 		else:
 			return {}
-	var origin_steam_id = str(message.get("origin_steam_id", ""))
-	if origin_steam_id == "":
-		origin_steam_id = from_steam_id
 	if action_id == "" and _is_duplicate_mutating_run_page_action(message, origin_steam_id):
 		return {}
 
@@ -5443,8 +5467,9 @@ func _get_current_shop_focus_target(shop: Node, player_index: int) -> String:
 	if not _is_valid_shop_node(shop):
 		return ""
 	var focus_emulator = Utils.get_focus_emulator(player_index)
+	var focus_emulator_available = _is_live_ref(focus_emulator)
 	var focused_control = _safe_get(focus_emulator, "focused_control", null)
-	if _is_live_ref(focused_control):
+	if focus_emulator_available and _is_live_ref(focused_control):
 		var reroll_button = shop._get_reroll_button(player_index) if shop.has_method("_get_reroll_button") else null
 		if _is_live_ref(reroll_button) and focused_control == reroll_button:
 			return "reroll"
@@ -5466,6 +5491,11 @@ func _get_current_shop_focus_target(shop: Node, player_index: int) -> String:
 		if inv_target != "":
 			return inv_target
 
+	# A live FocusEmulator with no recognized control means there is no current
+	# user focus. Do not resurrect the vanilla shop cache from a prior shop page.
+	if focus_emulator_available:
+		return FOCUS_CONTROL_GUARD.resolve_shop_focus_target(true, "", "")
+
 	# Fallback for the vanilla shop state variable. This only tracks shop buy items,
 	# not inventory weapons/items, so keep it after the actual FocusEmulator check.
 	var focused_items = _safe_get(shop, "_focused_shop_item", [])
@@ -5473,8 +5503,8 @@ func _get_current_shop_focus_target(shop: Node, player_index: int) -> String:
 		var focused_shop_item = focused_items[player_index]
 		var idx = _get_shop_item_index(focused_shop_item, player_index)
 		if idx >= 0:
-			return "item_" + str(idx)
-	return ""
+			return FOCUS_CONTROL_GUARD.resolve_shop_focus_target(false, "", "item_" + str(idx))
+	return FOCUS_CONTROL_GUARD.resolve_shop_focus_target(false, "", "")
 
 
 func _get_shop_focus_target_stable_identity(shop: Node, player_index: int, target: String) -> Dictionary:
@@ -5641,7 +5671,7 @@ func _get_shop_inventory_elements(shop: Node, player_index: int, is_weapon: bool
 
 
 func _set_focus_emulator_control_safely(focus_emulator, control) -> bool:
-	if not _is_live_ref(focus_emulator) or not _is_live_ref(control):
+	if not _is_live_ref(focus_emulator) or not FOCUS_CONTROL_GUARD.can_apply_focus_control(control):
 		return false
 
 	# FocusEmulator._set_focused_control_with_style(control, false) intentionally
@@ -7729,18 +7759,24 @@ func _build_all_progression_visible_options(ui: Node = null, include_marker_stat
 	return states
 
 
-func _is_stale_run_page_action(action_id: String) -> bool:
-	var parts = action_id.split(":")
-	if parts.size() < 2:
+func _is_stale_run_page_action(action_id: String, message: Dictionary = {}) -> bool:
+	if typeof(message) != TYPE_DICTIONARY:
+		return true
+	# SteamLobbyManager's production protocol core owns normal wire sequencing.
+	# Keep this explicit-field fallback for direct internal callers; action_id is an
+	# opaque idempotency key and is never parsed as protocol state.
+	if bool(message.get("_bo_sequence_validated", false)):
 		return false
-	var origin = str(parts[0])
-	var seq = int(parts[1])
-	if origin == "" or seq <= 0:
-		return false
-	var last_seq = int(_last_run_page_action_seq_by_origin.get(origin, 0))
+	var origin = str(message.get("origin_steam_id", ""))
+	var stream = str(message.get("action_stream", ""))
+	var seq = int(message.get("sequence", 0))
+	if origin == "" or stream == "" or seq <= 0:
+		return true
+	var sequence_key = origin + "|" + stream
+	var last_seq = int(_last_run_page_action_seq_by_origin.get(sequence_key, 0))
 	if seq <= last_seq:
 		return true
-	_last_run_page_action_seq_by_origin[origin] = seq
+	_last_run_page_action_seq_by_origin[sequence_key] = seq
 	return false
 
 
@@ -7803,6 +7839,7 @@ func _trim_processed_run_page_actions() -> void:
 	for key in _processed_run_page_action_ids.keys():
 		if now - int(_processed_run_page_action_ids[key]) > 30000:
 			_processed_run_page_action_ids.erase(key)
+			_processed_run_page_action_origin_by_id.erase(key)
 
 
 func _get_steam_lobby_manager() -> Node:
@@ -10233,10 +10270,9 @@ func _apply_focus_element_for_host_display(selection: Node, player_index: int, e
 
 
 func _apply_focus_visual_only(player_index: int, element) -> void:
-	if not _is_live_ref(element):
+	if not FOCUS_CONTROL_GUARD.can_apply_focus_control(element):
 		return
 
-	FocusEmulatorSignal.set_expected_control(element, player_index)
 	var focus_emulator = Utils.get_focus_emulator(player_index)
 	if _is_live_ref(focus_emulator):
 		if focus_emulator is CanvasItem:
@@ -10251,6 +10287,8 @@ func _apply_focus_visual_only(player_index: int, element) -> void:
 
 	var fallback_focus = Utils.get_focus_emulator(player_index)
 	if _is_live_ref(fallback_focus):
+		if FOCUS_CONTROL_GUARD.should_expect_focus_signal_after_direct_assignment(false):
+			FocusEmulatorSignal.set_expected_control(element, player_index)
 		Utils.focus_player_control(element, player_index, fallback_focus)
 
 

@@ -1,0 +1,15 @@
+name: BrotatoOnline tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Run production Godot protocol tests and release checks
+        run: make verify

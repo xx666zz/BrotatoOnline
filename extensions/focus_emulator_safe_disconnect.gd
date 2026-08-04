@@ -3,13 +3,11 @@ extends "res://ui/menus/global/focus_emulator.gd"
 # Minimal safety guards around vanilla focus bookkeeping. Valid controls continue
 # through the original implementation; only stale/freed controls use the fallback.
 
+const FOCUS_CONTROL_GUARD = preload("res://mods-unpacked/six666-BrotatoOnline/scripts/focus_control_guard.gd")
+
 
 func _bo_is_live_control(value) -> bool:
-	if value == null or typeof(value) != TYPE_OBJECT:
-		return false
-	if not is_instance_valid(value) or not (value is Control):
-		return false
-	return not value.is_queued_for_deletion()
+	return FOCUS_CONTROL_GUARD.is_focusable_control(value)
 
 
 func _connect_focused_control(control: Control) -> void:

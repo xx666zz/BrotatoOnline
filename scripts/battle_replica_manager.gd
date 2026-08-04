@@ -55,6 +55,13 @@ const BULLET_HELL_PHASE_DRIFT_CORRECTION_SEC = 0.20
 const BULLET_HELL_CLEAR_LOCAL_PROJECTILES_ON_FIRST_SYNC = true
 const UNKNOWN_ENTITY_RESYNC_REQUEST_INTERVAL_MSEC = 2000
 
+func should_remove_dead_host_proxy(category: String, is_game_host: bool, death_sync_enabled: bool) -> bool:
+	# When death sync is disabled, the next Host snapshot is authoritative. Remove
+	# a dead pet proxy first so its dying node cannot sit beside the new one. Enemy
+	# nodes must stay in vanilla EntitySpawner bookkeeping until its death/pool path
+	# finishes, otherwise the spawner's live count can shrink permanently.
+	return category == "pet" and not is_game_host and not death_sync_enabled
+
 var _latest_snapshot = {}
 var _latest_snapshot_tick = -1
 var _last_applied_tick = -1
@@ -1776,11 +1783,11 @@ func _on_host_local_entity_died(entity, _die_args, net_id: String, category: Str
 			# local proxy first, do not let the next compact Host snapshot recreate this
 			# net_id as the generic baby/boss fallback while the reliable claim is in flight.
 			_locally_killed_until[net_id] = OS.get_ticks_msec() + LOCAL_KILL_IGNORE_MSEC
-			_cleanup_host_entity_tracking(net_id)
 			_send_entity_kill_claim(net_id, category, entity)
 			_flush_boss_damage_reports(true)
+			_remove_dead_host_proxy(entity, net_id, category)
 			return
-		_cleanup_host_entity_tracking(net_id)
+		_remove_dead_host_proxy(entity, net_id, category)
 		return
 
 	# Defensive fallback for any stale pooled signal connection that survived from an
@@ -1805,6 +1812,26 @@ func _on_host_local_entity_died(entity, _die_args, net_id: String, category: Str
 	_locally_killed_until[net_id] = OS.get_ticks_msec() + LOCAL_KILL_IGNORE_MSEC
 	_cleanup_host_entity_tracking(net_id)
 	_send_entity_kill_claim(net_id, category, entity)
+
+
+func _remove_dead_host_proxy(entity: Node, net_id: String, category: String) -> void:
+	if not should_remove_dead_host_proxy(category, _is_game_host(), ENABLE_DEATH_SYNC):
+		_cleanup_host_entity_tracking(net_id)
+		return
+	var tracked = _host_entities.get(net_id, null)
+	if tracked == entity:
+		_remove_host_entity(net_id, true)
+		return
+	# A stale pooled died signal must never free the currently tracked node. It may,
+	# however, still refer to the old dead node after its network entry was cleaned.
+	if tracked != null or not _is_valid_node(entity):
+		return
+	if entity.has_meta("brotato_online_net_id") and str(entity.get_meta("brotato_online_net_id")) != net_id:
+		return
+	_unregister_from_spawner_arrays(entity)
+	if not entity.is_queued_for_deletion():
+		entity.queue_free()
+	_cleanup_host_entity_tracking(net_id)
 
 
 func _send_entity_kill_claim(net_id: String, category: String, entity: Node = null) -> void:
@@ -3386,6 +3413,10 @@ func _prune_local_kill_ignores(now: int, active_ids: Dictionary) -> void:
 			to_remove.append(id)
 	for id in to_remove:
 		_locally_killed_until.erase(id)
+
+
+func clear_connection_state(reason: String) -> void:
+	_clear_all(reason)
 
 
 func _clear_all(reason: String) -> void:

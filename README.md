@@ -24,7 +24,13 @@ Brotato Online 是一个为《Brotato》添加远程联机支持的模组。
 
 ## 安装
 
-在 Steam 创意工坊中订阅。
+正式版可直接通过 Steam 创意工坊订阅。测试本地构建时，必须先保持对应创意工坊项目处于已订阅状态，再用生成的 ZIP 覆盖该订阅目录中的模组包：
+
+```text
+<SteamLibrary>/steamapps/workshop/content/1942280/<WorkshopItemId>/<Workshop原包文件名>.zip
+```
+
+必须覆盖订阅目录中已经存在的原包文件，不能在同一目录新增第二个 ZIP；否则 ModLoader 会把它识别成重复或结构错误的模组。也不要把测试 ZIP 放在 `content/1942280/` 根目录，或另建未订阅的伪项目目录。ZIP 内部固定包含 `mods-unpacked/six666-BrotatoOnline/` 根目录。
 
 ## 基本同步模型
 
@@ -152,9 +158,31 @@ func _ready():
 
 - 联机方式：Steam
 
+- Mod 版本：4.1.1
+
+- 网络协议：v2（不兼容旧协议，所有玩家必须使用相同版本）
+
 ## 兼容性说明
 
 Brotato Online 对原版流程做了较多运行时扩展，因此与其他模组的兼容性取决于它们修改的范围。
+
+## 测试
+
+仓库提供可重复的本地测试入口。它会在禁网的 Godot 3.5.3 Docker 容器中直接测试生产协议核心、发送调度器和 Steam callback 驱动，并解析真实管理器脚本：
+
+```bash
+./tools/run_tests.sh
+```
+
+发布校验会同时检查版本一致性、ZIP 可重复性、CRC、文件清单和逐文件哈希：
+
+```bash
+make test-godot
+make verify
+make package
+```
+
+Godot 测试只把临时目录中的必要生产脚本和测试入口只读挂载给容器，不会暴露日志或发布物。真实 Brotato/Steam 双端重连仍需要在带有游戏和 ModLoader 的环境中进行集成回归。
 
 ## 文档
 

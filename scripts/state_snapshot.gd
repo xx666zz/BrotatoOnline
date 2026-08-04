@@ -1833,11 +1833,6 @@ func _prepare_remote_player_proxy_for_client_authority(player: Node, player_inde
 	player.set_meta("brotato_online_hurtbox_disabled_player_index", player_index)
 	player.set_meta("brotato_online_hurtbox_enabled_reason", reason)
 
-	# Every remote player keeps a real Hurtbox so Host-side overlaps enter the complete
-	# vanilla Player.take_damage() pipeline. The Player extension restores client-owned
-	# HP afterward and blocks local proxy death, while preserving character/item
-	# on-damage mechanics (Bull is no longer a special case).
-	_enable_remote_player_hurtbox(player)
 
 
 func _is_bull_player_index(player_index: int) -> bool:
@@ -1860,19 +1855,6 @@ func _is_bull_player_index(player_index: int) -> bool:
 		return false
 	return str(character.get("my_id")) == BULL_CHARACTER_ID
 
-
-func _enable_remote_player_hurtbox(player: Node) -> void:
-	if not _is_valid_node(player):
-		return
-	var invincibility_timer = player.get("_invincibility_timer")
-	if invincibility_timer != null and is_instance_valid(invincibility_timer) and invincibility_timer.has_method("is_stopped") and not invincibility_timer.is_stopped():
-		return
-	if player.has_method("enable_hurtbox"):
-		player.enable_hurtbox()
-		return
-	var hurtbox = player.get_node_or_null("Hurtbox")
-	if hurtbox != null and hurtbox.has_method("enable"):
-		hurtbox.enable()
 
 
 func _is_host_remote_player_index(player_index: int) -> bool:

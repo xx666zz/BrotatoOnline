@@ -752,104 +752,7 @@ func _prepare_remote_player_hurtbox_proxy(player: Node, player_index: int, reaso
 	player.set_meta("brotato_online_hurtbox_disabled_player_index", player_index)
 	player.set_meta("brotato_online_hurtbox_enabled_reason", reason)
 
-	# Keep the real Hurtbox for every non-owned player so enemy overlaps enter the
-	# complete vanilla Player.take_damage() pipeline. The Player extension restores
-	# synchronized HP afterward and blocks local proxy death, while preserving all
-	# character/item on-damage mechanics (Bull is no longer a special case).
-	_enable_remote_player_hurtbox(player)
 
-
-func _disable_remote_proxy_collision_tree(root: Node) -> void:
-	if not _is_valid_node(root):
-		return
-	var hurtbox = root.get_node_or_null("Hurtbox")
-	if hurtbox != null:
-		_disable_collision_tree_under_hurtbox(hurtbox)
-	# Some modded characters may rename or wrap the Hurtbox. Only disable nodes that
-	# look like hurtboxes; do not zero the whole Player collision tree, because weapon
-	# hitboxes under the remote proxy are still useful for local visual simulation.
-	var stack = [root]
-	while stack.size() > 0:
-		var cur = stack.pop_back()
-		if not _is_valid_node(cur):
-			continue
-		for child in cur.get_children():
-			if child is Node:
-				stack.append(child)
-		if cur != root and str(cur.name).to_lower().find("hurtbox") != -1:
-			_disable_collision_tree_under_hurtbox(cur)
-
-
-func _disable_collision_tree_under_hurtbox(root: Node) -> void:
-	if not _is_valid_node(root):
-		return
-	var stack = [root]
-	while stack.size() > 0:
-		var cur = stack.pop_back()
-		if not _is_valid_node(cur):
-			continue
-		for child in cur.get_children():
-			if child is Node:
-				stack.append(child)
-		if cur is CollisionObject2D:
-			if not cur.has_meta("brotato_online_saved_collision_layer"):
-				cur.set_meta("brotato_online_saved_collision_layer", int(cur.collision_layer))
-			if not cur.has_meta("brotato_online_saved_collision_mask"):
-				cur.set_meta("brotato_online_saved_collision_mask", int(cur.collision_mask))
-			cur.set_deferred("collision_layer", 0)
-			cur.set_deferred("collision_mask", 0)
-		if cur is Area2D:
-			if not cur.has_meta("brotato_online_saved_monitoring"):
-				cur.set_meta("brotato_online_saved_monitoring", bool(cur.monitoring))
-			if not cur.has_meta("brotato_online_saved_monitorable"):
-				cur.set_meta("brotato_online_saved_monitorable", bool(cur.monitorable))
-			cur.set_deferred("monitoring", false)
-			cur.set_deferred("monitorable", false)
-		if cur is CollisionShape2D or cur is CollisionPolygon2D:
-			if not cur.has_meta("brotato_online_saved_disabled"):
-				cur.set_meta("brotato_online_saved_disabled", bool(cur.disabled))
-			cur.set_deferred("disabled", true)
-
-
-func _restore_remote_proxy_collision_tree(root: Node) -> void:
-	if not _is_valid_node(root):
-		return
-	var hurtbox = root.get_node_or_null("Hurtbox")
-	if hurtbox != null:
-		_restore_collision_tree_under_hurtbox(hurtbox)
-	var stack = [root]
-	while stack.size() > 0:
-		var cur = stack.pop_back()
-		if not _is_valid_node(cur):
-			continue
-		for child in cur.get_children():
-			if child is Node:
-				stack.append(child)
-		if cur != root and str(cur.name).to_lower().find("hurtbox") != -1:
-			_restore_collision_tree_under_hurtbox(cur)
-
-
-func _restore_collision_tree_under_hurtbox(root: Node) -> void:
-	if not _is_valid_node(root):
-		return
-	var stack = [root]
-	while stack.size() > 0:
-		var cur = stack.pop_back()
-		if not _is_valid_node(cur):
-			continue
-		for child in cur.get_children():
-			if child is Node:
-				stack.append(child)
-		if cur is CollisionObject2D:
-			var layer = int(cur.get_meta("brotato_online_saved_collision_layer", 1))
-			var mask = int(cur.get_meta("brotato_online_saved_collision_mask", 20))
-			cur.set_deferred("collision_layer", layer)
-			cur.set_deferred("collision_mask", mask)
-		if cur is Area2D:
-			cur.set_deferred("monitoring", bool(cur.get_meta("brotato_online_saved_monitoring", true)))
-			cur.set_deferred("monitorable", bool(cur.get_meta("brotato_online_saved_monitorable", true)))
-		if cur is CollisionShape2D or cur is CollisionPolygon2D:
-			cur.set_deferred("disabled", bool(cur.get_meta("brotato_online_saved_disabled", false)))
 
 
 func _is_bull_player_index(player_index: int) -> bool:
@@ -872,20 +775,6 @@ func _is_bull_player_index(player_index: int) -> bool:
 		return false
 	return str(character.get("my_id")) == BULL_CHARACTER_ID
 
-
-func _enable_remote_player_hurtbox(player: Node) -> void:
-	if not _is_valid_node(player):
-		return
-	var invincibility_timer = player.get("_invincibility_timer")
-	if invincibility_timer != null and is_instance_valid(invincibility_timer) and invincibility_timer.has_method("is_stopped") and not invincibility_timer.is_stopped():
-		return
-	_restore_remote_proxy_collision_tree(player)
-	if player.has_method("enable_hurtbox"):
-		player.enable_hurtbox()
-		return
-	var hurtbox = player.get_node_or_null("Hurtbox")
-	if hurtbox != null and hurtbox.has_method("enable"):
-		hurtbox.enable()
 
 
 func _apply_latest_snapshot_if_needed() -> void:
@@ -2933,21 +2822,45 @@ func _apply_host_progression_player_state(ui: Node, player_state: Dictionary) ->
 	var mode = str(visible.get("mode", "none"))
 	if mode != "upgrade" and mode != "item_box":
 		return
-	var key = str(player_index) + ":" + to_json(visible)
-	if str(_last_progression_apply_key_by_player.get(player_index, "")) == key:
-		return
 	var container = null
 	if ui.has_method("_get_player_container"):
 		container = ui._get_player_container(player_index)
 	if not _is_valid_node(container):
 		return
+
+	var key = str(player_index) + ":" + to_json(visible)
+	var same_state = str(_last_progression_apply_key_by_player.get(player_index, "")) == key
+	# A menu-channel idle packet or vanilla finish() can hide/disable a container after
+	# this battle state was already cached. Reapply only when its expected panel is no
+	# longer visible; otherwise use repeated snapshots as a cheap input-route repair.
+	if same_state and _progression_container_is_showing_mode(container, mode):
+		_ensure_client_progression_interaction_ready(container, player_index, "battle_snapshot_repeat")
+		return
+
 	_prepare_host_progression_ui(ui, container, player_index, visible)
+	var applied = false
 	if mode == "upgrade":
-		if _apply_host_upgrade_options_to_container(container, player_index, visible):
-			_last_progression_apply_key_by_player[player_index] = key
+		applied = _apply_host_upgrade_options_to_container(container, player_index, visible)
 	elif mode == "item_box":
-		if _apply_host_item_box_option_to_container(container, player_index, visible):
-			_last_progression_apply_key_by_player[player_index] = key
+		applied = _apply_host_item_box_option_to_container(container, player_index, visible)
+	if applied:
+		_last_progression_apply_key_by_player[player_index] = key
+		_ensure_client_progression_interaction_ready(container, player_index, "battle_snapshot_apply")
+
+
+func _progression_container_is_showing_mode(container: Node, mode: String) -> bool:
+	if not _is_valid_node(container):
+		return false
+	var panel = container.get("_upgrades_container") if mode == "upgrade" else container.get("_items_container")
+	return _is_valid_node(panel) and panel is CanvasItem and bool(panel.visible)
+
+
+func _ensure_client_progression_interaction_ready(container: Node, player_index: int, reason: String) -> void:
+	if _is_game_host() or player_index != _get_owned_player_index():
+		return
+	var menu_sync = _get_menu_sync_manager()
+	if menu_sync != null and menu_sync.has_method("ensure_client_progression_interaction_ready"):
+		menu_sync.ensure_client_progression_interaction_ready(container, player_index, reason)
 
 
 func _prepare_host_progression_ui(ui: Node, container: Node, player_index: int, visible: Dictionary) -> void:
@@ -4012,6 +3925,10 @@ func _get_runtime_locator() -> Node:
 
 func _get_steam_lobby_manager() -> Node:
 	return _get_sibling_or_root_node("BrotatoOnlineSteamLobbyManager")
+
+
+func _get_menu_sync_manager() -> Node:
+	return _get_sibling_or_root_node("BrotatoOnlineMenuSyncManager")
 
 
 func _get_slot_manager() -> Node:

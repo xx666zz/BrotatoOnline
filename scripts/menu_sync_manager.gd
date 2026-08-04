@@ -6600,6 +6600,20 @@ func _install_client_progression_press_intercept(container: Node, player_index: 
 			ban_button.connect("pressed", self, "_on_client_item_box_ban_pressed", [player_index])
 
 
+# Public repair entry used by both menu-state and battle-snapshot progression paths.
+# Vanilla finish() intentionally sets FocusEmulator.player_index = -1 after a player
+# completes their rewards. Online Host state can later reopen that same container, so
+# every authoritative visible option must restore both input routing and button guards.
+func ensure_client_progression_interaction_ready(container: Node, player_index: int, reason: String = "") -> void:
+	if _is_game_host():
+		return
+	if player_index != _get_local_client_player_index():
+		return
+	if not _is_live_ref(container):
+		return
+	_install_client_progression_press_intercept(container, player_index)
+	_ensure_local_progression_focus(container, player_index, reason)
+
 
 func _ensure_local_progression_focus(container: Node, player_index: int, reason: String = "") -> void:
 	if _is_game_host() or _applying_remote_run_page_action:
@@ -7178,15 +7192,13 @@ func _apply_progression_visible_option_to_ui(player_index: int, visible: Diction
 		_prepare_progression_ui_for_state(ui, container, player_index, visible)
 		var ok = _apply_upgrade_options_to_progression_container(container, player_index, visible)
 		if ok and not _is_game_host() and player_index == _get_local_client_player_index():
-			_install_client_progression_press_intercept(container, player_index)
-			_ensure_local_progression_focus(container, player_index, "apply_upgrade_state")
+			ensure_client_progression_interaction_ready(container, player_index, "apply_upgrade_state")
 		return ok
 	elif mode == "item_box":
 		_prepare_progression_ui_for_state(ui, container, player_index, visible)
 		var item_ok = _apply_item_box_option_to_progression_container(container, player_index, visible)
 		if item_ok and not _is_game_host() and player_index == _get_local_client_player_index():
-			_install_client_progression_press_intercept(container, player_index)
-			_ensure_local_progression_focus(container, player_index, "apply_item_box_state")
+			ensure_client_progression_interaction_ready(container, player_index, "apply_item_box_state")
 		return item_ok
 	elif mode == "hidden" or mode == "idle" or mode == "none":
 		return _apply_progression_idle_state(ui, container, player_index)

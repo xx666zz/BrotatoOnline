@@ -63,8 +63,6 @@ var _last_apply_focus_expected_usec = 0
 var _last_apply_focus_callback_usec = 0
 
 
-
-
 const SCREEN_NONE = "none"
 const SCREEN_CHARACTER_SELECTION = "character_selection"
 const SCREEN_WEAPON_SELECTION = "weapon_selection"
@@ -146,10 +144,9 @@ var _host_shop_item_observer_key = {}
 var _next_local_run_page_action_seq = 1
 var _recent_mutating_run_page_action_keys = {}
 var _pending_synced_shop_start_id = 0
-var _client_shop_direct_lock_probe_seq = 0
-var _client_shop_lock_state_by_slot_key = {}
-var _host_shop_lock_state_by_slot_key = {}
-var _last_client_shop_lock_poll_key = ""
+var _shop_focus_wiring_key_by_player = {}
+var _shop_item_slot_by_instance_id = {}
+var _host_shop_lock_signal_wiring_key_by_player = {}
 var _last_applied_shop_gear_key_by_player = {}
 var _last_applied_shop_state_key_by_player = {}
 var _shop_state_cache_instance_id = 0
@@ -182,12 +179,12 @@ var _shop_inventory_custom_button_apply_guard = false
 var _shop_inventory_custom_button_recent_press_keys = {}
 var _shop_inventory_custom_button_deferred_apply_keys = {}
 var _shop_inventory_custom_button_descriptor_cache = {}
+var _property_exists_cache = {}
 
 func _bo_ui_diag_log(tag: String, msg: String) -> void:
 	if not BO_UI_DIAG_ENABLED:
 		return
 	print("[BO_LAG][UI][" + tag + "] " + msg)
-
 
 
 func _bo_ui_diag_node_desc(node) -> String:
@@ -381,7 +378,6 @@ func _is_selection_like_screen_fast(screen: String) -> bool:
 	return screen == SCREEN_CHARACTER_SELECTION or screen == SCREEN_WEAPON_SELECTION or screen == SCREEN_DIFFICULTY_SELECTION
 
 
-
 func begin_game_start_guard(start_id: int = 0, reason: String = "", preserve_queued_actions: bool = false) -> void:
 	# Called as soon as a difficulty/shop game start handshake begins. From this point
 	# old shop/upgrade UI nodes are transitional: do not scan them, do not queue focus
@@ -457,10 +453,9 @@ func _reset_run_page_runtime_state_for_game_start(clear_queued_actions: bool = t
 	_shop_input_guard_instance_id = 0
 	_shop_input_guard_until_msec = 0
 	_shop_input_guard_wait_release = false
-	_client_shop_direct_lock_probe_seq = 0
-	_client_shop_lock_state_by_slot_key.clear()
-	_host_shop_lock_state_by_slot_key.clear()
-	_last_client_shop_lock_poll_key = ""
+	_shop_focus_wiring_key_by_player.clear()
+	_shop_item_slot_by_instance_id.clear()
+	_host_shop_lock_signal_wiring_key_by_player.clear()
 	_last_applied_shop_gear_key_by_player.clear()
 	_last_applied_shop_state_key_by_player.clear()
 	_last_applied_shop_slots_key_by_player.clear()
@@ -743,9 +738,10 @@ func consume_local_run_page_action_messages() -> Array:
 	if now - _last_consume_run_page_scan_msec >= RUN_PAGE_CONSUME_SCAN_INTERVAL_MSEC:
 		_last_consume_run_page_scan_msec = now
 		var fast_screen = _get_current_menu_screen_fast()
-		if fast_screen == SCREEN_SHOP:
-			_poll_shop_page_state_and_intercepts()
-		elif fast_screen == SCREEN_GAME:
+		# Shop setup/polling has exactly one scheduler: _process(). Shop focus and lock
+		# changes are signal-driven after that one-time wiring, so the Steam send-drain
+		# path must not call _poll_shop_page_state_and_intercepts() a second time.
+		if fast_screen == SCREEN_GAME:
 			_poll_progression_page_focus_and_state()
 
 	var messages = []
@@ -817,6 +813,8 @@ func receive_run_page_action_sync(from_steam_id: String, message: Dictionary, se
 			applied = _apply_progression_item_box_action(player_index, message, "take")
 		else:
 			applied = true
+	elif action_type == "item_box_item_added":
+		applied = _apply_item_box_item_added(player_index, message)
 	elif action_type == "item_box_discard":
 		if _is_game_host():
 			applied = _apply_progression_item_box_action(player_index, message, "discard")
@@ -998,9 +996,9 @@ func _poll_shop_page_state_and_intercepts() -> void:
 		_shop_input_guard_instance_id = 0
 		_shop_input_guard_until_msec = 0
 		_shop_input_guard_wait_release = false
-		_client_shop_lock_state_by_slot_key.clear()
-		_host_shop_lock_state_by_slot_key.clear()
-		_last_client_shop_lock_poll_key = ""
+		_shop_focus_wiring_key_by_player.clear()
+		_shop_item_slot_by_instance_id.clear()
+		_host_shop_lock_signal_wiring_key_by_player.clear()
 		_last_applied_shop_gear_key_by_player.clear()
 		_last_applied_shop_state_key_by_player.clear()
 		_reset_shop_inventory_custom_button_runtime_state()
@@ -1020,9 +1018,10 @@ func _poll_shop_page_state_and_intercepts() -> void:
 		_install_host_shop_go_sync_intercept(shop)
 		_install_host_shop_local_mutation_observer(shop)
 		for host_player_index in host_player_indices:
-			_ensure_shop_inventory_popup_wiring_for_player(shop, int(host_player_index), false)
-			_queue_shop_focus_if_changed(int(host_player_index))
-			_poll_host_shop_lock_state_changes(shop, int(host_player_index))
+			var player_index = int(host_player_index)
+			_ensure_shop_inventory_popup_wiring_for_player(shop, player_index, false)
+			if not _ensure_shop_focus_event_wiring(shop, player_index):
+				_queue_shop_focus_if_changed(player_index)
 		_debug_host_shop_focus_snapshot(shop)
 		return
 
@@ -1035,8 +1034,40 @@ func _poll_shop_page_state_and_intercepts() -> void:
 	# Client shop movement stays vanilla; this manager only intercepts mutating actions.
 	_install_client_shop_intercepts(shop, local_player_index)
 	_ensure_shop_inventory_popup_wiring_for_player(shop, local_player_index, true)
-	_queue_shop_focus_if_changed(local_player_index)
-	_poll_client_shop_lock_state_changes(shop, local_player_index)
+	if not _ensure_shop_focus_event_wiring(shop, local_player_index):
+		_queue_shop_focus_if_changed(local_player_index)
+
+
+func _ensure_shop_focus_event_wiring(shop: Node, player_index: int) -> bool:
+	if not _is_valid_shop_node(shop) or player_index < 0:
+		return false
+	var focus_emulator = Utils.get_focus_emulator(player_index) if Utils != null else null
+	if not _is_live_ref(focus_emulator) or not focus_emulator.has_signal("bo_focused_control_changed"):
+		return false
+	var key = str(shop.get_instance_id()) + ":" + str(focus_emulator.get_instance_id())
+	if key == str(_shop_focus_wiring_key_by_player.get(player_index, "")):
+		return true
+	if not focus_emulator.is_connected("bo_focused_control_changed", self, "_on_shop_focused_control_changed"):
+		focus_emulator.connect("bo_focused_control_changed", self, "_on_shop_focused_control_changed", [player_index])
+	_shop_focus_wiring_key_by_player[player_index] = key
+	_queue_shop_focus_from_control(shop, player_index, _safe_get(focus_emulator, "focused_control", null))
+	return true
+
+
+func _on_shop_focused_control_changed(focused_control, player_index: int) -> void:
+	if not _is_online_session_active() or _is_game_start_guard_active():
+		return
+	if _get_current_menu_screen_fast() != SCREEN_SHOP:
+		return
+	if _is_game_host():
+		if not _get_host_local_player_indices().has(player_index):
+			return
+	elif player_index != _get_local_client_player_index():
+		return
+	var shop = _find_shop_node()
+	if not _is_valid_shop_node(shop):
+		return
+	_queue_shop_focus_from_control(shop, player_index, focused_control)
 
 
 func _debug_host_shop_focus_snapshot(shop: Node) -> void:
@@ -1087,7 +1118,9 @@ func _reset_shop_state_diff_cache() -> void:
 	_last_applied_shop_run_data_key_by_player.clear()
 	_last_applied_shop_gear_key_by_player.clear()
 	_last_applied_shop_state_key_by_player.clear()
-	_host_shop_lock_state_by_slot_key.clear()
+	_shop_focus_wiring_key_by_player.clear()
+	_shop_item_slot_by_instance_id.clear()
+	_host_shop_lock_signal_wiring_key_by_player.clear()
 	_reset_shop_inventory_custom_button_runtime_state(false)
 	if not preserve_pending_shop_state:
 		_pending_shop_states_from_host = []
@@ -1131,7 +1164,9 @@ func _ensure_shop_state_diff_cache_for_instance(shop: Node) -> void:
 	_last_applied_shop_run_data_key_by_player.clear()
 	_last_applied_shop_gear_key_by_player.clear()
 	_last_applied_shop_state_key_by_player.clear()
-	_host_shop_lock_state_by_slot_key.clear()
+	_shop_focus_wiring_key_by_player.clear()
+	_shop_item_slot_by_instance_id.clear()
+	_host_shop_lock_signal_wiring_key_by_player.clear()
 	_reset_shop_inventory_custom_button_runtime_state(false)
 	if not preserve_pending_shop_state:
 		_pending_shop_states_from_host = []
@@ -1159,13 +1194,36 @@ func _queue_shop_focus_if_changed(player_index: int) -> void:
 	var shop = _find_shop_node()
 	if not _is_valid_shop_node(shop):
 		return
+	var focus_emulator = Utils.get_focus_emulator(player_index) if Utils != null else null
+	var focused_control = _safe_get(focus_emulator, "focused_control", null) if _is_live_ref(focus_emulator) else null
+	if _is_live_ref(focused_control):
+		_queue_shop_focus_from_control(shop, player_index, focused_control)
+		return
+
+	# Rare vanilla fallback when FocusEmulator has not been initialized yet. This path
+	# only checks the shop's own focused slot state; it never enumerates the inventory.
 	var target = _get_current_shop_focus_target(shop, player_index)
+	if target != "":
+		_queue_shop_focus_target(player_index, target, {})
+
+
+func _queue_shop_focus_from_control(shop: Node, player_index: int, focused_control) -> void:
+	if not _is_valid_shop_node(shop) or player_index < 0 or not _is_live_ref(focused_control):
+		return
+	var info = _get_shop_focus_target_info(shop, player_index, focused_control)
+	var target = str(info.get("target", ""))
 	if target == "":
 		return
-	# Keep the compact positional target for the common case. Inventory/weapon focus
-	# also carries a stable item identity so the receiver can verify that the same
-	# index still contains the same item after a gift/combine/reorder.
-	var focus_item_identity = _get_shop_focus_target_stable_identity(shop, player_index, target)
+	var focus_item_identity = {}
+	var inventory_item = info.get("inventory_item", null)
+	if inventory_item != null:
+		focus_item_identity = _build_shop_item_stable_identity(inventory_item)
+	_queue_shop_focus_target(player_index, target, focus_item_identity)
+
+
+func _queue_shop_focus_target(player_index: int, target: String, focus_item_identity: Dictionary) -> void:
+	if target == "":
+		return
 	var key = str(player_index) + ":" + target + ":" + _shop_item_stable_identity_key(focus_item_identity)
 	if key == str(_last_local_shop_focus_key.get(player_index, "")):
 		return
@@ -1209,24 +1267,9 @@ func _install_host_shop_go_sync_intercept(shop: Node) -> void:
 				if not reroll_button.is_connected("pressed", self, "_on_host_shop_reroll_pressed"):
 					reroll_button.connect("pressed", self, "_on_host_shop_reroll_pressed", [player_index])
 
-		# Keep the Host's vanilla lock callback connected. BaseShop can toggle a focused
-		# item directly from its _input() path without emitting LockButton.toggled, so Host
-		# lock synchronization is detected by the lightweight visible-slot poll below.
-		# Replacing the vanilla callback here made mouse/button locks use a different path
-		# from keyboard/controller locks and caused Host changes to remain local-only.
-		var container = shop._get_shop_items_container(player_index) if shop.has_method("_get_shop_items_container") else null
-		var shop_items = _safe_get(container, "_shop_items", []) if _is_live_ref(container) else []
-		if typeof(shop_items) == TYPE_ARRAY:
-			for shop_item in shop_items:
-				if not _is_live_ref(shop_item):
-					continue
-				var lock_button = _safe_get(shop_item, "_lock_button", null)
-				if not _is_live_ref(lock_button):
-					continue
-				if lock_button.is_connected("toggled", self, "_on_host_shop_item_lock_toggled"):
-					lock_button.disconnect("toggled", self, "_on_host_shop_item_lock_toggled")
-				if not lock_button.is_connected("toggled", shop_item, "_on_LockButton_toggled"):
-					lock_button.connect("toggled", shop_item, "_on_LockButton_toggled")
+		# Lock synchronization is signal-driven. Keep vanilla mutation connected and add
+		# a read-only observer; no per-slot lock-state polling runs in the shop hot path.
+		_ensure_host_shop_lock_signal_wiring(shop, player_index)
 
 func _on_host_shop_go_pressed(player_index: int) -> void:
 	if not _is_game_host() or _applying_remote_run_page_action:
@@ -1253,13 +1296,61 @@ func _on_host_shop_reroll_pressed(player_index: int) -> void:
 	}, "reroll")
 
 
+func _ensure_host_shop_lock_signal_wiring(shop: Node, player_index: int) -> void:
+	if not _is_game_host() or not _is_valid_shop_node(shop) or player_index < 0:
+		return
+	var key = str(shop.get_instance_id()) + ":" + str(player_index)
+	if key == str(_host_shop_lock_signal_wiring_key_by_player.get(player_index, "")):
+		return
+	var container = shop._get_shop_items_container(player_index) if shop.has_method("_get_shop_items_container") else null
+	if not _is_live_ref(container):
+		return
+	var shop_items = _safe_get(container, "_shop_items", [])
+	if typeof(shop_items) != TYPE_ARRAY or shop_items.empty():
+		return
+	for slot_index in range(shop_items.size()):
+		var shop_item = shop_items[slot_index]
+		if not _is_live_ref(shop_item):
+			continue
+		_cache_shop_item_slot(shop, player_index, shop_item, slot_index)
+		# A node can survive a client -> host/session-role transition after the client
+		# intercept disconnected vanilla's button callback. Restore that one setup-time
+		# connection, but do not observe Button.toggled for synchronization.
+		var lock_button = _safe_get(shop_item, "_lock_button", null)
+		if _is_live_ref(lock_button) and not lock_button.is_connected("toggled", shop_item, "_on_LockButton_toggled"):
+			lock_button.connect("toggled", shop_item, "_on_LockButton_toggled")
+		# ShopItem.change_lock_status() is the common mutation point for both the
+		# LockButton path and BaseShop._input() keyboard/gamepad direct-lock path.
+		# Observe that O(1) event instead of scanning slot lock state.
+		if shop_item.has_signal("bo_lock_status_changed") and not shop_item.is_connected("bo_lock_status_changed", self, "_on_host_shop_item_lock_toggled"):
+			shop_item.connect("bo_lock_status_changed", self, "_on_host_shop_item_lock_toggled", [player_index])
+	_host_shop_lock_signal_wiring_key_by_player[player_index] = key
+
+
 func _on_host_shop_item_lock_toggled(button_pressed: bool, shop_item, player_index: int) -> void:
 	if not _is_game_host() or _applying_remote_run_page_action:
+		return
+	# Let the vanilla ShopItem callback mutate Host state first. Broadcast the explicit
+	# final lock value on the deferred turn instead of replaying the mutation locally.
+	call_deferred("_deferred_broadcast_host_shop_item_lock_toggled", bool(button_pressed), shop_item, player_index)
+
+
+func _deferred_broadcast_host_shop_item_lock_toggled(button_pressed: bool, shop_item, player_index: int) -> void:
+	if not _is_game_host() or _applying_remote_run_page_action or not _is_live_ref(shop_item):
+		return
+	var shop = _find_shop_node()
+	if not _is_valid_shop_node(shop):
 		return
 	var msg = _build_client_shop_item_action("shop_lock", shop_item, player_index)
 	msg["ban"] = false
 	msg["desired_locked"] = bool(button_pressed)
-	_apply_host_local_shop_action(msg, "lock")
+	msg["host_applied"] = true
+	msg["resolved_shop_index"] = _get_cached_shop_item_slot(shop, player_index, shop_item)
+	var state_after = _build_shop_action_delta_state(player_index, "shop_lock", msg, true)
+	if not state_after.empty():
+		msg["host_state_after"] = state_after
+		msg["state_after"] = state_after
+	_queue_local_run_page_action(msg)
 
 
 func _install_host_shop_local_mutation_observer(shop: Node) -> void:
@@ -1498,142 +1589,26 @@ func _install_client_shop_intercepts(shop: Node, player_index: int) -> void:
 		if not item_popup.is_connected("item_discard_button_pressed", self, "_on_client_shop_discard_weapon_pressed"):
 			item_popup.connect("item_discard_button_pressed", self, "_on_client_shop_discard_weapon_pressed", [player_index])
 
-	_seed_client_shop_lock_state_baseline(shop, player_index)
+
+func _cache_shop_item_slot(shop: Node, player_index: int, shop_item, slot_index: int) -> void:
+	if not _is_valid_shop_node(shop) or player_index < 0 or not _is_live_ref(shop_item) or slot_index < 0:
+		return
+	var key = str(shop.get_instance_id()) + ":" + str(player_index) + ":" + str(shop_item.get_instance_id())
+	_shop_item_slot_by_instance_id[key] = slot_index
 
 
-func _poll_host_shop_lock_state_changes(shop: Node, player_index: int) -> void:
-	if not _is_game_host() or _applying_remote_run_page_action:
-		return
-	if not _is_valid_shop_node(shop) or player_index < 0:
-		return
-	var container = shop._get_shop_items_container(player_index) if shop.has_method("_get_shop_items_container") else null
-	if not _is_live_ref(container):
-		return
-	var shop_item_nodes = _safe_get(container, "_shop_items", [])
-	if typeof(shop_item_nodes) != TYPE_ARRAY:
-		return
-
-	var live_keys = {}
-	for slot_index in range(shop_item_nodes.size()):
-		var shop_item = shop_item_nodes[slot_index]
-		if not _is_live_ref(shop_item):
-			continue
-		if not bool(_safe_get(shop_item, "active", false)):
-			continue
-		var item_data = _safe_get(shop_item, "item_data", null)
-		if item_data == null or not bool(_safe_get(item_data, "is_lockable", true)):
-			continue
-		var slot_key = _build_client_shop_lock_slot_key(shop, player_index, slot_index, item_data)
-		if slot_key == "":
-			continue
-		live_keys[slot_key] = true
-		var locked = bool(_safe_get(shop_item, "locked", false))
-		if not _host_shop_lock_state_by_slot_key.has(slot_key):
-			_host_shop_lock_state_by_slot_key[slot_key] = locked
-			continue
-		var previous_locked = bool(_host_shop_lock_state_by_slot_key[slot_key])
-		if previous_locked == locked:
-			continue
-
-		_host_shop_lock_state_by_slot_key[slot_key] = locked
-		var message = _build_client_shop_item_action("shop_lock", shop_item, player_index)
-		message["ban"] = false
-		message["desired_locked"] = locked
-		message["host_applied"] = true
-		message["resolved_shop_index"] = slot_index
-		var state_after = _build_shop_action_delta_state(player_index, "shop_lock", message, true)
-		if not state_after.empty():
-			message["host_state_after"] = state_after
-			message["state_after"] = state_after
-		_queue_local_run_page_action(message)
-
-	var cleanup = []
-	var player_prefix = str(shop.get_instance_id()) + ":" + str(player_index) + ":"
-	for key in _host_shop_lock_state_by_slot_key.keys():
-		if not live_keys.has(key) and str(key).begins_with(player_prefix):
-			cleanup.append(key)
-	for key in cleanup:
-		_host_shop_lock_state_by_slot_key.erase(key)
-
-
-func _seed_client_shop_lock_state_baseline(shop: Node, player_index: int) -> void:
-	if _is_game_host() or not _is_valid_shop_node(shop):
-		return
-	var container = shop._get_shop_items_container(player_index) if shop.has_method("_get_shop_items_container") else null
-	if not _is_live_ref(container):
-		return
-	var shop_item_nodes = _safe_get(container, "_shop_items", [])
-	if typeof(shop_item_nodes) != TYPE_ARRAY:
-		return
-	for slot_index in range(shop_item_nodes.size()):
-		var shop_item = shop_item_nodes[slot_index]
-		if not _is_live_ref(shop_item):
-			continue
-		var item_data = _safe_get(shop_item, "item_data", null)
-		if item_data == null:
-			continue
-		var slot_key = _build_client_shop_lock_slot_key(shop, player_index, slot_index, item_data)
-		if slot_key == "":
-			continue
-		_client_shop_lock_state_by_slot_key[slot_key] = bool(_safe_get(shop_item, "locked", false))
-
-
-func _poll_client_shop_lock_state_changes(shop: Node, player_index: int) -> void:
-	if _is_game_host() or _applying_remote_run_page_action:
-		return
-	if not _is_valid_shop_node(shop) or player_index < 0:
-		return
-	if RunData.get_player_effect_bool(Keys.disable_item_locking_hash, player_index):
-		return
-	var container = shop._get_shop_items_container(player_index) if shop.has_method("_get_shop_items_container") else null
-	if not _is_live_ref(container):
-		return
-	var shop_item_nodes = _safe_get(container, "_shop_items", [])
-	if typeof(shop_item_nodes) != TYPE_ARRAY:
-		return
-	var live_keys = {}
-	for slot_index in range(shop_item_nodes.size()):
-		var shop_item = shop_item_nodes[slot_index]
-		if not _is_live_ref(shop_item):
-			continue
-		if not bool(_safe_get(shop_item, "active", false)):
-			continue
-		var item_data = _safe_get(shop_item, "item_data", null)
-		if item_data == null:
-			continue
-		if not bool(_safe_get(item_data, "is_lockable", true)):
-			continue
-		var slot_key = _build_client_shop_lock_slot_key(shop, player_index, slot_index, item_data)
-		if slot_key == "":
-			continue
-		live_keys[slot_key] = true
-		var locked = bool(_safe_get(shop_item, "locked", false))
-		if not _client_shop_lock_state_by_slot_key.has(slot_key):
-			_client_shop_lock_state_by_slot_key[slot_key] = locked
-			continue
-		var prev_locked = bool(_client_shop_lock_state_by_slot_key[slot_key])
-		if prev_locked == locked:
-			continue
-		_client_shop_lock_state_by_slot_key[slot_key] = locked
-		var msg = _build_client_shop_item_action("shop_lock", shop_item, player_index)
-		msg["ban"] = false
-		msg["desired_locked"] = locked
-		_submit_local_shop_action(msg, player_index, "lock_poll")
-	var cleanup = []
-	for key in _client_shop_lock_state_by_slot_key.keys():
-		if not live_keys.has(key) and str(key).begins_with(str(shop.get_instance_id()) + ":" + str(player_index) + ":"):
-			cleanup.append(key)
-	for key in cleanup:
-		_client_shop_lock_state_by_slot_key.erase(key)
-
-
-func _build_client_shop_lock_slot_key(shop: Node, player_index: int, slot_index: int, item_data) -> String:
-	if not _is_valid_shop_node(shop) or item_data == null:
-		return ""
-	var item_key = _get_shop_item_identity_key(item_data)
-	if item_key == "":
-		item_key = str(_safe_get(item_data, "my_id_hash", 0))
-	return str(shop.get_instance_id()) + ":" + str(player_index) + ":" + str(slot_index) + ":" + item_key
+func _get_cached_shop_item_slot(shop: Node, player_index: int, shop_item) -> int:
+	if not _is_valid_shop_node(shop) or player_index < 0 or not _is_live_ref(shop_item):
+		return -1
+	var key = str(shop.get_instance_id()) + ":" + str(player_index) + ":" + str(shop_item.get_instance_id())
+	if _shop_item_slot_by_instance_id.has(key):
+		return int(_shop_item_slot_by_instance_id[key])
+	# Rare fallback for a slot node created after initial signal wiring. The result is
+	# cached immediately, so normal focus changes remain O(1).
+	var slot_index = _get_shop_item_index(shop_item, player_index)
+	if slot_index >= 0:
+		_shop_item_slot_by_instance_id[key] = slot_index
+	return slot_index
 
 
 func _intercept_client_shop_item_buttons(container: Node, player_index: int) -> void:
@@ -1642,9 +1617,13 @@ func _intercept_client_shop_item_buttons(container: Node, player_index: int) -> 
 	var shop_item_nodes = _safe_get(container, "_shop_items", [])
 	if typeof(shop_item_nodes) != TYPE_ARRAY:
 		return
-	for shop_item_node in shop_item_nodes:
+	var shop = _find_shop_node()
+	for slot_index in range(shop_item_nodes.size()):
+		var shop_item_node = shop_item_nodes[slot_index]
 		if not _is_live_ref(shop_item_node):
 			continue
+		if _is_valid_shop_node(shop):
+			_cache_shop_item_slot(shop, player_index, shop_item_node, slot_index)
 		if shop_item_node.is_connected("buy_button_pressed", container, "on_shop_item_buy_button_pressed"):
 			shop_item_node.disconnect("buy_button_pressed", container, "on_shop_item_buy_button_pressed")
 		if not shop_item_node.is_connected("buy_button_pressed", self, "_on_client_shop_item_buy_button_pressed"):
@@ -1660,75 +1639,15 @@ func _intercept_client_shop_item_buttons(container: Node, player_index: int) -> 
 
 		var lock_button = _safe_get(shop_item_node, "_lock_button", null)
 		if _is_live_ref(lock_button):
+			# Client button activation remains intercepted so it cannot mutate authoritative
+			# RunData locally. Keyboard/gamepad direct-lock bypasses this Button entirely and
+			# is captured by bo_lock_status_changed below.
 			if lock_button.is_connected("toggled", shop_item_node, "_on_LockButton_toggled"):
 				lock_button.disconnect("toggled", shop_item_node, "_on_LockButton_toggled")
 			if not lock_button.is_connected("toggled", self, "_on_client_shop_item_lock_toggled"):
 				lock_button.connect("toggled", self, "_on_client_shop_item_lock_toggled", [shop_item_node, player_index])
-
-
-func _maybe_schedule_client_shop_direct_lock_probe(event: InputEvent) -> void:
-	# This probe is only for shop lock/select. In battle, analog stick motion can
-	# generate many InputEventJoypadMotion events per second; do not scan for a
-	# shop node from main.tscn on every motion event.
-	if event is InputEventJoypadMotion:
-		return
-	if _get_current_menu_screen_fast() != SCREEN_SHOP:
-		return
-	if _is_game_start_guard_active():
-		return
-	if _is_game_host() or _applying_remote_run_page_action:
-		return
-	var shop = _find_shop_node()
-	if not _is_valid_shop_node(shop):
-		return
-	var player_index = _get_local_client_player_index()
-	if player_index < 0:
-		return
-	if not Utils.is_player_select_pressed(event, player_index):
-		return
-	var shop_item = _get_focused_shop_item_node(shop, player_index)
-	if not _is_live_ref(shop_item):
-		return
-	var item_data = _safe_get(shop_item, "item_data", null)
-	if item_data == null:
-		return
-	if not bool(_safe_get(item_data, "is_lockable", true)):
-		return
-	if RunData.get_player_effect_bool(Keys.disable_item_locking_hash, player_index):
-		return
-
-	_client_shop_direct_lock_probe_seq += 1
-	var probe_seq = _client_shop_direct_lock_probe_seq
-	var before_locked = bool(_safe_get(shop_item, "locked", false))
-	var item_key = _get_shop_item_identity_key(item_data)
-	call_deferred("_finish_client_shop_direct_lock_probe", probe_seq, int(shop.get_instance_id()), int(shop_item.get_instance_id()), player_index, before_locked, item_key)
-
-
-func _finish_client_shop_direct_lock_probe(probe_seq: int, shop_instance_id: int, shop_item_instance_id: int, player_index: int, before_locked: bool, item_key: String) -> void:
-	if probe_seq <= 0:
-		return
-	if _is_game_host() or _applying_remote_run_page_action:
-		return
-	var shop = _find_shop_node()
-	if not _is_valid_shop_node(shop) or int(shop.get_instance_id()) != shop_instance_id:
-		return
-	var shop_item = _get_shop_item_by_instance_id(shop, player_index, shop_item_instance_id)
-	if not _is_live_ref(shop_item):
-		return
-	var item_data = _safe_get(shop_item, "item_data", null)
-	if item_data == null:
-		return
-	if item_key != "" and _get_shop_item_identity_key(item_data) != item_key:
-		return
-	var after_locked = bool(_safe_get(shop_item, "locked", false))
-	# Send even if after_locked == before_locked. Depending on scene-tree input order,
-	# this manager can receive _input after BaseShop already toggled the item, so the
-	# captured "before" value may already be the final value. Host-side application is
-	# idempotent because desired_locked is explicit and the item identity is included.
-	var msg = _build_client_shop_item_action("shop_lock", shop_item, player_index)
-	msg["ban"] = false
-	msg["desired_locked"] = after_locked
-	_submit_local_shop_action(msg, player_index, "lock_probe")
+		if shop_item_node.has_signal("bo_lock_status_changed") and not shop_item_node.is_connected("bo_lock_status_changed", self, "_on_client_shop_item_lock_toggled"):
+			shop_item_node.connect("bo_lock_status_changed", self, "_on_client_shop_item_lock_toggled", [player_index])
 
 
 func _get_focused_shop_item_node(shop: Node, player_index: int):
@@ -1742,21 +1661,6 @@ func _get_focused_shop_item_node(shop: Node, player_index: int):
 	var target = _get_current_shop_focus_target(shop, player_index)
 	if target != "":
 		return _get_shop_item_for_target(shop, player_index, target)
-	return null
-
-
-func _get_shop_item_by_instance_id(shop: Node, player_index: int, instance_id: int):
-	if not _is_valid_shop_node(shop):
-		return null
-	var container = shop._get_shop_items_container(player_index) if shop.has_method("_get_shop_items_container") else null
-	if not _is_live_ref(container):
-		return null
-	var shop_item_nodes = _safe_get(container, "_shop_items", [])
-	if typeof(shop_item_nodes) != TYPE_ARRAY:
-		return null
-	for shop_item in shop_item_nodes:
-		if _is_live_ref(shop_item) and int(shop_item.get_instance_id()) == instance_id:
-			return shop_item
 	return null
 
 
@@ -1910,29 +1814,12 @@ func _on_client_shop_item_lock_toggled(button_pressed: bool, shop_item, player_i
 	msg["desired_locked"] = bool(button_pressed)
 	if not _is_game_host() and _is_live_ref(shop_item):
 		_apply_shop_item_lock_visual_only(shop_item, bool(button_pressed))
-		_update_client_shop_lock_baseline_for_item(shop_item, player_index, bool(button_pressed))
 	_submit_local_shop_action(msg, player_index, "lock")
 
 
-func _update_client_shop_lock_baseline_for_item(shop_item, player_index: int, locked: bool) -> void:
-	if _is_game_host() or not _is_live_ref(shop_item):
-		return
-	var shop = _find_shop_node()
-	if not _is_valid_shop_node(shop):
-		return
-	var slot_index = _get_shop_item_index(shop_item, player_index)
-	if slot_index < 0:
-		return
-	var item_data = _safe_get(shop_item, "item_data", null)
-	if item_data == null:
-		return
-	var slot_key = _build_client_shop_lock_slot_key(shop, player_index, slot_index, item_data)
-	if slot_key != "":
-		_client_shop_lock_state_by_slot_key[slot_key] = locked
-
-
 func _build_client_shop_item_action(action_type: String, shop_item, player_index: int) -> Dictionary:
-	var idx = _get_shop_item_index(shop_item, player_index)
+	var shop = _find_shop_node()
+	var idx = _get_cached_shop_item_slot(shop, player_index, shop_item) if _is_valid_shop_node(shop) else _get_shop_item_index(shop_item, player_index)
 	var item_data = _safe_get(shop_item, "item_data", null)
 	return {
 		"msg_type": "run_page_action_sync",
@@ -2060,7 +1947,6 @@ func _apply_client_shop_lock_prediction_visual_only(shop: Node, player_index: in
 	if message.has("desired_locked"):
 		desired_locked = bool(message.get("desired_locked", desired_locked))
 	_apply_shop_item_lock_visual_only(shop_item, desired_locked)
-	_update_client_shop_lock_baseline_for_item(shop_item, player_index, desired_locked)
 	if _is_live_ref(container) and container.has_method("update_buttons_color"):
 		container.update_buttons_color()
 	return true
@@ -5442,62 +5328,66 @@ func _is_valid_shop_node(node) -> bool:
 func _get_current_shop_focus_target(shop: Node, player_index: int) -> String:
 	if not _is_valid_shop_node(shop):
 		return ""
-	var focus_emulator = Utils.get_focus_emulator(player_index)
-	var focused_control = _safe_get(focus_emulator, "focused_control", null)
+	var focus_emulator = Utils.get_focus_emulator(player_index) if Utils != null else null
+	var focused_control = _safe_get(focus_emulator, "focused_control", null) if _is_live_ref(focus_emulator) else null
 	if _is_live_ref(focused_control):
-		var reroll_button = shop._get_reroll_button(player_index) if shop.has_method("_get_reroll_button") else null
-		if _is_live_ref(reroll_button) and focused_control == reroll_button:
-			return "reroll"
-		var go_button = shop._get_go_button(player_index) if shop.has_method("_get_go_button") else null
-		if _is_live_ref(go_button) and focused_control == go_button:
-			return "go"
-		var container = shop._get_shop_items_container(player_index) if shop.has_method("_get_shop_items_container") else null
-		if _is_live_ref(container):
-			var shop_items = _safe_get(container, "_shop_items", [])
-			if typeof(shop_items) == TYPE_ARRAY:
-				for i in range(shop_items.size()):
-					var item = shop_items[i]
-					if not _is_live_ref(item):
-						continue
-					var button = _safe_get(item, "_button", null)
-					if _is_live_ref(button) and focused_control == button:
-						return "item_" + str(i)
-		var inv_target = _get_inventory_focus_target_for_control(shop, player_index, focused_control)
-		if inv_target != "":
-			return inv_target
+		var info = _get_shop_focus_target_info(shop, player_index, focused_control)
+		var target = str(info.get("target", ""))
+		if target != "":
+			return target
 
-	# Fallback for the vanilla shop state variable. This only tracks shop buy items,
-	# not inventory weapons/items, so keep it after the actual FocusEmulator check.
+	# Rare vanilla fallback. _focused_shop_item only tracks the four buy slots and is
+	# therefore bounded; inventory focus never falls back to a full-list reverse scan.
 	var focused_items = _safe_get(shop, "_focused_shop_item", [])
 	if typeof(focused_items) == TYPE_ARRAY and player_index >= 0 and player_index < focused_items.size():
 		var focused_shop_item = focused_items[player_index]
-		var idx = _get_shop_item_index(focused_shop_item, player_index)
-		if idx >= 0:
-			return "item_" + str(idx)
+		if _is_live_ref(focused_shop_item):
+			var idx = _get_cached_shop_item_slot(shop, player_index, focused_shop_item)
+			if idx >= 0:
+				return "item_" + str(idx)
 	return ""
 
 
-func _get_shop_focus_target_stable_identity(shop: Node, player_index: int, target: String) -> Dictionary:
-	var is_weapon = target.begins_with("weapon_")
-	if not is_weapon and not target.begins_with("inventory_item_"):
+func _get_shop_focus_target_info(shop: Node, player_index: int, focused_control) -> Dictionary:
+	if not _is_valid_shop_node(shop) or player_index < 0 or not _is_live_ref(focused_control):
 		return {}
-	# The target was just derived from FocusEmulator. Walk from the focused control
-	# to its InventoryElement parent instead of enumerating the inventory a second
-	# time merely to serialize the focused item's identity.
-	var focus_emulator = Utils.get_focus_emulator(player_index)
-	var focused_control = _safe_get(focus_emulator, "focused_control", null) if _is_live_ref(focus_emulator) else null
-	var elements_node = _get_shop_inventory_elements_node(shop, player_index, is_weapon)
-	var current = focused_control
-	while _is_live_ref(current) and _is_live_ref(elements_node) and current != elements_node:
-		if current.get_parent() == elements_node:
-			return _build_shop_item_stable_identity(_safe_get(current, "item", null))
-		current = current.get_parent()
 
-	# Rare fallback for vanilla state-derived targets where FocusEmulator is absent.
-	var element = _get_inventory_element_for_shop_target(shop, player_index, target)
-	if not _is_live_ref(element):
-		return {}
-	return _build_shop_item_stable_identity(_safe_get(element, "item", null))
+	var reroll_button = shop._get_reroll_button(player_index) if shop.has_method("_get_reroll_button") else null
+	if _is_live_ref(reroll_button) and focused_control == reroll_button:
+		return {"target": "reroll"}
+	var go_button = shop._get_go_button(player_index) if shop.has_method("_get_go_button") else null
+	if _is_live_ref(go_button) and focused_control == go_button:
+		return {"target": "go"}
+
+	var shop_items_container = shop._get_shop_items_container(player_index) if shop.has_method("_get_shop_items_container") else null
+	var weapons_elements = _get_shop_inventory_elements_node(shop, player_index, true)
+	var items_elements = _get_shop_inventory_elements_node(shop, player_index, false)
+	var shop_prefix = str(shop.get_instance_id()) + ":" + str(player_index) + ":"
+	var current = focused_control
+	while _is_live_ref(current):
+		var cached_slot_key = shop_prefix + str(current.get_instance_id())
+		if _shop_item_slot_by_instance_id.has(cached_slot_key):
+			return {"target": "item_" + str(int(_shop_item_slot_by_instance_id[cached_slot_key]))}
+
+		var parent = current.get_parent()
+		if _is_live_ref(weapons_elements) and parent == weapons_elements:
+			return {
+				"target": "weapon_" + str(current.get_index()),
+				"inventory_item": _safe_get(current, "item", null)
+			}
+		if _is_live_ref(items_elements) and parent == items_elements:
+			return {
+				"target": "inventory_item_" + str(current.get_index()),
+				"inventory_item": _safe_get(current, "item", null)
+			}
+		if _is_live_ref(shop_items_container) and parent == shop_items_container:
+			var slot_index = _get_cached_shop_item_slot(shop, player_index, current)
+			if slot_index >= 0:
+				return {"target": "item_" + str(slot_index)}
+		if current == shop:
+			break
+		current = parent
+	return {}
 
 
 func _resolve_shop_focus_target_by_stable_identity(shop: Node, player_index: int, target: String, identity) -> String:
@@ -5521,7 +5411,7 @@ func _resolve_shop_focus_target_by_stable_identity(shop: Node, player_index: int
 	else:
 		return target
 
-	# Common case: inspect only the requested visible index. The full inventory array
+	# Common case: inspect only the requested child index. The full inventory array
 	# is not built unless this slot contains a different item identity.
 	var indexed_element = _get_shop_inventory_element_at_visible_index(shop, player_index, is_weapon, index)
 	if _is_live_ref(indexed_element) and _shop_item_matches_stable_identity(_safe_get(indexed_element, "item", null), identity):
@@ -5552,30 +5442,11 @@ func _get_control_for_shop_target(shop: Node, player_index: int, target: String)
 
 
 func _get_inventory_focus_target_for_control(shop: Node, player_index: int, focused_control) -> String:
-	# InventoryElement itself is normally the focused Control, but after opening an
-	# inventory popup vanilla focus can temporarily sit on a child/popup button.
-	# Accept descendants as belonging to the same inventory target so shop_focus
-	# packets continue to describe weapons/items instead of falling back to shop
-	# items only.
-	var weapons = _get_shop_inventory_elements(shop, player_index, true)
-	for i in range(weapons.size()):
-		if _control_matches_or_contains(weapons[i], focused_control):
-			return "weapon_" + str(i)
-	var items = _get_shop_inventory_elements(shop, player_index, false)
-	for i in range(items.size()):
-		if _control_matches_or_contains(items[i], focused_control):
-			return "inventory_item_" + str(i)
+	var info = _get_shop_focus_target_info(shop, player_index, focused_control)
+	var target = str(info.get("target", ""))
+	if target.begins_with("weapon_") or target.begins_with("inventory_item_"):
+		return target
 	return ""
-
-
-func _control_matches_or_contains(owner, control) -> bool:
-	if not _is_live_ref(owner) or not _is_live_ref(control):
-		return false
-	if owner == control:
-		return true
-	if _safe_node_is_parent_of(owner, control):
-		return true
-	return false
 
 
 func _get_inventory_element_for_shop_target(shop: Node, player_index: int, target: String):
@@ -5617,6 +5488,15 @@ func _get_shop_inventory_element_at_visible_index(shop: Node, player_index: int,
 	var elements_node = _get_shop_inventory_elements_node(shop, player_index, is_weapon)
 	if not _is_live_ref(elements_node):
 		return null
+
+	# New shop_focus packets use InventoryElement.get_index(), so the common lookup is
+	# direct O(1). If an older peer sent a visible-only index and hidden children exist,
+	# fall back to the legacy visible scan for compatibility.
+	if wanted_index < elements_node.get_child_count():
+		var direct_child = elements_node.get_child(wanted_index)
+		if _is_live_ref(direct_child) and direct_child is Control and direct_child.is_visible_in_tree():
+			return direct_child
+
 	var visible_index = 0
 	for child_index in range(elements_node.get_child_count()):
 		var child = elements_node.get_child(child_index)
@@ -6419,6 +6299,7 @@ func _poll_progression_page_focus_and_state() -> void:
 		var host_player_indices = _get_host_local_player_indices()
 		_configure_online_focus_emulator_input_owners(host_player_indices, "progression_host")
 		_ensure_host_progression_ban_button_connections(ui)
+		_ensure_host_item_box_take_sync_connection(ui)
 		var player_count = _get_run_player_count()
 		for player_index in range(player_count):
 			_queue_progression_state_if_changed(player_index, ui)
@@ -6438,6 +6319,55 @@ func _poll_progression_page_focus_and_state() -> void:
 	_install_client_progression_press_intercept(container, local_player_index)
 	_ensure_local_progression_focus(container, local_player_index, "poll")
 	_queue_progression_focus_if_changed(local_player_index, ui)
+
+
+func _ensure_host_item_box_take_sync_connection(ui: Node) -> void:
+	if not _is_live_ref(ui) or not _is_game_host():
+		return
+	if not ui.has_signal("item_take_button_pressed"):
+		return
+	if not ui.is_connected("item_take_button_pressed", self, "_on_host_item_box_take_for_inventory_sync"):
+		ui.connect("item_take_button_pressed", self, "_on_host_item_box_take_for_inventory_sync")
+
+
+func _on_host_item_box_take_for_inventory_sync(item_data, consumable) -> void:
+	# The Host already runs vanilla RunData.add_item through Main's existing signal
+	# connection. Broadcast only this single inventory addition so Clients can keep
+	# their held-items list correct even when endless shops use incremental-only sync.
+	if not _is_game_host() or not _is_online_session_active() or item_data == null:
+		return
+	var player_index = int(_safe_get(consumable, "player_index", -1))
+	if player_index < 0 or player_index >= _get_run_player_count():
+		return
+	var item_state = _serialize_item_parent_data(item_data)
+	if item_state.empty():
+		return
+	_queue_local_run_page_action({
+		"msg_type": "run_page_action_sync",
+		"action_type": "item_box_item_added",
+		"screen": "progression_item_box",
+		"player_index": player_index,
+		"item": item_state,
+		"item_id_hash": int(item_state.get("my_id_hash", 0))
+	})
+
+
+func _apply_item_box_item_added(player_index: int, message: Dictionary) -> bool:
+	# Client-side background inventory mutation only. Do not replay TakeButton/UI
+	# progression: the existing authoritative progression state remains responsible
+	# for which crate/reward is shown next.
+	if _is_game_host() or RunData == null:
+		return false
+	if player_index < 0 or player_index >= RunData.players_data.size():
+		return false
+	var item_state = message.get("item", {})
+	if typeof(item_state) != TYPE_DICTIONARY or item_state.empty():
+		return false
+	var item_data = _resolve_item_parent_data(item_state)
+	if item_data == null:
+		return false
+	RunData.add_item(item_data, player_index)
+	return true
 
 
 func _ensure_host_progression_ban_button_connections(ui: Node) -> void:
@@ -7768,6 +7698,7 @@ func _is_mutating_run_page_action(action_type: String) -> bool:
 		"upgrade_select",
 		"upgrade_reroll",
 		"item_box_take",
+		"item_box_item_added",
 		"item_box_discard",
 		"item_box_ban",
 		"shop_buy",
@@ -9712,7 +9643,6 @@ func _install_client_press_intercept(selection: Node, screen: String, player_ind
 	_client_intercept_selection_instance_id = selection_id
 
 
-
 func _is_player_currently_ready_with_item(selection: Node, player_index: int, item_state: Dictionary) -> bool:
 	if not _is_live_ref(selection):
 		return false
@@ -10094,7 +10024,6 @@ func _clear_focus_emulators_before_client_scene_change(from_screen: String, to_s
 			_clear_focus_emulator_live_control(focus_emulator)
 		else:
 			_neutralize_stale_focus_emulator(focus_emulator, true)
-
 
 
 func _try_apply_pending_host_state() -> void:
@@ -10491,7 +10420,6 @@ func apply_remote_select_by_item_id(player_index: int, item_id, expected_screen:
 	var total_usec = OS.get_ticks_usec() - total_start_usec
 	if total_usec >= BO_UI_DIAG_SINGLE_COST_USEC:
 		_bo_ui_diag_log("REMOTE_SELECT", "total_us=" + str(total_usec) + " find_selection_us=" + str(selection_usec) + " find_element_us=" + str(find_usec) + " collect_us=" + str(collect_usec) + " scan_us=" + str(scan_usec) + " candidates=" + str(candidate_count) + " cache_hit=" + str(cache_hit) + " cache_build_us=" + str(cache_build_usec) + " apply_focus_us=" + str(apply_usec) + " cancel_us=" + str(cancel_usec) + " control_us=" + str(control_usec) + " expected_us=" + str(expected_usec) + " callback_us=" + str(callback_usec) + " select_us=" + str(select_usec) + " player=" + str(player_index) + " item=" + str(item_id) + " screen=" + screen)
-
 
 
 func build_selection_state() -> Dictionary:
@@ -11190,20 +11118,33 @@ func _safe_get(obj, prop_name: String, default_value):
 
 
 func _has_property(obj, prop_name: String) -> bool:
-	if not _is_live_ref(obj):
+	if not _is_live_ref(obj) or typeof(obj) != TYPE_OBJECT:
 		return false
-
-	if typeof(obj) != TYPE_OBJECT:
-		return false
-
 	if not obj.has_method("get_property_list"):
 		return false
 
-	for prop in obj.get_property_list():
-		if prop.has("name") and prop["name"] == prop_name:
-			return true
+	# get_property_list() allocates an Array of Dictionaries. Calling it from every
+	# _safe_get() made shop focus/lock code pay that allocation repeatedly. Cache the
+	# property-name set once per script/native class; subsequent checks are O(1).
+	var owner_key = _get_property_cache_owner_key(obj)
+	var property_names = _property_exists_cache.get(owner_key, null)
+	if property_names == null or typeof(property_names) != TYPE_DICTIONARY:
+		property_names = {}
+		for prop in obj.get_property_list():
+			if typeof(prop) == TYPE_DICTIONARY and prop.has("name"):
+				property_names[str(prop["name"])] = true
+		_property_exists_cache[owner_key] = property_names
+	return property_names.has(prop_name)
 
-	return false
+
+func _get_property_cache_owner_key(obj) -> String:
+	if not _is_live_ref(obj):
+		return "invalid"
+	var script_res = obj.get_script() if obj.has_method("get_script") else null
+	if _is_live_ref(script_res):
+		return "script:" + str(script_res.get_instance_id())
+	var cls = obj.get_class() if obj.has_method("get_class") else str(typeof(obj))
+	return "class:" + str(cls)
 
 
 func _get_slot_manager() -> Node:
@@ -11219,8 +11160,8 @@ func _input(event: InputEvent) -> void:
 		return
 	_bo_ui_diag_log_input_event(event, "menu_sync_manager")
 	var t_input = OS.get_ticks_usec()
-	# Lock changes are already captured by the lock-button signal and by the
-	# shop-state diff poll. The old raw select-input probe could run while backing
-	# out to the stats panel with focus still on an item and submit a false lock
+	# Lock changes are captured by the lock-button toggled signal. The old raw
+	# select-input probe could run while backing out to the stats panel with focus
+	# still on an item and submit a false lock
 	# action, which then disabled/locked that entry on Host and Client.
 	_bo_ui_diag_log_cost("input_handler", t_input)

@@ -384,6 +384,14 @@ func _brotato_online_discard_client_end_wave_pickups(reason: String) -> void:
 
 func clean_up_room() -> void:
 	if _brotato_online_is_online_client():
+		# Stop client-side enemy attack animations before vanilla frees EnemyProjectiles.
+		# Animation method tracks can still call ShootingAttackBehavior.shoot() even after
+		# the behavior node itself has stopped processing, racing the projectile container
+		# teardown during end-wave cleanup.
+		var replica = _brotato_online_get_battle_replica_manager()
+		if replica != null and replica.has_method("prepare_client_room_cleanup"):
+			replica.prepare_client_room_cleanup()
+
 		# The Host already owns bonus-gold/material and item-box queues. Letting the
 		# client run vanilla end-wave attraction briefly appends local boxes/materials,
 		# which makes HUD icons multiply or flash before the Host correction arrives.
@@ -789,11 +797,31 @@ func spawn_consumables(unit: Unit) -> void:
 
 
 func get_node_from_pool(id: int, parent: Node) -> Node:
+	# Vanilla immediately calls parent.add_child(node) when a pooled node is available.
+	# During client end-wave cleanup EnemyProjectiles may already be queued/freed while
+	# an animation method track is finishing a shot. Never pass that dead parent to vanilla.
+	if _brotato_online_is_online_client() and (parent == null or not is_instance_valid(parent) or parent.is_queued_for_deletion()):
+		return null
+
 	var node = .get_node_from_pool(id, parent)
 	if node != null and is_instance_valid(node):
 		_brotato_online_clear_drop_meta(node, "pool_pop")
 		_brotato_online_sanitize_pool_node(node, "pool_pop")
 	return node
+
+
+func add_enemy_projectile(instance: Projectile) -> void:
+	if _brotato_online_is_online_client():
+		# Companion guard for get_node_from_pool(): if the pool was empty, vanilla enemy
+		# shooting code instantiates a projectile and calls this method next. The container
+		# can already be gone at that point, so discard the late projectile instead of
+		# calling add_child() on a freed EnemyProjectiles node.
+		if instance == null or not is_instance_valid(instance):
+			return
+		if _enemy_projectiles == null or not is_instance_valid(_enemy_projectiles) or _enemy_projectiles.is_queued_for_deletion():
+			instance.call_deferred("queue_free")
+			return
+	.add_enemy_projectile(instance)
 
 
 func add_node_to_pool(node: Node, id: int) -> void:

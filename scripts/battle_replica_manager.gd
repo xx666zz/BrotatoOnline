@@ -392,13 +392,10 @@ func _apply_reliable_entity_birth_state(state: Dictionary, server_time_msec: int
 	var net_id = str(state.get("net_id", ""))
 	if net_id == "" or _locally_killed_until.has(net_id):
 		return
-	if _host_state_marks_boss_elite_dead(state) or bool(state.get("dead", false)):
-		if ENABLE_DEATH_SYNC:
-			_schedule_remote_death(net_id, str(state.get("category", _host_entity_category.get(net_id, ""))), _dict_to_vec2(state.get("pos", {})), now + DEATH_VISUAL_DELAY_MSEC, "reliable_state_dead")
-		else:
-			_remove_host_entity(net_id, true)
+	var category = str(state.get("category", _host_entity_category.get(net_id, "")))
+	if _host_state_marks_synced_entity_dead(state, category):
+		_schedule_remote_death(net_id, category, _dict_to_vec2(state.get("pos", {})), now + DEATH_VISUAL_DELAY_MSEC, "reliable_state_dead")
 		return
-	var category = str(state.get("category", ""))
 	var sync_mode = _get_entity_sync_mode(category, state)
 	var pos = _dict_to_vec2(state.get("pos", {}))
 	var vel = _dict_to_vec2(state.get("vel", {}))
@@ -630,7 +627,12 @@ func _suspend_client_battle_layer(reason: String) -> void:
 	if not _client_battle_terminal_cleanup_suspended:
 		pass
 	_client_battle_terminal_cleanup_suspended = true
-	_clear_all(reason)
+	# Do not free replicated combat entities here. Main may set _is_run_won/_is_wave_failed
+	# before its vanilla clean_up_room() has run; deleting Host replicas at this point
+	# bypasses EntitySpawner.clean_up_room() -> die(cleaning_up=true), leaves external
+	# target references pointing at freed instances, and can also change end-wave counts.
+	# Stop the replica layer immediately, but let vanilla own the room-cleanup lifecycle.
+	_pending_remote_deaths.clear()
 	_client_world_prepared = false
 	_client_initial_entity_cleanup_done = false
 	_latest_snapshot = {}
@@ -798,12 +800,9 @@ func _apply_latest_snapshot_if_needed() -> void:
 		var net_id = str(state.get("net_id", ""))
 		if net_id == "":
 			continue
-		var category = str(state.get("category", ""))
-		if _host_state_marks_boss_elite_dead(state) or bool(state.get("dead", false)):
-			if ENABLE_DEATH_SYNC:
-				_schedule_remote_death(net_id, str(state.get("category", _host_entity_category.get(net_id, ""))), _dict_to_vec2(state.get("pos", {})), now + DEATH_VISUAL_DELAY_MSEC, "state_dead")
-			else:
-				_remove_host_entity(net_id, true)
+		var category = str(state.get("category", _host_entity_category.get(net_id, "")))
+		if _host_state_marks_synced_entity_dead(state, category):
+			_schedule_remote_death(net_id, category, _dict_to_vec2(state.get("pos", {})), now + DEATH_VISUAL_DELAY_MSEC, "state_dead")
 			continue
 		if _locally_killed_until.has(net_id):
 			continue
@@ -921,6 +920,7 @@ func _get_or_create_host_entity(net_id: String, state: Dictionary) -> Node:
 	var scene_path = str(state.get("scene_path", ""))
 	var entity_type = int(state.get("entity_type", -1))
 	var pos = _dict_to_vec2(state.get("pos", {}))
+	var spawn_player_index = _resolve_spawn_player_index(int(state.get("player_index", -1)))
 	var node = null
 	if _is_local_combat_category(category):
 		var spawn_scene_path = scene_path
@@ -961,17 +961,17 @@ func _get_or_create_host_entity(net_id: String, state: Dictionary) -> Node:
 		if category == "structure" and data_res == null:
 			return null
 		if category == "pet" and data_res == null:
-			node = _spawn_display_only_entity(scene_path, pos, category)
+			node = _spawn_display_only_entity(scene_path, pos, category, spawn_player_index)
 			if _is_valid_node(node):
 				node.set_meta("brotato_online_display_only_fallback", true)
 		else:
 			spawn_scene_path = _get_spawnable_combat_scene_path(scene_path, category)
-			node = _spawn_local_combat_entity(spawn_scene_path, entity_type, pos, int(state.get("player_index", -1)), data_res)
+			node = _spawn_local_combat_entity(spawn_scene_path, entity_type, pos, spawn_player_index, data_res)
 		if _is_valid_node(node) and spawn_scene_path != scene_path:
 			node.set_meta("brotato_online_scene_fallback", true)
 			node.set_meta("brotato_online_original_scene_path", scene_path)
 	else:
-		node = _spawn_display_only_entity(scene_path, pos, category)
+		node = _spawn_display_only_entity(scene_path, pos, category, spawn_player_index)
 
 	if not _is_valid_node(node):
 		return null
@@ -1081,12 +1081,60 @@ func _infer_pet_data_path(scene_path: String) -> String:
 	return ""
 
 
+func _resolve_spawn_player_index(player_index: int) -> int:
+	# Host owner is authoritative. Some third-party/legacy snapshots may not expose one;
+	# only then fall back to the local mirrored player. This is creation-time only.
+	if player_index >= 0:
+		return player_index
+	var owned_index = _get_owned_player_index()
+	if owned_index >= 0:
+		return owned_index
+	return player_index
+
+
+func _set_creation_player_index(node: Node, player_index: int) -> void:
+	# Creation-time owner assignment must also work before add_child().
+	# _is_valid_node() requires is_inside_tree(), so it cannot be used here.
+	if node == null or not is_instance_valid(node):
+		return
+	if node.is_queued_for_deletion():
+		return
+	if node.get("player_index") != null:
+		node.set("player_index", _resolve_spawn_player_index(player_index))
+
+
+func _prime_pooled_player_index_before_spawn(spawner: Node, packed: PackedScene, entity_type: int, player_index: int) -> void:
+	# Vanilla already assigns owner before init() for new PET/STRUCTURE instances, and
+	# reassigns STRUCTURE before set_data(). Its pooled PET path is the exception: respawn()
+	# and update_data() happen without refreshing player_index. Prime the exact node that
+	# Main.get_node_from_pool() will pop so third-party pet init/update code sees the owner.
+	if entity_type != EntityType.PET and entity_type != EntityType.STRUCTURE:
+		return
+	if spawner == null or packed == null:
+		return
+	var main = spawner.get("_main")
+	if not _is_valid_node(main):
+		return
+	var pool = main.get("_pool")
+	if typeof(pool) != TYPE_DICTIONARY:
+		return
+	var pool_id = packed.get_instance_id()
+	if not pool.has(pool_id):
+		return
+	var nodes = pool[pool_id]
+	if typeof(nodes) != TYPE_ARRAY or nodes.empty():
+		return
+	var candidate = nodes[nodes.size() - 1]
+	_set_creation_player_index(candidate, player_index)
+
+
 func _spawn_local_combat_entity(scene_path: String, entity_type: int, pos: Vector2, player_index: int, data_res: Resource = null) -> Node:
 	if scene_path == "":
 		return null
 	var packed = load(scene_path)
 	if packed == null or not (packed is PackedScene):
 		return null
+	var spawn_player_index = _resolve_spawn_player_index(player_index)
 	var locator = _get_runtime_locator()
 	var spawner = locator.get_entity_spawner() if locator != null and locator.has_method("get_entity_spawner") else null
 	if spawner != null and spawner.has_method("spawn_entity"):
@@ -1094,7 +1142,8 @@ func _spawn_local_combat_entity(scene_path: String, entity_type: int, pos: Vecto
 		if args != null:
 			args.position = pos
 			args.type = entity_type
-			args.player_index = player_index
+			args.player_index = spawn_player_index
+			_prime_pooled_player_index_before_spawn(spawner, packed, entity_type, spawn_player_index)
 
 			var spawned = spawner.spawn_entity(packed, args, data_res, null, -1)
 			if _is_valid_node(spawned):
@@ -1107,13 +1156,14 @@ func _spawn_local_combat_entity(scene_path: String, entity_type: int, pos: Vecto
 	if parent == null:
 		node.queue_free()
 		return null
+	_set_creation_player_index(node, spawn_player_index)
 	parent.add_child(node)
-	_init_fallback_local_combat_entity(node, spawner, entity_type, pos, player_index, data_res)
+	_init_fallback_local_combat_entity(node, spawner, entity_type, pos, spawn_player_index, data_res)
 	_set_node_global_pos(node, pos)
 	return node
 
 
-func _spawn_display_only_entity(scene_path: String, pos: Vector2, category: String) -> Node:
+func _spawn_display_only_entity(scene_path: String, pos: Vector2, category: String, player_index: int = -1) -> Node:
 	var node = null
 	if scene_path != "":
 		var packed = load(scene_path)
@@ -1127,6 +1177,8 @@ func _spawn_display_only_entity(scene_path: String, pos: Vector2, category: Stri
 	if parent == null:
 		node.queue_free()
 		return null
+	if category == "pet" or category == "structure":
+		_set_creation_player_index(node, player_index)
 	parent.add_child(node)
 	_set_node_global_pos(node, pos)
 	return node
@@ -1138,8 +1190,6 @@ func _init_fallback_local_combat_entity(node: Node, spawner: Node, entity_type: 
 	# and follow_target_movement_behavior.gd crashes in get_target_position().
 	if not _is_valid_node(node):
 		return
-	if node.get("player_index") != null:
-		node.set("player_index", player_index)
 	if node.has_method("init") and spawner != null:
 		var zone_min = spawner.get("_zone_min_pos")
 		var zone_max = spawner.get("_zone_max_pos")
@@ -1770,18 +1820,6 @@ func _on_host_local_entity_died(entity, _die_args, net_id: String, category: Str
 		return
 	if net_id == "":
 		return
-	if not ENABLE_DEATH_REPORTS:
-		if _allows_client_entity_death_report(category, entity, net_id):
-			# Bosses/elites are Host-motion controlled. If a client-side kill removes the
-			# local proxy first, do not let the next compact Host snapshot recreate this
-			# net_id as the generic baby/boss fallback while the reliable claim is in flight.
-			_locally_killed_until[net_id] = OS.get_ticks_msec() + LOCAL_KILL_IGNORE_MSEC
-			_cleanup_host_entity_tracking(net_id)
-			_send_entity_kill_claim(net_id, category, entity)
-			_flush_boss_damage_reports(true)
-			return
-		_cleanup_host_entity_tracking(net_id)
-		return
 
 	# Defensive fallback for any stale pooled signal connection that survived from an
 	# older build/session: trust the node's current replicated meta id if it points
@@ -1795,10 +1833,30 @@ func _on_host_local_entity_died(entity, _die_args, net_id: String, category: Str
 			else:
 				return
 
+	# Host-confirmed deaths and vanilla room cleanup must never be reflected back as
+	# client kill claims. Both paths emit died synchronously from Entity.die().
+	if _is_valid_node(entity) and entity.has_meta("brotato_online_remote_death_applying") and bool(entity.get_meta("brotato_online_remote_death_applying")):
+		_pending_remote_deaths.erase(net_id)
+		_cleanup_host_entity_tracking(net_id)
+		return
+	if _die_args != null and bool(_die_args.cleaning_up):
+		_pending_remote_deaths.erase(net_id)
+		_cleanup_host_entity_tracking(net_id)
+		return
 	if _pending_remote_deaths.has(net_id):
 		_cleanup_host_entity_tracking(net_id)
 		return
-	if _is_valid_node(entity) and entity.has_meta("brotato_online_remote_death_applying") and bool(entity.get_meta("brotato_online_remote_death_applying")):
+
+	if not ENABLE_DEATH_REPORTS:
+		if _allows_client_entity_death_report(category, entity, net_id):
+			# Bosses/elites are Host-motion controlled. If a client-side kill removes the
+			# local proxy first, do not let the next compact Host snapshot recreate this
+			# net_id as the generic baby/boss fallback while the reliable claim is in flight.
+			_locally_killed_until[net_id] = OS.get_ticks_msec() + LOCAL_KILL_IGNORE_MSEC
+			_cleanup_host_entity_tracking(net_id)
+			_send_entity_kill_claim(net_id, category, entity)
+			_flush_boss_damage_reports(true)
+			return
 		_cleanup_host_entity_tracking(net_id)
 		return
 
@@ -3126,12 +3184,12 @@ func _process_battle_events(snapshot: Dictionary, server_time_msec: int, now: in
 				continue
 			_seen_battle_event_ids[event_key] = true
 		if event_type == "death_event":
-			if not ENABLE_DEATH_SYNC:
-				continue
 			var net_id = str(event.get("target_net_id", event.get("net_id", "")))
 			if net_id == "":
 				continue
 			var category = str(event.get("category", _host_entity_category.get(net_id, "")))
+			if not _should_sync_remote_death_for_category(category):
+				continue
 			var pos = _dict_to_vec2(event.get("pos", {}))
 			var event_server_time = int(event.get("server_time_msec", server_time_msec))
 			var elapsed = max(0, server_time_msec - event_server_time)
@@ -3153,13 +3211,10 @@ func _prune_seen_battle_events() -> void:
 func _handle_host_removed_entity(id: String, now: int, source: String) -> void:
 	if id == "":
 		return
-	if not ENABLE_DEATH_SYNC:
-		_remove_host_entity(id, true)
-		_locally_killed_until.erase(id)
-		_sent_kill_claim_ids.erase(id)
-		return
 	if _locally_killed_until.has(id):
-		_remove_host_entity(id, true)
+		# Local combat already ran Entity.die(). A later Host removal is only an
+		# acknowledgement; never free the node out from under its death animation/pool path.
+		_remove_host_entity(id, false)
 		_locally_killed_until.erase(id)
 		_sent_kill_claim_ids.erase(id)
 		return
@@ -3168,7 +3223,7 @@ func _handle_host_removed_entity(id: String, now: int, source: String) -> void:
 
 func _schedule_or_remove_remote_death(id: String, source: String, now: int) -> void:
 	var category = str(_host_entity_category.get(id, ""))
-	if _is_combat_death_category(category) and _host_entities.has(id):
+	if _is_combat_death_category(category) and _host_entities.has(id) and _should_sync_remote_death_for_category(category):
 		var pos = _get_node_global_pos(_host_entities[id]) if _is_valid_node(_host_entities[id]) else _host_entity_targets.get(id, Vector2.ZERO)
 		_schedule_remote_death(id, category, pos, now + DEATH_VISUAL_DELAY_MSEC, source)
 	else:
@@ -3178,22 +3233,16 @@ func _schedule_or_remove_remote_death(id: String, source: String, now: int) -> v
 func _schedule_remote_death(id: String, category: String, pos: Vector2, remove_at_msec: int, source: String) -> void:
 	if id == "":
 		return
-	if not ENABLE_DEATH_SYNC:
-		_remove_host_entity(id, true)
-		_locally_killed_until.erase(id)
-		_sent_kill_claim_ids.erase(id)
+	if category == "":
+		category = str(_host_entity_category.get(id, ""))
+	if not _is_combat_death_category(category) or not _should_sync_remote_death_for_category(category):
 		return
 	if _locally_killed_until.has(id):
-		_remove_host_entity(id, true)
+		_remove_host_entity(id, false)
 		_locally_killed_until.erase(id)
 		_sent_kill_claim_ids.erase(id)
 		return
 	if not _host_entities.has(id):
-		return
-	if category == "":
-		category = str(_host_entity_category.get(id, ""))
-	if not _is_combat_death_category(category):
-		_remove_host_entity(id, true)
 		return
 	if _is_host_battle_inactive_cached():
 		remove_at_msec = OS.get_ticks_msec()
@@ -3212,9 +3261,6 @@ func _schedule_remote_death(id: String, category: String, pos: Vector2, remove_a
 
 
 func _update_pending_remote_deaths() -> void:
-	if not ENABLE_DEATH_SYNC:
-		_pending_remote_deaths.clear()
-		return
 	if _pending_remote_deaths.empty():
 		return
 	var now = OS.get_ticks_msec()
@@ -3233,11 +3279,23 @@ func _update_pending_remote_deaths() -> void:
 func _apply_pending_remote_death(id: String) -> void:
 	var node = _host_entities.get(id, null)
 	if _is_valid_node(node):
-		node.set_meta("brotato_online_remote_death_applying", true)
-		_unregister_from_spawner_arrays(node)
-		if node.has_method("die") and not bool(node.get("dead")):
-			node.call("die")
-		else:
+		# Preserve the vanilla Entity death lifecycle. In particular, keep the instance
+		# alive with dead == true until its death animation calls free_entity()/pooling.
+		# Mods commonly retain enemy references and use exactly that window to clear them.
+		var already_dead = bool(node.get("dead")) if node.get("dead") != null else false
+		if node.has_method("die") and not already_dead:
+			node.set_meta("brotato_online_remote_death_applying", true)
+			var die_args = Entity.DieArgs.new()
+			die_args.from = null
+			die_args.knockback_vector = Vector2.ZERO
+			die_args.cleaning_up = false
+			die_args.enemy_killed_by_player = false
+			die_args.killed_by_player_index = -1
+			die_args.killing_blow_dmg_value = 0
+			die_args.is_burning = false
+			node.call("die", die_args)
+		elif not already_dead and not node.is_queued_for_deletion():
+			# Non-Entity/display-only fallback nodes have no vanilla death lifecycle.
 			node.queue_free()
 	_cleanup_host_entity_tracking(id)
 	_pending_remote_deaths.erase(id)
@@ -3255,6 +3313,10 @@ func _is_host_battle_inactive_cached() -> bool:
 	if bool(_latest_wave_timer_state.get("running", false)):
 		return float(_latest_wave_timer_state.get("time_left", 0.0)) <= 0.05
 	return true
+
+
+func prepare_client_room_cleanup() -> void:
+	_neutralize_client_combat_threats("main_clean_up_room_pre")
 
 
 func _neutralize_client_combat_threats(reason: String) -> void:
@@ -3587,6 +3649,10 @@ func _disable_behavior_children(node: Node) -> void:
 	for child in node.get_children():
 		if not (child is Node):
 			continue
+		# Attack animations can invoke behavior methods from method tracks independently
+		# of the behavior node's _process state. Stop them explicitly before room cleanup.
+		if child is AnimationPlayer:
+			child.stop(false)
 		var n = str(child.name).to_lower()
 		if n.find("movement") >= 0 or n.find("attack") >= 0 or n.find("target") >= 0:
 			child.set_process(false)
@@ -3677,13 +3743,35 @@ func _is_looter_net_id(net_id: String) -> bool:
 	return _is_looter_entity(_host_entities.get(net_id, null))
 
 
-func _host_state_marks_boss_elite_dead(state: Dictionary) -> bool:
+func _should_sync_remote_death_for_category(category: String) -> bool:
+	if not _is_combat_death_category(category):
+		return false
+	# Broad death synchronization stays disabled by default. Bosses/elites keep their
+	# existing narrow authoritative path; if ENABLE_DEATH_SYNC is enabled later, every
+	# combat category goes through the exact same vanilla-lifecycle implementation.
+	return ENABLE_DEATH_SYNC or _is_boss_elite_category(category)
+
+
+func _host_state_marks_synced_entity_dead(state: Dictionary, category: String = "") -> bool:
 	if typeof(state) != TYPE_DICTIONARY:
 		return false
-	if not _is_boss_elite_category(str(state.get("category", ""))):
+	if category == "":
+		category = str(state.get("category", ""))
+	if not _should_sync_remote_death_for_category(category):
 		return false
+	if bool(state.get("dead", false)):
+		return true
+	# Health is authoritative only for categories whose death sync is enabled. This
+	# keeps regular birth-only enemies locally simulated while broad sync remains off.
 	var health = int(state.get("health", -1))
 	return health >= 0 and health <= 0
+
+
+func _host_state_marks_boss_elite_dead(state: Dictionary) -> bool:
+	# Kept as a compatibility wrapper for any external/debug calls.
+	if typeof(state) != TYPE_DICTIONARY or not _is_boss_elite_category(str(state.get("category", ""))):
+		return false
+	return _host_state_marks_synced_entity_dead(state, str(state.get("category", "")))
 
 
 func _should_apply_host_removed_entity(net_id: String) -> bool:

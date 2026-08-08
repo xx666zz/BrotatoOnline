@@ -120,9 +120,9 @@ func _setup_steam() -> void:
 		return
 	_steam = Engine.get_singleton("Steam")
 	if _steam.has_method("steamInitEx"):
-		_steam.steamInitEx(true, BROTATO_APP_ID)
+		_steam.steamInitEx(BROTATO_APP_ID, true)
 	elif _steam.has_method("steamInit"):
-		_steam.steamInit(true, BROTATO_APP_ID)
+		_steam.steamInit()
 	var self_id = ""
 	if _steam.has_method("getSteamID"):
 		self_id = str(_steam.getSteamID())

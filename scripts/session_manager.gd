@@ -40,6 +40,10 @@ const FORCE_ALL_STEAM_MESSAGES_RELIABLE = true
 # Keep each chunk well below 64KB after the JSON/base64 wrapper is added.
 const P2P_JSON_CHUNK_TRIGGER_BYTES = 400 * 1024
 const P2P_JSON_CHUNK_RAW_BYTES = 44000
+# LAN uses Godot 3.x NetworkedMultiplayerENet. Pre-chunk large state payloads,
+# but keep chunks reasonably large to avoid excessive application-level packet
+# count. 32 KB raw expands to roughly 43 KB after base64 plus the JSON wrapper.
+const LAN_P2P_JSON_CHUNK_RAW_BYTES = 32000
 const P2P_JSON_CHUNK_SENDS_PER_FRAME = 1
 # When SteamNetworkingMessages refuses a reliable chunk because the send buffer is
 # full, keep the packet at the head of the queue and retry after a few frames.
@@ -458,6 +462,8 @@ func join_lan(address: String, port: int = DEFAULT_LAN_PORT) -> void:
 	if _session_active:
 		leave_lobby()
 	_reset_transient_online_state_for_new_session("join_lan")
+	_online_flow_started = false
+	_online_flow_left_since_msec = 0
 	_pending_lan_join = true
 	_online_role = "client"
 	_client_join_request_started_msec = OS.get_ticks_msec()
@@ -506,6 +512,7 @@ func _on_transport_peer_disconnected(transport: Node, peer) -> void:
 	if peer_key != "" and peer_key != "__pending_host__":
 		_connection_by_peer_key.erase(peer_key)
 		_remove_player_connection(peer_key)
+		_drop_pending_p2p_sends_for_target(peer_key)
 	if not _is_game_host() and transport == _lan_transport and _session_active:
 		leave_lobby()
 	elif _is_game_host():
@@ -572,7 +579,14 @@ func _handle_transport_welcome(transport: Node, peer, welcome: Dictionary) -> vo
 	_session_active = true
 	_pending_lan_join = false
 	_online_role = "client"
-	_online_flow_started = true
+	# transport_welcome only confirms that the LAN transport handshake finished.
+	# The client may still be on the title/public-lobby scene while waiting for the
+	# Host's character/weapon/menu_scene_state. Starting the online-flow lifecycle
+	# here makes _poll_online_flow_lifecycle() treat that waiting scene as "left the
+	# run" and call leave_lobby() after 1.2 seconds. Match the Steam path: only mark
+	# the flow started when a real Host setup/scene message is received.
+	_online_flow_started = false
+	_online_flow_left_since_msec = 0
 	_client_join_request_started_msec = 0
 	var lookup_key = _connection_lookup_key(transport, peer)
 	_peer_key_by_connection[lookup_key] = _game_host_steam_id
@@ -6807,10 +6821,20 @@ func _send_p2p_json(target_steam_id: String, message: Dictionary, reliable: bool
 	var coalesce_key = _get_p2p_send_queue_coalesce_key(target_steam_id, wire_message, channel)
 	_bo_net_diag_log_large_or_queued_send(target_steam_id, msg_type, payload.size(), channel, reliable or FORCE_ALL_STEAM_MESSAGES_RELIABLE, "large_payload", _pending_p2p_chunk_sends.size())
 
-	# Only pre-chunk very large messages. Medium reliable packets should keep Steam's
-	# native message ordering; if Steam refuses one, fall back to the frame-paced chunk
-	# queue below.
-	if payload.size() > P2P_JSON_CHUNK_TRIGGER_BYTES:
+	# SteamNetworkingMessages can carry medium reliable messages directly and only
+	# needs application-level chunking for very large payloads. LAN uses Godot 3.x
+	# NetworkedMultiplayerENet instead. Its put_packet() reports OK after handing the
+	# packet to ENet even when ENet rejects that send internally, so a large direct LAN
+	# packet cannot reliably fall back through the send-failed path below. Pre-chunk
+	# LAN payloads before they reach ENet; the existing chunk queue/reassembly is
+	# transport-agnostic and also preserves ordering for following menu actions.
+	var target_connection = _connection_by_peer_key.get(target_steam_id, {})
+	var target_transport = target_connection.get("transport", null) if typeof(target_connection) == TYPE_DICTIONARY else null
+	var is_lan_target = target_transport != null and target_transport == _lan_transport
+	var should_prechunk = payload.size() > P2P_JSON_CHUNK_TRIGGER_BYTES
+	if is_lan_target and payload.size() > LAN_P2P_JSON_CHUNK_RAW_BYTES:
+		should_prechunk = true
+	if should_prechunk:
 		var queued_large = _queue_p2p_json_chunks(target_steam_id, payload, msg_type, send_flags, channel, coalesce_key)
 		return queued_large
 
@@ -6897,14 +6921,32 @@ func _drop_pending_p2p_coalesced_sends(coalesce_key: String, target_steam_id: St
 	return removed
 
 
+func _get_p2p_chunk_raw_bytes_for_target(target_peer_key: String) -> int:
+	var connection = _connection_by_peer_key.get(target_peer_key, {})
+	if typeof(connection) == TYPE_DICTIONARY and connection.get("transport", null) == _lan_transport:
+		return LAN_P2P_JSON_CHUNK_RAW_BYTES
+	return P2P_JSON_CHUNK_RAW_BYTES
+
+
+func _drop_pending_p2p_sends_for_target(target_peer_key: String) -> void:
+	if target_peer_key == "":
+		return
+	var i = _pending_p2p_chunk_sends.size() - 1
+	while i >= 0:
+		var queued = _pending_p2p_chunk_sends[i]
+		if typeof(queued) == TYPE_DICTIONARY and str(queued.get("target_steam_id", "")) == target_peer_key:
+			_pending_p2p_chunk_sends.remove(i)
+		i -= 1
+
+
 func _queue_p2p_json_direct_after_pending(target_steam_id: String, payload: PoolByteArray, msg_type: String, send_flags: int, channel: int, coalesce_key: String = "") -> bool:
 	if payload.size() <= 0:
 		return false
 	# A packet can be below the pre-chunk trigger but still too large for the
-	# current SteamNetworkingMessages send buffer. If it is queued behind chunks,
-	# do not retry it forever as a direct packet; split it now while preserving
-	# ordering behind the already-pending sends.
-	if payload.size() > P2P_JSON_CHUNK_RAW_BYTES:
+	# current transport. If it is queued behind chunks, split it now while
+	# preserving ordering behind the already-pending sends.
+	var chunk_raw_bytes = _get_p2p_chunk_raw_bytes_for_target(target_steam_id)
+	if payload.size() > chunk_raw_bytes:
 		return _queue_p2p_json_chunks(target_steam_id, payload, msg_type, send_flags, channel, coalesce_key)
 	_drop_pending_p2p_coalesced_sends(coalesce_key, target_steam_id, channel)
 	var now = OS.get_ticks_msec()
@@ -6930,17 +6972,20 @@ func _queue_p2p_json_direct_after_pending(target_steam_id: String, payload: Pool
 func _queue_p2p_json_chunks(target_steam_id: String, payload: PoolByteArray, msg_type: String, send_flags: int, channel: int, coalesce_key: String = "") -> bool:
 	if payload.size() <= 0:
 		return false
+	var chunk_raw_bytes = _get_p2p_chunk_raw_bytes_for_target(target_steam_id)
+	if chunk_raw_bytes <= 0:
+		return false
 	_p2p_chunk_seq += 1
 	var now = OS.get_ticks_msec()
 	var chunk_id = str(_self_steam_id) + ":" + str(_p2p_chunk_seq) + ":" + str(OS.get_ticks_usec()) + ":" + msg_type
-	var chunk_count = int(ceil(float(payload.size()) / float(P2P_JSON_CHUNK_RAW_BYTES)))
+	var chunk_count = int(ceil(float(payload.size()) / float(chunk_raw_bytes)))
 	if chunk_count <= 1:
 		return false
 	_drop_pending_p2p_coalesced_sends(coalesce_key, target_steam_id, channel)
 	_bo_net_diag_log_large_or_queued_send(target_steam_id, msg_type, payload.size(), channel, true, "chunk_queue", _pending_p2p_chunk_sends.size() + chunk_count)
 	for chunk_index in range(chunk_count):
-		var start = chunk_index * P2P_JSON_CHUNK_RAW_BYTES
-		var length = min(P2P_JSON_CHUNK_RAW_BYTES, payload.size() - start)
+		var start = chunk_index * chunk_raw_bytes
+		var length = min(chunk_raw_bytes, payload.size() - start)
 		var raw_chunk = _slice_pool_byte_array(payload, start, length)
 		var chunk_message = {
 			"msg_type": "p2p_json_chunk",

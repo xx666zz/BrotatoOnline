@@ -5598,6 +5598,13 @@ func _show_shop_focus_popup_for_target(shop: Node, player_index: int, target: St
 	var item_popup = shop._get_item_popup(player_index) if _is_valid_shop_node(shop) and shop.has_method("_get_item_popup") else null
 	var shop_item = _get_shop_item_for_target(shop, player_index, target)
 	if _is_live_ref(shop_item):
+		# During reconnect the remote FocusEmulator can become ready before this player's
+		# ShopItem has received its data. A late shop_focus packet may therefore resolve to
+		# a live ShopItem node whose item_data is still null. Never feed that transient
+		# placeholder into ItemPopup/third-party ItemDescription extensions.
+		var shop_item_data = _safe_get(shop_item, "item_data", null)
+		if not _is_live_ref(shop_item_data):
+			return
 		# The vanilla PopupManager first calls display_item_data(), then CoopShop only
 		# adds coop-specific lock/steal/ban hints. Calling show_shop_hints() alone keeps
 		# the previous item panel content (for example SMG text while Toxic Sludge is
@@ -5607,7 +5614,7 @@ func _show_shop_focus_popup_for_target(shop: Node, player_index: int, target: St
 		if _is_live_ref(item_popup):
 			if item_popup.has_method("display_item_data"):
 				var button = _safe_get(shop_item, "_button", shop_item)
-				item_popup.display_item_data(shop_item.item_data, button)
+				item_popup.display_item_data(shop_item_data, button)
 			if item_popup.has_method("set_synergies_visible"):
 				item_popup.set_synergies_visible(true)
 			item_popup.shop_item = shop_item

@@ -42,6 +42,31 @@ func _disconnect_focused_control(control: Control) -> void:
 	._disconnect_focused_control(control)
 
 
+func _set_focused_control_with_style(control: Control, emit_signals: bool) -> void:
+	if not _bo_is_live_control(control):
+		return
+	if focused_control == control:
+		return
+
+	# Vanilla keeps the previous focused Control in a local variable, clears the
+	# member, then emits focus_exited after installing the new Control. Inventory
+	# rebuilds can free that previous Control between those steps, so the later
+	# FocusEmulatorSignal.emit(previous, ...) receives Nil and crashes. Run the
+	# vanilla style/focus bookkeeping without its late signal emission, then emit
+	# only for references that are still alive. Valid controls keep vanilla order
+	# and semantics; a stale previous Control simply cannot receive focus_exited.
+	var previous = focused_control if _bo_is_live_control(focused_control) else null
+	var focus_owner = control.get_focus_owner()
+	._set_focused_control_with_style(control, false)
+
+	if not emit_signals:
+		return
+	if _bo_is_live_control(previous) and focus_owner != previous:
+		FocusEmulatorSignal.emit(previous, "focus_exited", player_index)
+	if _bo_is_live_control(control):
+		FocusEmulatorSignal.emit(control, "focus_entered", player_index)
+
+
 func _clear_focused_control() -> void:
 	if focused_control == null:
 		_bo_emit_focused_control_changed(null)

@@ -7191,11 +7191,18 @@ func _apply_upgrade_options_to_progression_container(container: Node, player_ind
 	var upgrade_states = visible.get("upgrades", [])
 	if typeof(upgrade_states) != TYPE_ARRAY:
 		return false
+	var upgrade_uis = []
+	if container.has_method("_get_upgrade_uis"):
+		upgrade_uis = container._get_upgrade_uis()
 	var upgrades = []
-	for upgrade_state in upgrade_states:
+	for state_index in range(upgrade_states.size()):
+		var upgrade_state = upgrade_states[state_index]
 		if typeof(upgrade_state) != TYPE_DICTIONARY:
 			continue
-		var upgrade_data = _resolve_item_parent_data(upgrade_state)
+		var slot_hint = null
+		if state_index < upgrade_uis.size() and _is_live_ref(upgrade_uis[state_index]):
+			slot_hint = _safe_get(upgrade_uis[state_index], "upgrade_data", null)
+		var upgrade_data = _resolve_progression_upgrade_data(upgrade_state, slot_hint)
 		if upgrade_data != null:
 			upgrades.append(upgrade_data)
 	if upgrades.empty():
@@ -7212,9 +7219,6 @@ func _apply_upgrade_options_to_progression_container(container: Node, player_ind
 		container.set("_old_upgrades", upgrades.duplicate())
 	if visible.has("gold"):
 		_set_player_gold_from_shop_state(player_index, int(visible.get("gold", RunData.get_player_gold(player_index))))
-	var upgrade_uis = []
-	if container.has_method("_get_upgrade_uis"):
-		upgrade_uis = container._get_upgrade_uis()
 	for i in range(upgrade_uis.size()):
 		var upgrade_ui = upgrade_uis[i]
 		if not _is_live_ref(upgrade_ui):
@@ -7443,10 +7447,81 @@ func _serialize_item_parent_data(data) -> Dictionary:
 	if data is UpgradeData:
 		result["upgrade_id"] = str(_safe_get(data, "upgrade_id", ""))
 		result["upgrade_id_hash"] = int(_safe_get(data, "upgrade_id_hash", Keys.empty_hash))
+		result["display_name"] = str(_safe_get(data, "name", ""))
+		result["icon_resource_path"] = _get_resource_path(_safe_get(data, "icon", null))
+		var upgrade_runtime_sync = _get_upgrade_runtime_sync()
+		if upgrade_runtime_sync != null and upgrade_runtime_sync.has_method("serialize_upgrade_effect_state"):
+			result["upgrade_effect_state"] = upgrade_runtime_sync.serialize_upgrade_effect_state(data)
 	return result
 
 
-func _resolve_item_parent_data(state: Dictionary):
+func _resolve_progression_upgrade_data(state: Dictionary, slot_hint):
+	# First prefer a real resource/ItemService match. Runtime upgrades created by other
+	# mods are often removed from ItemService immediately after rolling, so a global
+	# "first upgrade" placeholder is not a valid base for their Effect array.
+	var resolved = _resolve_item_parent_data(state, false)
+	if resolved != null:
+		return _sanitize_progression_upgrade_effects(resolved)
+
+	# The progression UI already owns the locally-created runtime UpgradeData for this
+	# slot. Reuse that class/effect structure by position, then overlay Host runtime
+	# effect values. Click authority is also slot-based, so this does not change the
+	# upgrade_direct_action / upgrade_select matching semantics.
+	if slot_hint != null and slot_hint is UpgradeData:
+		var copy = _duplicate_with_synced_value_if_needed(slot_hint, state)
+		_apply_item_parent_display_identity_from_state(copy, state)
+		return _sanitize_progression_upgrade_effects(copy)
+
+	# Last-resort compatibility path (e.g. peer missing a content mod). Keep the old
+	# placeholder behavior but sanitize its Effect list before feeding UpgradeUI.
+	resolved = _resolve_item_parent_data(state, true)
+	if resolved != null:
+		_apply_item_parent_display_identity_from_state(resolved, state)
+		return _sanitize_progression_upgrade_effects(resolved)
+	return null
+
+
+func _apply_item_parent_display_identity_from_state(data, state: Dictionary) -> void:
+	if data == null or typeof(state) != TYPE_DICTIONARY:
+		return
+	if state.has("my_id") and data.get("my_id") != null:
+		data.set("my_id", str(state.get("my_id", data.get("my_id"))))
+	if state.has("my_id_hash") and data.get("my_id_hash") != null:
+		data.set("my_id_hash", int(state.get("my_id_hash", data.get("my_id_hash"))))
+	if state.has("upgrade_id") and data.get("upgrade_id") != null:
+		data.set("upgrade_id", str(state.get("upgrade_id", data.get("upgrade_id"))))
+	if state.has("upgrade_id_hash") and data.get("upgrade_id_hash") != null:
+		data.set("upgrade_id_hash", int(state.get("upgrade_id_hash", data.get("upgrade_id_hash"))))
+	if state.has("display_name") and data.get("name") != null:
+		data.set("name", str(state.get("display_name", data.get("name"))))
+	var icon_path = str(state.get("icon_resource_path", ""))
+	if icon_path != "" and ResourceLoader.exists(icon_path) and data.get("icon") != null:
+		var icon = load(icon_path)
+		if icon != null:
+			data.set("icon", icon)
+
+
+func _sanitize_progression_upgrade_effects(upgrade_data):
+	if upgrade_data == null or not (upgrade_data is UpgradeData):
+		return upgrade_data
+	var raw_effects = upgrade_data.get("effects")
+	if typeof(raw_effects) != TYPE_ARRAY:
+		return upgrade_data
+	var cleaned = []
+	var changed = false
+	for effect in raw_effects:
+		if effect == null or typeof(effect) != TYPE_OBJECT:
+			changed = true
+			continue
+		cleaned.append(effect)
+	if not changed:
+		return upgrade_data
+	var copy = upgrade_data.duplicate()
+	copy.set("effects", cleaned)
+	return copy
+
+
+func _resolve_item_parent_data(state: Dictionary, allow_missing_placeholder: bool = true):
 	if typeof(state) != TYPE_DICTIONARY or state.empty():
 		return null
 	var resource_path = str(state.get("resource_path", ""))
@@ -7473,6 +7548,8 @@ func _resolve_item_parent_data(state: Dictionary):
 		resolved = ItemService.get_element(ItemService.items, id_hash)
 	if resolved != null:
 		return _duplicate_with_synced_value_if_needed(resolved, state)
+	if not allow_missing_placeholder:
+		return null
 	var fallback = _get_cached_missing_host_item_placeholder(state, data_type)
 	if fallback != null:
 		pass
@@ -7528,7 +7605,9 @@ func _duplicate_with_synced_value_if_needed(data, state: Dictionary):
 		return null
 	var serialized_data = state.get("serialized_data", {})
 	var has_serialized_data = typeof(serialized_data) == TYPE_DICTIONARY and not serialized_data.empty()
-	var needs_copy = has_serialized_data or state.has("value") or state.has("is_cursed") or state.has("curse_factor")
+	var upgrade_effect_state = state.get("upgrade_effect_state", null)
+	var has_upgrade_effect_state = data is UpgradeData and typeof(upgrade_effect_state) == TYPE_ARRAY
+	var needs_copy = has_serialized_data or state.has("value") or state.has("is_cursed") or state.has("curse_factor") or has_upgrade_effect_state
 	if not needs_copy:
 		return data
 	var copy = data.duplicate()
@@ -7548,7 +7627,18 @@ func _duplicate_with_synced_value_if_needed(data, state: Dictionary):
 			copy.set("dmg_dealt_last_wave", int(state.get("dmg_dealt_last_wave", copy.get("dmg_dealt_last_wave"))))
 		if state.has("tracked_value") and copy.get("tracked_value") != null:
 			copy.set("tracked_value", int(state.get("tracked_value", copy.get("tracked_value"))))
+	if has_upgrade_effect_state:
+		var upgrade_runtime_sync = _get_upgrade_runtime_sync()
+		if upgrade_runtime_sync != null and upgrade_runtime_sync.has_method("apply_upgrade_effect_state"):
+			upgrade_runtime_sync.apply_upgrade_effect_state(copy, upgrade_effect_state)
 	return copy
+
+
+func _get_upgrade_runtime_sync() -> Node:
+	var parent = get_parent()
+	if parent == null:
+		return null
+	return parent.get_node_or_null("BrotatoOnlineUpgradeRuntimeSync")
 
 
 func _get_resource_path(data) -> String:

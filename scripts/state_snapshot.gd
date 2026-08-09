@@ -1284,9 +1284,19 @@ func _serialize_item_parent_data(data) -> Dictionary:
 	if data is UpgradeData:
 		result["upgrade_id"] = str(_safe_get_from_object(data, "upgrade_id", ""))
 		result["upgrade_id_hash"] = int(_safe_get_from_object(data, "upgrade_id_hash", Keys.empty_hash))
+		var upgrade_runtime_sync = _get_upgrade_runtime_sync()
+		if upgrade_runtime_sync != null and upgrade_runtime_sync.has_method("serialize_upgrade_effect_state"):
+			result["upgrade_effect_state"] = upgrade_runtime_sync.serialize_upgrade_effect_state(data)
 	if data is ConsumableData:
 		result["consumable_kind"] = _get_consumable_kind(data)
 	return result
+
+
+func _get_upgrade_runtime_sync() -> Node:
+	var parent = get_parent()
+	if parent == null:
+		return null
+	return parent.get_node_or_null("BrotatoOnlineUpgradeRuntimeSync")
 
 
 func _get_consumable_kind(data) -> String:

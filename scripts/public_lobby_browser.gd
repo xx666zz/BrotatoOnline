@@ -26,6 +26,8 @@ const LOBBY_LIST_REQUEST_TIMEOUT_MSEC = 8000
 const PUBLIC_JOIN_VERIFY_TIMEOUT_MSEC = 6000
 const HOST_METADATA_REFRESH_MSEC = 1000
 const UI_SCAN_INTERVAL_MSEC = 300
+const HOST_MODS_FORMAT_VERSION = "1"
+const HOST_MODS_LOBBY_MAX_PARTS = 24
 
 # A dedicated SteamNetworkingMessages channel is used for a tiny request/response
 # probe. It measures the route that the mod will actually use without joining the
@@ -72,6 +74,11 @@ var _direct_connect_button = null
 var _direct_panel = null
 var _direct_address_edit = null
 var _direct_port_edit = null
+var _mods_panel = null
+var _mods_title_label = null
+var _mods_body_edit = null
+var _mods_close_button = null
+var _mods_return_focus = null
 
 # Lobby metadata writes are cached. Rewriting the same Steam lobby data every
 # second emits lobby_data_update callbacks; those callbacks used to rebuild the
@@ -129,7 +136,9 @@ func _input(event: InputEvent) -> void:
 	if not _overlay_open:
 		return
 	if event.is_action_released("ui_cancel"):
-		if _direct_panel != null and _direct_panel.visible:
+		if _mods_panel != null and _mods_panel.visible:
+			_hide_host_mods()
+		elif _direct_panel != null and _direct_panel.visible:
 			_hide_direct_connect()
 		else:
 			_close_browser_overlay()
@@ -540,6 +549,11 @@ func _ensure_browser_overlay(title_screen: Node) -> void:
 		if _direct_panel != null:
 			_direct_address_edit = _direct_panel.get_node_or_null("Margin/VBox/Address")
 			_direct_port_edit = _direct_panel.get_node_or_null("Margin/VBox/Port")
+		_mods_panel = existing.get_node_or_null("HostModsPanel")
+		if _mods_panel != null:
+			_mods_title_label = _mods_panel.get_node_or_null("Center/Panel/Margin/VBox/Title")
+			_mods_body_edit = _mods_panel.get_node_or_null("Center/Panel/Margin/VBox/Body")
+			_mods_close_button = _mods_panel.get_node_or_null("Center/Panel/Margin/VBox/Close")
 		return
 
 	var overlay = Control.new()
@@ -571,7 +585,7 @@ func _ensure_browser_overlay(title_screen: Node) -> void:
 
 	var panel = PanelContainer.new()
 	panel.name = "Panel"
-	panel.rect_min_size = Vector2(1220, 760)
+	panel.rect_min_size = Vector2(1400, 760)
 	center.add_child(panel)
 
 	var margin = MarginContainer.new()
@@ -609,13 +623,16 @@ func _ensure_browser_overlay(title_screen: Node) -> void:
 	header.name = "Header"
 	header.add_constant_override("separation", 12)
 	vbox.add_child(header)
-	_add_header_label(header, _text("host"), 410)
+	_add_header_label(header, _text("host"), 420)
 	_add_header_label(header, _text("players"), 115)
 	_add_header_label(header, _text("ping"), 130)
-	_add_header_label(header, _text("state"), 260)
-	var header_spacer = Control.new()
-	header_spacer.rect_min_size = Vector2(150, 0)
-	header.add_child(header_spacer)
+	_add_header_label(header, _text("state"), 220)
+	var header_mods_spacer = Control.new()
+	header_mods_spacer.rect_min_size = Vector2(120, 0)
+	header.add_child(header_mods_spacer)
+	var header_join_spacer = Control.new()
+	header_join_spacer.rect_min_size = Vector2(140, 0)
+	header.add_child(header_join_spacer)
 
 	var scroll = ScrollContainer.new()
 	scroll.name = "Scroll"
@@ -646,6 +663,12 @@ func _ensure_browser_overlay(title_screen: Node) -> void:
 	_configure_runtime_button(refresh)
 	_refresh_button = refresh
 
+	var refresh_separator = ColorRect.new()
+	refresh_separator.color = Color(1, 1, 1, 0.18)
+	refresh_separator.rect_min_size = Vector2(2, 52)
+	refresh_separator.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	bottom.add_child(refresh_separator)
+
 	var direct_connect = Button.new()
 	direct_connect.name = "DirectConnect"
 	direct_connect.text = _text("direct_connect")
@@ -660,6 +683,12 @@ func _ensure_browser_overlay(title_screen: Node) -> void:
 	var bottom_spacer = Control.new()
 	bottom_spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	bottom.add_child(bottom_spacer)
+
+	var back_separator = ColorRect.new()
+	back_separator.color = Color(1, 1, 1, 0.18)
+	back_separator.rect_min_size = Vector2(2, 52)
+	back_separator.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	bottom.add_child(back_separator)
 
 	var back = Button.new()
 	back.name = "Back"
@@ -678,43 +707,67 @@ func _ensure_browser_overlay(title_screen: Node) -> void:
 	direct_panel.anchor_top = 0.5
 	direct_panel.anchor_right = 0.5
 	direct_panel.anchor_bottom = 0.5
-	direct_panel.margin_left = -280
-	direct_panel.margin_top = -165
-	direct_panel.margin_right = 280
-	direct_panel.margin_bottom = 165
+	direct_panel.margin_left = -350
+	direct_panel.margin_top = -220
+	direct_panel.margin_right = 350
+	direct_panel.margin_bottom = 220
 	direct_panel.visible = false
 	overlay.add_child(direct_panel)
 	var direct_margin = MarginContainer.new()
 	direct_margin.name = "Margin"
 	for side in ["margin_left", "margin_right", "margin_top", "margin_bottom"]:
-		direct_margin.add_constant_override(side, 24)
+		direct_margin.add_constant_override(side, 26)
 	direct_panel.add_child(direct_margin)
 	var direct_vbox = VBoxContainer.new()
 	direct_vbox.name = "VBox"
-	direct_vbox.add_constant_override("separation", 12)
+	direct_vbox.add_constant_override("separation", 14)
 	direct_margin.add_child(direct_vbox)
 	var direct_title = Label.new()
 	direct_title.name = "Title"
 	direct_title.text = _text("direct_title")
 	direct_title.align = Label.ALIGN_CENTER
 	direct_vbox.add_child(direct_title)
+	var direct_desc = Label.new()
+	direct_desc.name = "Description"
+	direct_desc.text = _text("direct_description")
+	direct_desc.align = Label.ALIGN_CENTER
+	direct_desc.autowrap = true
+	direct_desc.rect_min_size = Vector2(0, 44)
+	direct_vbox.add_child(direct_desc)
+	var direct_separator = ColorRect.new()
+	direct_separator.name = "Separator"
+	direct_separator.color = Color(1, 1, 1, 0.18)
+	direct_separator.rect_min_size = Vector2(0, 2)
+	direct_separator.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	direct_vbox.add_child(direct_separator)
+	var address_label = Label.new()
+	address_label.name = "AddressLabel"
+	address_label.text = _text("address_label")
+	direct_vbox.add_child(address_label)
 	var address_edit = LineEdit.new()
 	address_edit.name = "Address"
 	address_edit.placeholder_text = _text("address_hint")
+	address_edit.rect_min_size = Vector2(0, 48)
 	direct_vbox.add_child(address_edit)
+	var port_label = Label.new()
+	port_label.name = "PortLabel"
+	port_label.text = _text("port_label")
+	direct_vbox.add_child(port_label)
 	var port_edit = LineEdit.new()
 	port_edit.name = "Port"
 	port_edit.placeholder_text = _text("port_hint")
 	port_edit.text = str(DEFAULT_LAN_PORT)
+	port_edit.rect_min_size = Vector2(0, 48)
 	direct_vbox.add_child(port_edit)
 	var direct_buttons = HBoxContainer.new()
 	direct_buttons.name = "Buttons"
-	direct_buttons.add_constant_override("separation", 12)
+	direct_buttons.add_constant_override("separation", 14)
 	direct_vbox.add_child(direct_buttons)
 	var join_direct = Button.new()
 	join_direct.name = "Join"
 	join_direct.text = _text("join")
 	join_direct.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	join_direct.rect_min_size = Vector2(0, 56)
 	direct_buttons.add_child(join_direct)
 	join_direct.connect("pressed", self, "_confirm_direct_connect")
 	_configure_runtime_button(join_direct)
@@ -722,12 +775,82 @@ func _ensure_browser_overlay(title_screen: Node) -> void:
 	cancel_direct.name = "Cancel"
 	cancel_direct.text = _text("cancel")
 	cancel_direct.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	cancel_direct.rect_min_size = Vector2(0, 56)
 	direct_buttons.add_child(cancel_direct)
 	cancel_direct.connect("pressed", self, "_hide_direct_connect")
 	_configure_runtime_button(cancel_direct)
 	_direct_panel = direct_panel
 	_direct_address_edit = address_edit
 	_direct_port_edit = port_edit
+
+	# Modal host-mod viewer. The lobby list itself stays compact; details are only
+	# rendered after the user presses the per-row button.
+	var mods_layer = Control.new()
+	mods_layer.name = "HostModsPanel"
+	mods_layer.anchor_right = 1.0
+	mods_layer.anchor_bottom = 1.0
+	mods_layer.mouse_filter = Control.MOUSE_FILTER_STOP
+	mods_layer.visible = false
+	overlay.add_child(mods_layer)
+
+	var mods_dim = ColorRect.new()
+	mods_dim.name = "Dim"
+	mods_dim.anchor_right = 1.0
+	mods_dim.anchor_bottom = 1.0
+	mods_dim.color = Color(0, 0, 0, 0.45)
+	mods_dim.mouse_filter = Control.MOUSE_FILTER_STOP
+	mods_layer.add_child(mods_dim)
+
+	var mods_center = CenterContainer.new()
+	mods_center.name = "Center"
+	mods_center.anchor_right = 1.0
+	mods_center.anchor_bottom = 1.0
+	mods_layer.add_child(mods_center)
+
+	var mods_popup = PanelContainer.new()
+	mods_popup.name = "Panel"
+	mods_popup.rect_min_size = Vector2(760, 570)
+	mods_center.add_child(mods_popup)
+
+	var mods_margin = MarginContainer.new()
+	mods_margin.name = "Margin"
+	mods_margin.add_constant_override("margin_left", 28)
+	mods_margin.add_constant_override("margin_right", 28)
+	mods_margin.add_constant_override("margin_top", 24)
+	mods_margin.add_constant_override("margin_bottom", 24)
+	mods_popup.add_child(mods_margin)
+
+	var mods_vbox = VBoxContainer.new()
+	mods_vbox.name = "VBox"
+	mods_vbox.add_constant_override("separation", 14)
+	mods_margin.add_child(mods_vbox)
+
+	var mods_title = Label.new()
+	mods_title.name = "Title"
+	mods_title.text = _text("mods_title")
+	mods_title.align = Label.ALIGN_CENTER
+	mods_vbox.add_child(mods_title)
+
+	var mods_body = TextEdit.new()
+	mods_body.name = "Body"
+	mods_body.readonly = true
+	mods_body.rect_min_size = Vector2(690, 410)
+	mods_body.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	mods_vbox.add_child(mods_body)
+
+	var mods_close = Button.new()
+	mods_close.name = "Close"
+	mods_close.text = _text("close")
+	mods_close.rect_min_size = Vector2(220, 58)
+	mods_close.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	mods_close.connect("pressed", self, "_hide_host_mods")
+	_configure_runtime_button(mods_close)
+	mods_vbox.add_child(mods_close)
+
+	_mods_panel = mods_layer
+	_mods_title_label = mods_title
+	_mods_body_edit = mods_body
+	_mods_close_button = mods_close
 
 	_refresh_button.focus_neighbour_right = _refresh_button.get_path_to(_direct_connect_button)
 	_direct_connect_button.focus_neighbour_left = _direct_connect_button.get_path_to(_refresh_button)
@@ -815,6 +938,7 @@ func _close_browser_overlay() -> void:
 	_pending_public_join_started_msec = 0
 	_clear_ping_state()
 	_hide_direct_connect()
+	_hide_host_mods(false)
 	if _lan_discovery != null and _lan_discovery.has_method("stop_search"):
 		_lan_discovery.stop_search()
 	if _overlay != null and is_instance_valid(_overlay):
@@ -929,6 +1053,7 @@ func _read_lobby_entry(lobby_id: int) -> Dictionary:
 	var compatible = mod_version == NETWORK_PROTOCOL_VERSION and game_version == GAME_VERSION
 	var joinable_state = state == "character_selection" or state == "coop_resume"
 	var full = member_count >= member_limit
+	var host_mods = _read_steam_host_mod_metadata(lobby_id)
 	return {
 		"source": "steam",
 		"entry_id": str(lobby_id),
@@ -943,8 +1068,27 @@ func _read_lobby_entry(lobby_id: int) -> Dictionary:
 		"compatible": compatible,
 		"joinable": compatible and joinable_state and not full and host_id != "" and host_id != "0",
 		"full": full,
-		"ping_ms": -1
+		"ping_ms": -1,
+		"host_mods_format": str(host_mods.get("format", "")),
+		"host_mods_payload": str(host_mods.get("payload", "")),
+		"host_mods_too_large": bool(host_mods.get("too_large", false))
 	}
+
+
+func _read_steam_host_mod_metadata(lobby_id: int) -> Dictionary:
+	if _steam == null or not _steam_has_method("getLobbyData"):
+		return {}
+	var format_version = str(_steam.getLobbyData(lobby_id, "host_mods_format"))
+	if format_version == "":
+		return {}
+	var too_large = str(_steam.getLobbyData(lobby_id, "host_mods_too_large")) == "1"
+	var part_count = int(str(_steam.getLobbyData(lobby_id, "host_mods_parts")))
+	if part_count < 0 or part_count > HOST_MODS_LOBBY_MAX_PARTS:
+		return {"format": format_version, "payload": "", "too_large": true}
+	var payload = ""
+	for i in range(part_count):
+		payload += str(_steam.getLobbyData(lobby_id, "host_mods_" + str(i)))
+	return {"format": format_version, "payload": payload, "too_large": too_large}
 
 
 func _on_lan_lobby_found(entry: Dictionary) -> void:
@@ -952,6 +1096,10 @@ func _on_lan_lobby_found(entry: Dictionary) -> void:
 		return
 	var normalized = entry.duplicate(true)
 	normalized["source"] = "lan"
+	# These fields are optional. Old LAN hosts simply do not provide them.
+	normalized["host_mods_format"] = str(normalized.get("host_mods_format", ""))
+	normalized["host_mods_payload"] = str(normalized.get("host_mods_payload", ""))
+	normalized["host_mods_too_large"] = bool(normalized.get("host_mods_too_large", false))
 	normalized["compatible"] = str(normalized.get("mod_version", "")) == NETWORK_PROTOCOL_VERSION
 	var member_count = int(normalized.get("member_count", 1))
 	var member_limit = int(normalized.get("member_limit", 4))
@@ -1006,9 +1154,9 @@ func _add_lobby_row(entry: Dictionary) -> void:
 	panel.add_child(row)
 
 	var host = Label.new()
-	var source_prefix = "[LAN] " if str(entry.get("source", "steam")) == "lan" else "[Steam] "
+	var source_prefix = "[LAN] " if str(entry.get("source", "steam")) == "lan" else ""
 	host.text = source_prefix + str(entry.get("host_name", ""))
-	host.rect_min_size = Vector2(410, 60)
+	host.rect_min_size = Vector2(420, 60)
 	host.valign = Label.VALIGN_CENTER
 	host.clip_text = true
 	row.add_child(host)
@@ -1028,20 +1176,31 @@ func _add_lobby_row(entry: Dictionary) -> void:
 
 	var state = Label.new()
 	state.text = _format_lobby_state(entry)
-	state.rect_min_size = Vector2(260, 60)
+	state.rect_min_size = Vector2(220, 60)
 	state.valign = Label.VALIGN_CENTER
 	state.clip_text = true
 	row.add_child(state)
 
+	var view_mods = Button.new()
+	view_mods.text = _text("view_mods")
+	view_mods.rect_min_size = Vector2(120, 60)
+	view_mods.focus_mode = Control.FOCUS_ALL
+	view_mods.mouse_filter = Control.MOUSE_FILTER_STOP
+	view_mods.connect("pressed", self, "_on_view_mods_pressed", [str(entry.get("entry_key", ""))])
+	_configure_runtime_button(view_mods)
+	row.add_child(view_mods)
+
 	var join = Button.new()
 	join.text = _text("join")
-	join.rect_min_size = Vector2(150, 60)
+	join.rect_min_size = Vector2(140, 60)
 	join.focus_mode = Control.FOCUS_ALL
 	join.mouse_filter = Control.MOUSE_FILTER_STOP
 	join.disabled = not bool(entry.get("joinable", false))
 	join.connect("pressed", self, "_on_join_lobby_pressed", [str(entry.get("entry_key", ""))])
 	_configure_runtime_button(join)
 	row.add_child(join)
+	view_mods.focus_neighbour_right = view_mods.get_path_to(join)
+	join.focus_neighbour_left = join.get_path_to(view_mods)
 
 
 func _format_lobby_state(entry: Dictionary) -> String:
@@ -1078,6 +1237,85 @@ func _clear_lobby_results() -> void:
 		for child in _rows_container.get_children():
 			_rows_container.remove_child(child)
 			child.queue_free()
+
+
+func _on_view_mods_pressed(entry_key: String) -> void:
+	if entry_key == "":
+		return
+	var entry = _find_entry(entry_key)
+	if entry.empty():
+		return
+	_show_host_mods(_format_host_mods_text(entry))
+
+
+func _format_host_mods_text(entry: Dictionary) -> String:
+	var format_version = str(entry.get("host_mods_format", ""))
+	if format_version == "":
+		return _text("mods_unsupported")
+	if format_version != HOST_MODS_FORMAT_VERSION:
+		return _text("mods_unknown_format")
+	if bool(entry.get("host_mods_too_large", false)):
+		return _text("mods_too_large")
+
+	var payload = str(entry.get("host_mods_payload", ""))
+	if payload == "":
+		return _text("mods_unreadable")
+	var parsed = parse_json(payload)
+	if typeof(parsed) != TYPE_ARRAY:
+		return _text("mods_unreadable")
+	if parsed.empty():
+		return _text("mods_empty")
+
+	var lines = []
+	lines.append(_text("mods_count") % parsed.size())
+	lines.append("")
+	var index = 1
+	for value in parsed:
+		if typeof(value) != TYPE_DICTIONARY:
+			continue
+		var mod_id = str(value.get("id", "")).strip_edges()
+		var mod_name = str(value.get("name", mod_id)).strip_edges()
+		var mod_version = str(value.get("version", "")).strip_edges()
+		if mod_name == "":
+			mod_name = mod_id if mod_id != "" else _text("mods_unknown_name")
+		var line = str(index) + ". " + mod_name
+		if mod_version != "":
+			line += "  " + mod_version
+		if mod_id != "" and mod_id != mod_name:
+			line += "  [" + mod_id + "]"
+		lines.append(line)
+		index += 1
+	return "\n".join(lines)
+
+
+func _show_host_mods(text: String) -> void:
+	if _mods_panel == null or not is_instance_valid(_mods_panel):
+		return
+	var viewport = get_viewport()
+	if viewport != null and viewport.has_method("gui_get_focus_owner"):
+		var focus_owner = viewport.call("gui_get_focus_owner")
+		if focus_owner != null and focus_owner is Control:
+			_mods_return_focus = focus_owner
+	if _direct_panel != null and is_instance_valid(_direct_panel):
+		_direct_panel.hide()
+	if _mods_body_edit != null and is_instance_valid(_mods_body_edit):
+		_mods_body_edit.text = text
+		_mods_body_edit.scroll_vertical = 0
+	_mods_panel.show()
+	if _mods_panel.get_parent() != null:
+		_mods_panel.get_parent().move_child(_mods_panel, _mods_panel.get_parent().get_child_count() - 1)
+	if _mods_close_button != null and is_instance_valid(_mods_close_button):
+		_mods_close_button.grab_focus()
+
+
+func _hide_host_mods(restore_focus: bool = true) -> void:
+	if _mods_panel != null and is_instance_valid(_mods_panel):
+		_mods_panel.hide()
+	if restore_focus and _mods_return_focus != null and is_instance_valid(_mods_return_focus):
+		_mods_return_focus.grab_focus()
+	elif restore_focus and _refresh_button != null and is_instance_valid(_refresh_button):
+		_refresh_button.grab_focus()
+	_mods_return_focus = null
 
 
 func _on_join_lobby_pressed(entry_key: String) -> void:
@@ -1452,12 +1690,31 @@ func _refresh_localized_texts() -> void:
 		_direct_connect_button.text = _text("direct_connect")
 	if _back_button != null and is_instance_valid(_back_button):
 		_back_button.text = _text("back")
+	if _mods_title_label != null and is_instance_valid(_mods_title_label):
+		_mods_title_label.text = _text("mods_title")
+	if _mods_close_button != null and is_instance_valid(_mods_close_button):
+		_mods_close_button.text = _text("close")
 	if _direct_panel != null and is_instance_valid(_direct_panel):
 		var title = _direct_panel.get_node_or_null("Margin/VBox/Title")
+		var description = _direct_panel.get_node_or_null("Margin/VBox/Description")
+		var address_label = _direct_panel.get_node_or_null("Margin/VBox/AddressLabel")
+		var address_edit = _direct_panel.get_node_or_null("Margin/VBox/Address")
+		var port_label = _direct_panel.get_node_or_null("Margin/VBox/PortLabel")
+		var port_edit = _direct_panel.get_node_or_null("Margin/VBox/Port")
 		var join_button = _direct_panel.get_node_or_null("Margin/VBox/Buttons/Join")
 		var cancel_button = _direct_panel.get_node_or_null("Margin/VBox/Buttons/Cancel")
 		if title != null:
 			title.text = _text("direct_title")
+		if description != null:
+			description.text = _text("direct_description")
+		if address_label != null:
+			address_label.text = _text("address_label")
+		if address_edit != null:
+			address_edit.placeholder_text = _text("address_hint")
+		if port_label != null:
+			port_label.text = _text("port_label")
+		if port_edit != null:
+			port_edit.placeholder_text = _text("port_hint")
 		if join_button != null:
 			join_button.text = _text("join")
 		if cancel_button != null:

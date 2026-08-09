@@ -8,6 +8,11 @@ const MAX_LOBBY_MEMBERS = 4
 const NETWORK_PROTOCOL_VERSION = "4.0.0"
 const DEFAULT_LAN_PORT = 27462
 const LAN_PROTOCOL_VERSION = 1
+# Optional pre-join host mod metadata. This is deliberately independent from
+# NETWORK_PROTOCOL_VERSION/LAN_PROTOCOL_VERSION so older clients keep working.
+const HOST_MODS_FORMAT_VERSION = "1"
+const HOST_MODS_LOBBY_CHUNK_CHARS = 1000
+const HOST_MODS_LOBBY_MAX_PARTS = 24
 const META_AUTO_JOIN_HOST_PLAYER = "brotato_online_auto_join_host_player"
 const META_PUBLIC_LOBBY_ENABLED = "brotato_online_public_lobby_enabled"
 
@@ -118,6 +123,8 @@ var _session_remote_peer_keys = [] # Includes disconnected in-run slots.
 var _rejected_peer_keys = {}
 var _pending_lan_join = false
 var _lan_game_port = DEFAULT_LAN_PORT
+var _host_mod_list_payload_cache = ""
+var _host_mod_list_cache_ready = false
 var _lobby_id = 0
 var _is_lobby_owner = false
 var _online_role = "none" # "none" / "host" / "client". Game authority never follows Steam owner migration.
@@ -738,6 +745,72 @@ func get_lobby_state() -> String:
 	return "menu"
 
 
+func get_host_mod_list_payload() -> String:
+	# The loaded mod set is stable after startup, so build this only when a lobby
+	# actually needs to publish it. We intentionally inspect ModLoader's live child
+	# nodes instead of scanning every unpacked folder, which would include disabled
+	# or otherwise unloaded packages.
+	if _host_mod_list_cache_ready:
+		return _host_mod_list_payload_cache
+
+	var mods = []
+	var tree = get_tree()
+	var loader_root = null
+	if tree != null and tree.root != null:
+		loader_root = tree.root.get_node_or_null("ModLoader")
+	if loader_root != null:
+		for child in loader_root.get_children():
+			if child == null or not is_instance_valid(child):
+				continue
+			var mod_id = str(child.name).strip_edges()
+			if mod_id == "":
+				continue
+			var manifest_path = ModLoaderMod.get_unpacked_dir().plus_file(mod_id).plus_file("manifest.json")
+			var manifest_file = File.new()
+			if not manifest_file.file_exists(manifest_path):
+				continue
+			if manifest_file.open(manifest_path, File.READ) != OK:
+				continue
+			var parsed_manifest = parse_json(manifest_file.get_as_text())
+			manifest_file.close()
+			if typeof(parsed_manifest) != TYPE_DICTIONARY:
+				continue
+
+			var display_name = str(parsed_manifest.get("name", mod_id)).strip_edges()
+			if display_name == "":
+				display_name = mod_id
+			mods.append({
+				"id": mod_id,
+				"name": display_name,
+				"version": str(parsed_manifest.get("version_number", "")).strip_edges()
+			})
+
+	_host_mod_list_payload_cache = to_json(mods)
+	_host_mod_list_cache_ready = true
+	return _host_mod_list_payload_cache
+
+
+func _publish_host_mod_lobby_data() -> void:
+	if _steam == null or _lobby_id == 0 or not _steam_has_method("setLobbyData"):
+		return
+	var payload = get_host_mod_list_payload()
+	var part_count = max(1, int(ceil(float(payload.length()) / float(HOST_MODS_LOBBY_CHUNK_CHARS))))
+	_steam.setLobbyData(_lobby_id, "host_mods_format", HOST_MODS_FORMAT_VERSION)
+	if part_count > HOST_MODS_LOBBY_MAX_PARTS:
+		# Do not publish malformed/truncated JSON. This edge case remains purely
+		# informational and must never affect whether the room can be joined.
+		_steam.setLobbyData(_lobby_id, "host_mods_parts", "0")
+		_steam.setLobbyData(_lobby_id, "host_mods_too_large", "1")
+		return
+
+	_steam.setLobbyData(_lobby_id, "host_mods_parts", str(part_count))
+	_steam.setLobbyData(_lobby_id, "host_mods_too_large", "0")
+	for i in range(part_count):
+		var offset = i * HOST_MODS_LOBBY_CHUNK_CHARS
+		var chunk = payload.substr(offset, HOST_MODS_LOBBY_CHUNK_CHARS)
+		_steam.setLobbyData(_lobby_id, "host_mods_" + str(i), chunk)
+
+
 func get_lan_discovery_info() -> Dictionary:
 	if not _session_active or not _is_game_host() or _lan_transport == null or not _lan_transport.is_hosting():
 		return {}
@@ -746,6 +819,10 @@ func get_lan_discovery_info() -> Dictionary:
 		host_name = str(_steam.getPersonaName()).strip_edges()
 	if host_name == "" or host_name.begins_with("lan:"):
 		host_name = "Player"
+	var host_mods_payload = get_host_mod_list_payload()
+	var host_mods_too_large = host_mods_payload.length() > HOST_MODS_LOBBY_CHUNK_CHARS * HOST_MODS_LOBBY_MAX_PARTS
+	if host_mods_too_large:
+		host_mods_payload = ""
 	return {
 		"host_name": host_name,
 		"game_port": _lan_game_port,
@@ -753,6 +830,11 @@ func get_lan_discovery_info() -> Dictionary:
 		"member_limit": MAX_LOBBY_MEMBERS,
 		"state": get_lobby_state(),
 		"mod_version": NETWORK_PROTOCOL_VERSION,
+		# Optional fields: old LAN browsers ignore them; new browsers can show the
+		# host's loaded mods before joining without changing discovery protocol v1.
+		"host_mods_format": HOST_MODS_FORMAT_VERSION,
+		"host_mods_payload": host_mods_payload,
+		"host_mods_too_large": host_mods_too_large,
 		"joinable": get_session_member_count() < MAX_LOBBY_MEMBERS and (_is_host_at_character_selection_for_lobby() or _is_in_official_coop_resume_scene())
 	}
 
@@ -1647,6 +1729,7 @@ func _setup_lobby_data() -> void:
 		_steam.setLobbyData(_lobby_id, "member_limit", str(MAX_LOBBY_MEMBERS))
 		_steam.setLobbyData(_lobby_id, "visibility", "public" if public_lobby else "friends")
 		_steam.setLobbyData(_lobby_id, "connect", _make_lobby_connect_string(_lobby_id))
+		_publish_host_mod_lobby_data()
 
 
 func _setup_join_presence() -> void:

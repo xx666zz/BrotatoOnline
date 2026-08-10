@@ -1259,6 +1259,10 @@ func _install_host_shop_go_sync_intercept(shop: Node) -> void:
 					go_button.disconnect("pressed", shop, "_on_GoButton_pressed")
 				if not go_button.is_connected("pressed", self, "_on_host_shop_go_pressed"):
 					go_button.connect("pressed", self, "_on_host_shop_go_pressed", [player_index])
+				# Keep vanilla focus_exited -> unready connected. This observer only
+				# broadcasts the resulting desired state so peers also cancel ready.
+				if not go_button.is_connected("focus_exited", self, "_on_host_shop_go_focus_exited"):
+					go_button.connect("focus_exited", self, "_on_host_shop_go_focus_exited", [player_index])
 
 			var reroll_button = shop._get_reroll_button(player_index) if shop.has_method("_get_reroll_button") else null
 			if _is_live_ref(reroll_button):
@@ -1274,15 +1278,43 @@ func _install_host_shop_go_sync_intercept(shop: Node) -> void:
 func _on_host_shop_go_pressed(player_index: int) -> void:
 	if not _is_game_host() or _applying_remote_run_page_action:
 		return
+	var shop = _find_shop_node()
+	var current_pressed = false
+	if _is_valid_shop_node(shop):
+		current_pressed = bool(_get_node_array_value(shop, "_player_pressed_go_button", player_index, false))
 	var msg = {
 		"msg_type": "run_page_action_sync",
 		"action_type": "shop_go",
 		"screen": "shop",
 		"player_index": player_index,
 		"target": "go",
-		"shop_index": -1
+		"shop_index": -1,
+		"desired_pressed": not current_pressed
 	}
 	_apply_host_local_shop_action(msg, "go")
+
+
+func _on_host_shop_go_focus_exited(player_index: int) -> void:
+	if not _is_game_host() or _applying_remote_run_page_action:
+		return
+	# Let BaseShop's original _on_GoButton_focus_exited finish first. The deferred
+	# action then observes/broadcasts the already-cancelled state; desired-state
+	# semantics make this safe even if vanilla already set it to false.
+	call_deferred("_sync_host_shop_go_focus_exit", player_index)
+
+
+func _sync_host_shop_go_focus_exit(player_index: int) -> void:
+	if not _is_game_host() or _applying_remote_run_page_action:
+		return
+	_apply_host_local_shop_action({
+		"msg_type": "run_page_action_sync",
+		"action_type": "shop_go",
+		"screen": "shop",
+		"player_index": player_index,
+		"target": "go",
+		"shop_index": -1,
+		"desired_pressed": false
+	}, "go_focus_exit")
 
 
 func _on_host_shop_reroll_pressed(player_index: int) -> void:
@@ -1550,13 +1582,12 @@ func _install_client_shop_intercepts(shop: Node, player_index: int) -> void:
 	if _is_live_ref(go_button):
 		if go_button.is_connected("pressed", shop, "_on_GoButton_pressed"):
 			go_button.disconnect("pressed", shop, "_on_GoButton_pressed")
-		# Online shop readiness is authoritative through shop_go/shop_state. The vanilla
-		# focus_exited handler clears the ready checkmark whenever our focus repair/router
-		# moves away from GoButton, which makes readiness flash and immediately disappear.
-		if go_button.is_connected("focus_exited", shop, "_on_GoButton_focus_exited"):
-			go_button.disconnect("focus_exited", shop, "_on_GoButton_focus_exited")
 		if not go_button.is_connected("pressed", self, "_on_client_shop_go_pressed"):
 			go_button.connect("pressed", self, "_on_client_shop_go_pressed", [player_index])
+		# Do not disconnect BaseShop._on_GoButton_focus_exited: vanilla owns the
+		# local unready behavior. We only mirror that semantic action to Host.
+		if not go_button.is_connected("focus_exited", self, "_on_client_shop_go_focus_exited"):
+			go_button.connect("focus_exited", self, "_on_client_shop_go_focus_exited", [player_index])
 
 	var container = shop._get_shop_items_container(player_index) if shop.has_method("_get_shop_items_container") else null
 	if _is_live_ref(container):
@@ -1707,6 +1738,29 @@ func _on_client_shop_go_pressed(player_index: int) -> void:
 	# Host may still receive a cancel/focus-exit before it commits the start. The
 	# authoritative game_start_prepare packet is the only point that may arm the
 	# client transition guard.
+
+
+func _on_client_shop_go_focus_exited(player_index: int) -> void:
+	if _is_game_host() or _applying_remote_run_page_action:
+		return
+	# The original BaseShop focus_exited handler remains connected and clears the
+	# local ready state. Defer the network mirror until that signal chain finishes.
+	call_deferred("_sync_client_shop_go_focus_exit", player_index)
+
+
+func _sync_client_shop_go_focus_exit(player_index: int) -> void:
+	if _is_game_host() or _applying_remote_run_page_action:
+		return
+	# A previous optimistic ready press must not survive this explicit cancel.
+	_local_shop_go_pending_until_by_player.erase(player_index)
+	_force_shop_go_visual_state_for_player(player_index, false)
+	_submit_local_shop_action({
+		"msg_type": "run_page_action_sync",
+		"action_type": "shop_go",
+		"screen": "shop",
+		"player_index": player_index,
+		"desired_pressed": false
+	}, player_index, "go_focus_exit")
 
 
 func _would_shop_go_press_start_game(shop: Node, player_index: int, desired_pressed: bool) -> bool:
@@ -2439,12 +2493,17 @@ func _apply_shop_reroll_action(player_index: int, _message: Dictionary) -> bool:
 	return false
 
 
-func _apply_shop_go_action(player_index: int, _message: Dictionary) -> bool:
+func _apply_shop_go_action(player_index: int, message: Dictionary) -> bool:
 	var shop = _find_shop_node()
 	if not _is_valid_shop_node(shop):
 		return false
 	if not shop.has_method("_on_GoButton_pressed"):
 		return false
+
+	var current_pressed = bool(_get_node_array_value(shop, "_player_pressed_go_button", player_index, false))
+	# desired_pressed makes shop_go idempotent. Keep toggle semantics only as a
+	# compatibility fallback for packets from older peers that omit the field.
+	var desired_pressed = bool(message.get("desired_pressed", not current_pressed))
 
 	# Once the synchronized shop start handshake has begun, its ready snapshot is
 	# authoritative. Host-local Go presses used to bypass SteamLobbyManager's
@@ -2456,22 +2515,23 @@ func _apply_shop_go_action(player_index: int, _message: Dictionary) -> bool:
 			if bool(steam_lobby_pending.has_pending_synced_shop_game_start()):
 				return true
 
+	# A duplicate/reordered shop_go packet must not toggle the state again.
+	if current_pressed == desired_pressed:
+		_force_shop_go_visual_state(shop, player_index, desired_pressed)
+		return true
+
 	# Online final-ready is special: vanilla _on_GoButton_pressed() immediately
 	# changes to MenuData.game_scene when all players are ready. In an online run
 	# that makes Host enter battle before Clients receive/apply the last shop state.
-	# For the final ready press, mark the visual/state as ready now, do the same
-	# clock-sync handshake used by difficulty start, then execute the vanilla method
-	# on the scheduled Host enter tick.
-	if _should_sync_shop_game_start(shop, player_index):
+	# Only a requested transition to ready may start this handshake.
+	if desired_pressed and _should_sync_shop_game_start(shop, player_index):
 		return _request_synced_shop_game_start(shop, player_index)
 
+	# Vanilla still performs the actual transition and side effects, but only when
+	# the current state differs from the requested state. This turns its toggle into
+	# desired-state semantics at the network boundary.
 	shop._on_GoButton_pressed(player_index)
-	# Restoring the Host local focus after a remote Go can trigger the remote
-	# GoButton focus_exited callback, which clears vanilla ready state. Reassert it
-	# only when this press actually left the player ready; a second Go press should
-	# still be able to cancel readiness.
-	if bool(_get_node_array_value(shop, "_player_pressed_go_button", player_index, false)):
-		_force_shop_go_visual_state(shop, player_index, true)
+	_force_shop_go_visual_state(shop, player_index, desired_pressed)
 	return true
 
 
@@ -2482,7 +2542,7 @@ func _should_sync_shop_game_start(shop: Node, player_index: int) -> bool:
 	if steam_lobby == null or not steam_lobby.has_method("request_synced_shop_game_start"):
 		return false
 	if bool(_get_node_array_value(shop, "_player_pressed_go_button", player_index, false)):
-		# Preserve vanilla behaviour: pressing Go again cancels ready.
+		# Final-start sync is only for a false -> true ready transition.
 		return false
 	for other_player_index in range(_get_run_player_count()):
 		if other_player_index == player_index:

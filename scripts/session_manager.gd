@@ -126,6 +126,15 @@ var _lobby_id = 0
 var _is_lobby_owner = false
 var _online_role = "none" # "none" / "host" / "client". Game authority never follows Steam owner migration.
 var _game_host_steam_id = ""
+# Unexpected Host loss during battle/shop needs a stronger teardown than a normal
+# lobby leave. Freeze the live run before replica entities are freed, then return
+# the client to the title screen. This guard prevents duplicate Steam/LAN signals
+# from starting the teardown twice.
+var _client_host_disconnect_teardown_active = false
+# Set only when an unexpected Host loss forces an active run back to the title
+# screen. The notice is created after the new title scene is ready, so it cannot
+# be destroyed together with the frozen battle/shop scene.
+var _host_disconnect_notice_pending = false
 var _online_run_slots_locked = false
 var _last_slot_lock_skip_log_msec = 0
 var _self_steam_id = ""
@@ -511,7 +520,7 @@ func _on_transport_peer_disconnected(transport: Node, peer) -> void:
 		_remove_player_connection(peer_key)
 		_drop_pending_p2p_sends_for_target(peer_key)
 	if not _is_game_host() and transport == _lan_transport and _session_active:
-		leave_lobby()
+		_handle_client_host_disconnect("lan_peer_disconnected")
 	elif _is_game_host():
 		_publish_session_metadata()
 
@@ -871,6 +880,7 @@ func _process(_delta: float) -> void:
 		_last_menu_phase_selection_poll_usec = now_usec
 		var t_boot = OS.get_ticks_usec()
 		_poll_startup_main_menu_ready()
+		_poll_host_disconnect_notice()
 		_consume_startup_join_if_ready()
 		_consume_pending_join_if_ready()
 		_poll_join_request_timeout()
@@ -1123,6 +1133,110 @@ func join_steam_lobby(lobby_id) -> void:
 	if typeof(join_result) == TYPE_BOOL and not bool(join_result):
 		_clear_pending_join_request()
 		_show_join_failure(_ui_text("join_failed_steam_unavailable"))
+
+
+func _handle_client_host_disconnect(reason: String) -> void:
+	# This path is only for an unexpected loss of the authoritative Host. A normal
+	# leave_lobby() is intentionally unchanged because it is also used while joining
+	# another room and while leaving menu staging.
+	if _client_host_disconnect_teardown_active or not _session_active or _is_game_host():
+		return
+
+	_client_host_disconnect_teardown_active = true
+	var was_in_live_run = _is_in_active_online_run_scene() or _is_in_end_run_scene()
+
+	# BattleReplicaManager._clear_all() frees Host-owned entities. During battle,
+	# Player/third-party mod timers may still hold references to those entities and
+	# can run again in the same frame. Stop the live scene first so no callback can
+	# observe partially torn-down replica state.
+	if was_in_live_run:
+		_freeze_current_run_for_host_disconnect()
+
+	leave_lobby()
+
+	# Menu staging can safely remain on its current screen after the Host disappears.
+	# A battle/shop/results scene cannot continue without authority, so leave it on
+	# the next idle turn after the network/session teardown has completed.
+	if was_in_live_run:
+		call_deferred("_finish_client_host_disconnect_exit_to_title", reason)
+
+
+func _freeze_current_run_for_host_disconnect() -> void:
+	var tree = get_tree()
+	if tree == null:
+		return
+	tree.paused = false
+	var scene = tree.current_scene
+	if not _is_live_node(scene):
+		return
+
+	# Stop every Timer/process callback under the live run before replica cleanup.
+	# This includes Player/OneSecondTimer (the timer involved in the observed
+	# freed-pet crash) and any third-party mod callbacks attached to the battle/shop
+	# scene. Persistent ModLoader singletons are not children of current_scene, so
+	# networking teardown itself remains operational.
+	_freeze_scene_branch_for_host_disconnect(scene)
+
+
+func _freeze_scene_branch_for_host_disconnect(node: Node) -> void:
+	if not _is_live_node(node):
+		return
+	if node is Timer:
+		node.stop()
+		node.paused = true
+	node.set_process(false)
+	node.set_physics_process(false)
+	node.set_process_input(false)
+	node.set_process_unhandled_input(false)
+	for child in node.get_children():
+		if child is Node:
+			_freeze_scene_branch_for_host_disconnect(child)
+
+
+func _finish_client_host_disconnect_exit_to_title(reason: String) -> void:
+	var tree = get_tree()
+	if tree == null:
+		return
+	tree.paused = false
+	_host_disconnect_notice_pending = true
+	var current = tree.current_scene
+	if _is_live_node(current) and str(current.filename) == str(MenuData.title_screen_scene):
+		_poll_host_disconnect_notice()
+		return
+	print("[BrotatoOnline] Host disconnected during active run; returning Client to title. reason=" + str(reason))
+	var _error = tree.change_scene(MenuData.title_screen_scene)
+
+
+func _poll_host_disconnect_notice() -> void:
+	if not _host_disconnect_notice_pending:
+		return
+	var tree = get_tree()
+	if tree == null or tree.root == null:
+		return
+	var current = tree.current_scene
+	if not _is_live_node(current):
+		return
+	if str(current.filename) != str(MenuData.title_screen_scene):
+		return
+
+	_host_disconnect_notice_pending = false
+	var existing = current.get_node_or_null("BrotatoOnlineHostDisconnectDialog")
+	if existing != null and is_instance_valid(existing):
+		if existing is AcceptDialog:
+			existing.window_title = _ui_text("host_disconnected_title")
+			existing.dialog_text = _ui_text("host_disconnected_message")
+			existing.popup_centered(Vector2(520, 220))
+		return
+
+	var dialog = AcceptDialog.new()
+	dialog.name = "BrotatoOnlineHostDisconnectDialog"
+	dialog.pause_mode = Node.PAUSE_MODE_PROCESS
+	dialog.window_title = _ui_text("host_disconnected_title")
+	dialog.dialog_text = _ui_text("host_disconnected_message")
+	dialog.rect_min_size = Vector2(520, 220)
+	current.add_child(dialog)
+	dialog.connect("popup_hide", dialog, "queue_free")
+	dialog.popup_centered(Vector2(520, 220))
 
 
 func leave_lobby() -> void:
@@ -1814,7 +1928,7 @@ func _refresh_lobby_members(force_slot_sync: bool = false) -> void:
 	var membership_changed = to_json(previous_member_ids) != to_json(current_member_ids)
 
 	if not _is_game_host() and _game_host_steam_id != "" and not _member_list_has_steam_id(_game_host_steam_id):
-		leave_lobby()
+		_handle_client_host_disconnect("steam_host_left_lobby")
 		return
 
 	# Ordinary lobby metadata updates (state, host name, visibility, etc.) must not
@@ -2280,6 +2394,7 @@ func _bump_online_session_generation(reason: String = "") -> void:
 
 
 func _reset_transient_online_state_for_new_session(reason: String = "") -> void:
+	_client_host_disconnect_teardown_active = false
 	_stop_client_hello_retry("new_session:" + str(reason))
 	_bump_online_session_generation(reason)
 	_restore_client_retry_wave_setting_override()

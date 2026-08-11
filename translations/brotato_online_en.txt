@@ -11,6 +11,8 @@ BROTATO_ONLINE_INPUT_DEVICE_UNKNOWN_GAMEPAD,Unknown controller
 BROTATO_ONLINE_INPUT_DEVICE_GAMEPAD_FORMAT,%s (Device %d)
 BROTATO_ONLINE_LOCAL_CHARACTER_OUTLINE,Outline local character
 BROTATO_ONLINE_LOCAL_CHARACTER_OUTLINE_DESC,In online battles, add a character outline only to the player controlled on this machine.
+BROTATO_ONLINE_QUICK_CHAT_CUSTOM_TITLE,Customize quick chat
+BROTATO_ONLINE_QUICK_CHAT_CUSTOM_DESC,"Blank = original. Custom text: up to 20 characters. Windowed mode is recommended for Chinese input; otherwise the IME candidate window may not appear."
 BROTATO_ONLINE_QUICK_CHAT_CANCEL,Release Ctrl to cancel
 BROTATO_ONLINE_QUICK_CHAT_STAY_ALIVE,Stay alive
 BROTATO_ONLINE_QUICK_CHAT_HURRY,Hurry!

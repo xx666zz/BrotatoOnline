@@ -11,9 +11,13 @@ const GAMEPAD_LT_BUTTON_CANDIDATES = [6]
 const FULL_CIRCLE = PI * 2.0
 const BUBBLE_SECONDS = 3.0
 const BUBBLE_JITTER = Vector2(18, 10)
-const TEXT_LIMIT = 32
+const CUSTOM_TEXT_LIMIT = 20
 const SHARED_FONT_PATHS = [
 	"res://resources/fonts/actual/base/font_26_outline.tres",
+	"res://resources/fonts/actual/base/font_26.tres"
+]
+const BUBBLE_FONT_PATHS = [
+	"res://resources/fonts/actual/base/font_22.tres",
 	"res://resources/fonts/actual/base/font_26.tres"
 ]
 
@@ -41,6 +45,7 @@ var _rng = RandomNumberGenerator.new()
 var _seen_chat_keys = {}
 var _last_seen_prune_msec = 0
 var _shared_font = null
+var _bubble_font = null
 var _gamepad_active = false
 var _gamepad_device = -1
 var _gamepad_lt_down = {}
@@ -321,10 +326,13 @@ func _submit_selected() -> void:
 	if steam.has_method("get_self_steam_id"):
 		self_id = str(steam.get_self_steam_id())
 	var option_id = OPTION_IDS[_selected_index]
+	var custom_text = _sanitize_custom_literal_text(_custom_option_text_by_id(option_id))
 	var message = {
 		"msg_type": "quick_chat",
-		"quick_chat_id": option_id,
-		"text": _option_text_by_id(option_id),
+		# Backward-compatible custom chat: old versions already treat an empty id as
+		# literal text, so no new message type or protocol field is required.
+		"quick_chat_id": "" if custom_text != "" else option_id,
+		"text": custom_text if custom_text != "" else _option_text_by_id(option_id),
 		"screen_pos": {"x": int(round(_wheel_center.x)), "y": int(round(_wheel_center.y))},
 		"screen_pos_norm": {"x": nx, "y": ny},
 		"origin_steam_id": self_id,
@@ -350,7 +358,7 @@ func _show_chat_bubble(message: Dictionary) -> void:
 	var pos = _resolve_message_screen_pos(message)
 	pos += Vector2(_rng.randf_range(-BUBBLE_JITTER.x, BUBBLE_JITTER.x), _rng.randf_range(-BUBBLE_JITTER.y, BUBBLE_JITTER.y))
 	var player_index = int(message.get("player_index", -1))
-	var bubble_w = clamp(116 + max(4, text.length()) * 18, 200, 390)
+	var bubble_w = clamp(116 + max(4, text.length()) * 18, 200, 500)
 	var bubble_h = 74
 	var holder_size = Vector2(94 + bubble_w, 98)
 	var top_left = pos - Vector2(40, 44)
@@ -524,11 +532,15 @@ func _build_bubble(holder: Control, bubble_w: int, bubble_h: int, text: String) 
 	label.text = text
 	label.align = Label.ALIGN_CENTER
 	label.valign = Label.VALIGN_CENTER
-	label.autowrap = true
-	label.rect_position = Vector2(16, 10)
-	label.rect_size = Vector2(bubble_w - 32, bubble_h - 20)
+	# A quick-chat message is capped tightly enough to stay on one line. Keeping
+	# the label single-line avoids Godot 3's autowrap/minimum-height interaction,
+	# which could make the glyph baseline look vertically bottom-aligned.
+	label.autowrap = false
+	label.clip_text = true
+	label.rect_position = Vector2(12, 0)
+	label.rect_size = Vector2(bubble_w - 24, bubble_h)
 	label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_apply_label_style(label, Color(0.13, 0.10, 0.06, 1))
+	_apply_bubble_label_style(label, Color(0.13, 0.10, 0.06, 1))
 	bubble.add_child(label)
 
 
@@ -537,11 +549,19 @@ func _resolve_message_text(message: Dictionary) -> String:
 	if id != "":
 		var text_by_id = _option_text_by_id(id)
 		if text_by_id != "":
+			# Vanilla quick-chat ids keep their normal localized text and are not
+			# subject to the custom-text cap.
 			return text_by_id
-	var text = str(message.get("text", "")).strip_edges()
-	if text.length() > TEXT_LIMIT:
-		text = text.substr(0, TEXT_LIMIT)
-	return text
+	# Empty/unknown ids are literal custom text. Enforce the 20-character limit
+	# again on receive so old or modified peers cannot bypass the sender limit.
+	return _sanitize_custom_literal_text(str(message.get("text", "")))
+
+
+func _sanitize_custom_literal_text(text: String) -> String:
+	var normalized = text.replace("\r", " ").replace("\n", " ").strip_edges()
+	if normalized.length() > CUSTOM_TEXT_LIMIT:
+		normalized = normalized.substr(0, CUSTOM_TEXT_LIMIT)
+	return normalized
 
 
 func _resolve_message_screen_pos(message: Dictionary) -> Vector2:
@@ -601,6 +621,27 @@ func _apply_label_style(label: Label, color: Color) -> void:
 	if _shared_font != null:
 		label.add_font_override("font", _shared_font)
 	label.add_color_override("font_color", color)
+
+
+func _apply_bubble_label_style(label: Label, color: Color) -> void:
+	if label == null:
+		return
+	_ensure_bubble_font()
+	if _bubble_font != null:
+		label.add_font_override("font", _bubble_font)
+	label.add_color_override("font_color", color)
+
+
+func _ensure_bubble_font() -> void:
+	if _bubble_font != null:
+		return
+	for font_path in BUBBLE_FONT_PATHS:
+		if not ResourceLoader.exists(font_path):
+			continue
+		var font = load(font_path)
+		if font != null:
+			_bubble_font = font
+			return
 
 
 func _ensure_shared_font() -> void:
@@ -739,7 +780,19 @@ func _prune_seen_chat_keys() -> void:
 func _option_text_by_index(index: int) -> String:
 	if index < 0 or index >= OPTION_IDS.size():
 		return ""
-	return _option_text_by_id(OPTION_IDS[index])
+	var option_id = str(OPTION_IDS[index])
+	var custom_text = _custom_option_text_by_id(option_id)
+	return custom_text if custom_text != "" else _option_text_by_id(option_id)
+
+
+func _custom_option_text_by_id(id: String) -> String:
+	var parent = get_parent()
+	if parent == null:
+		return ""
+	var settings = parent.get_node_or_null("BrotatoOnlineModSettingsManager")
+	if settings != null and settings.has_method("get_custom_quick_chat_text"):
+		return str(settings.call("get_custom_quick_chat_text", id)).strip_edges()
+	return ""
 
 
 func _option_text_by_id(id: String) -> String:

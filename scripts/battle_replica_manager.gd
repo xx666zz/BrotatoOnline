@@ -2895,12 +2895,18 @@ func _apply_host_progression_player_state(ui: Node, player_state: Dictionary) ->
 		_ensure_client_progression_interaction_ready(container, player_index, "battle_snapshot_repeat")
 		return
 
-	_prepare_host_progression_ui(ui, container, player_index, visible)
-	var applied = false
+	# Visible level-up choices are owned exclusively by MenuSyncManager's upgrade_state
+	# path. Battle snapshots must not rebuild UpgradeUI/set_upgrade(), because doing so
+	# creates a second writer that can race authoritative menu state and can reconstruct
+	# runtime UpgradeData with an incompatible Effect layout. Repeated snapshots may
+	# still repair the local input intercept if the authoritative upgrade page is visible.
 	if mode == "upgrade":
-		applied = _apply_host_upgrade_options_to_container(container, player_index, visible)
-	elif mode == "item_box":
-		applied = _apply_host_item_box_option_to_container(container, player_index, visible)
+		if _progression_container_is_showing_mode(container, mode):
+			_ensure_client_progression_interaction_ready(container, player_index, "battle_snapshot_upgrade_intercept")
+		return
+
+	_prepare_host_progression_ui(ui, container, player_index, visible)
+	var applied = _apply_host_item_box_option_to_container(container, player_index, visible)
 	if applied:
 		_last_progression_apply_key_by_player[player_index] = key
 		_ensure_client_progression_interaction_ready(container, player_index, "battle_snapshot_apply")
@@ -2948,56 +2954,6 @@ func _prepare_host_progression_ui(ui: Node, container: Node, player_index: int, 
 		ui.set("_showing_option", showing)
 	if container.has_method("focus"):
 		container.call_deferred("focus")
-
-
-func _apply_host_upgrade_options_to_container(container: Node, player_index: int, visible: Dictionary) -> bool:
-	var upgrade_states = visible.get("upgrades", [])
-	if typeof(upgrade_states) != TYPE_ARRAY:
-		return false
-	var upgrades = []
-	for upgrade_state in upgrade_states:
-		if typeof(upgrade_state) != TYPE_DICTIONARY:
-			continue
-		var upgrade_data = _resolve_item_parent_data(upgrade_state)
-		if upgrade_data != null:
-			upgrades.append(upgrade_data)
-	if upgrades.empty():
-		return false
-	if container.get("_level") != null:
-		container.set("_level", int(visible.get("level", container.get("_level"))))
-	if container.get("_reroll_price") != null:
-		container.set("_reroll_price", int(visible.get("reroll_price", container.get("_reroll_price"))))
-	if container.get("_reroll_count") != null:
-		container.set("_reroll_count", int(visible.get("reroll_count", container.get("_reroll_count"))))
-	if container.get("_reroll_discount") != null:
-		container.set("_reroll_discount", int(visible.get("reroll_discount", container.get("_reroll_discount"))))
-	if container.get("_old_upgrades") != null:
-		container.set("_old_upgrades", upgrades.duplicate())
-	var upgrade_uis = []
-	if container.has_method("_get_upgrade_uis"):
-		upgrade_uis = container._get_upgrade_uis()
-	for i in range(upgrade_uis.size()):
-		var upgrade_ui = upgrade_uis[i]
-		if not _is_valid_node(upgrade_ui):
-			continue
-		if upgrade_ui is CanvasItem:
-			upgrade_ui.visible = i < upgrades.size()
-		if i < upgrades.size() and upgrade_ui.has_method("set_upgrade"):
-			upgrade_ui.set_upgrade(upgrades[i], player_index)
-	var reroll_button = container.get("_reroll_button")
-	if _is_valid_node(reroll_button) and reroll_button.has_method("init"):
-		reroll_button.init(int(visible.get("reroll_price", 0)), player_index)
-		if reroll_button is CanvasItem:
-			reroll_button.visible = upgrades.size() > 1
-	var items_container = container.get("_items_container")
-	if items_container is CanvasItem:
-		items_container.hide()
-	var upgrades_container = container.get("_upgrades_container")
-	if upgrades_container is CanvasItem:
-		upgrades_container.show()
-	if container.has_method("_update_gold_label"):
-		container._update_gold_label()
-	return true
 
 
 func _apply_host_item_box_option_to_container(container: Node, player_index: int, visible: Dictionary) -> bool:

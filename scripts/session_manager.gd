@@ -15,6 +15,7 @@ const HOST_MODS_LOBBY_CHUNK_CHARS = 1000
 const HOST_MODS_LOBBY_MAX_PARTS = 24
 const META_AUTO_JOIN_HOST_PLAYER = "brotato_online_auto_join_host_player"
 const META_PUBLIC_LOBBY_ENABLED = "brotato_online_public_lobby_enabled"
+const QUICK_CHAT_CUSTOM_TEXT_LIMIT = 20
 
 # GodotSteam exposes these lobby types as integer enums. Keep explicit fallbacks
 # because the Brotato build used by the mod does not expose constants uniformly.
@@ -80,10 +81,6 @@ const OFFICIAL_COOP_CONTINUE_AUTO_LOBBY_DELAY_MSEC = 300
 const HOST_SELECTION_REQUEST_REPLY_MIN_INTERVAL_MSEC = 300
 const HOST_SELECTION_REQUEST_SETUP_MIN_INTERVAL_MSEC = 2000
 const BROWSER_PING_REPLY_MIN_INTERVAL_MSEC = 100
-const UPGRADE_DIRECT_FALLBACK_FIRST_SEND_MSEC = 650
-const UPGRADE_DIRECT_FALLBACK_RESEND_MSEC = 900
-const UPGRADE_DIRECT_FALLBACK_TTL_MSEC = 9000
-const UPGRADE_DIRECT_PENDING_TTL_MSEC = 9000
 const RETRY_WAVE_STATE_BROADCAST_INTERVAL_MSEC = 400
 const BATTLE_TERMINAL_STATE_RESEND_MSEC = 500
 const BATTLE_START_GENERATION_FENCE_MSEC = 12000
@@ -205,13 +202,6 @@ var _client_last_game_scene_apply_msec = 0
 var _pending_client_game_scene_ready_start_id = 0
 var _sent_client_game_scene_ready_start_id = 0
 var _local_run_page_action_seq = 0
-var _direct_upgrade_ui_instance_id = 0
-var _direct_upgrade_action_seq = 0
-var _direct_upgrade_local_actions = {}
-var _direct_upgrade_seen_action_ids = {}
-var _direct_upgrade_pending_remote_actions = []
-var _direct_upgrade_apply_guard = false
-var _direct_upgrade_last_prune_msec = 0
 var _lobby_toggle_button = null
 var _lobby_toggle_panel = null
 var _lobby_toggle_pending_create = false
@@ -952,7 +942,6 @@ func _process(_delta: float) -> void:
 		var t_menu_send = OS.get_ticks_usec()
 		_poll_and_send_local_client_menu_input()
 		_poll_and_send_local_run_page_actions()
-		_poll_direct_upgrade_action_sync()
 		_bo_net_diag_cost("poll_client_menu_send", t_menu_send)
 
 	# Battle send behavior is intentionally unchanged in this pass.
@@ -1466,11 +1455,6 @@ func _on_lobby_created(connect_result = 0, lobby_id = 0) -> void:
 	_client_seen_host_setup_msec_by_sender.clear()
 	_last_selection_request_reply_msec_by_steam_id.clear()
 	_last_selection_request_setup_msec_by_steam_id.clear()
-	_direct_upgrade_ui_instance_id = 0
-	_direct_upgrade_local_actions.clear()
-	_direct_upgrade_seen_action_ids.clear()
-	_direct_upgrade_pending_remote_actions.clear()
-	_direct_upgrade_apply_guard = false
 	_reset_game_start_sync_state()
 	_clear_retry_wave_sync_state("game_start_reset")
 	_sent_character_setup_key_by_steam_id.clear()
@@ -2336,11 +2320,6 @@ func _reset_transient_online_state_for_new_session(reason: String = "") -> void:
 	_client_last_game_scene_apply_msec = 0
 	_pending_client_game_scene_ready_start_id = 0
 	_sent_client_game_scene_ready_start_id = 0
-	_direct_upgrade_ui_instance_id = 0
-	_direct_upgrade_local_actions.clear()
-	_direct_upgrade_seen_action_ids.clear()
-	_direct_upgrade_pending_remote_actions.clear()
-	_direct_upgrade_apply_guard = false
 	var menu_sync = _get_menu_sync_manager()
 	if menu_sync != null and menu_sync.has_method("reset_online_session_state"):
 		menu_sync.reset_online_session_state(reason)
@@ -2478,11 +2457,11 @@ func _get_message_lobby_id(message: Dictionary) -> String:
 
 
 func _is_known_online_message_type(msg_type: String) -> bool:
-	return msg_type == "hello" or msg_type == "request_selection_state" or msg_type == "menu_focus" or msg_type == "select_character" or msg_type == "select_weapon" or msg_type == "select_difficulty" or msg_type == "select_zone" or msg_type == "host_character_setup" or msg_type == "host_weapon_setup" or msg_type == "game_start_prepare" or msg_type == "game_start_time_ack" or msg_type == "client_game_scene_ready" or msg_type == "game_start_commit" or msg_type == "retry_wave_confirm" or msg_type == "retry_wave_decline" or msg_type == "retry_wave_state" or msg_type == "retry_wave_end" or msg_type == "menu_scene_state" or msg_type == "run_page_action_sync" or msg_type == "quick_chat" or msg_type == "battle_reliable_events" or msg_type == "battle_snapshot" or msg_type == "battle_terminal_state" or msg_type == "selection_state" or msg_type == "battle_input" or msg_type == "damage_claim_batch" or msg_type == "player_hp_state" or msg_type == "player_state" or msg_type == "entity_kill_claim" or msg_type == "boss_damage_report" or msg_type == "pickup_claim" or msg_type == "battle_entity_resync_request" or msg_type == "upgrade_direct_action" or msg_type == "bo_mod_message"
+	return msg_type == "hello" or msg_type == "request_selection_state" or msg_type == "menu_focus" or msg_type == "select_character" or msg_type == "select_weapon" or msg_type == "select_difficulty" or msg_type == "select_zone" or msg_type == "host_character_setup" or msg_type == "host_weapon_setup" or msg_type == "game_start_prepare" or msg_type == "game_start_time_ack" or msg_type == "client_game_scene_ready" or msg_type == "game_start_commit" or msg_type == "retry_wave_confirm" or msg_type == "retry_wave_decline" or msg_type == "retry_wave_state" or msg_type == "retry_wave_end" or msg_type == "menu_scene_state" or msg_type == "run_page_action_sync" or msg_type == "quick_chat" or msg_type == "battle_reliable_events" or msg_type == "battle_snapshot" or msg_type == "battle_terminal_state" or msg_type == "selection_state" or msg_type == "battle_input" or msg_type == "damage_claim_batch" or msg_type == "player_hp_state" or msg_type == "player_state" or msg_type == "entity_kill_claim" or msg_type == "boss_damage_report" or msg_type == "pickup_claim" or msg_type == "battle_entity_resync_request" or msg_type == "bo_mod_message"
 
 
 func _is_host_authoritative_message_type(msg_type: String) -> bool:
-	return msg_type == "host_character_setup" or msg_type == "host_weapon_setup" or msg_type == "game_start_prepare" or msg_type == "game_start_commit" or msg_type == "retry_wave_state" or msg_type == "retry_wave_end" or msg_type == "menu_scene_state" or msg_type == "run_page_action_sync" or msg_type == "quick_chat" or msg_type == "battle_reliable_events" or msg_type == "battle_snapshot" or msg_type == "battle_terminal_state" or msg_type == "selection_state" or msg_type == "upgrade_direct_action"
+	return msg_type == "host_character_setup" or msg_type == "host_weapon_setup" or msg_type == "game_start_prepare" or msg_type == "game_start_commit" or msg_type == "retry_wave_state" or msg_type == "retry_wave_end" or msg_type == "menu_scene_state" or msg_type == "run_page_action_sync" or msg_type == "quick_chat" or msg_type == "battle_reliable_events" or msg_type == "battle_snapshot" or msg_type == "battle_terminal_state" or msg_type == "selection_state"
 
 
 func _should_drop_p2p_message_for_session(from_steam_id: String, message: Dictionary) -> bool:
@@ -2649,7 +2628,7 @@ func send_battle_message_to_host(message: Dictionary, reliable: bool = true) -> 
 func send_or_broadcast_quick_chat(message: Dictionary) -> bool:
 	if not _session_active:
 		return false
-	var wire = message.duplicate(true)
+	var wire = _sanitize_quick_chat_wire_message(message.duplicate(true))
 	wire["msg_type"] = "quick_chat"
 	if not wire.has("origin_steam_id") or str(wire.get("origin_steam_id", "")) == "":
 		wire["origin_steam_id"] = _self_steam_id
@@ -2673,8 +2652,9 @@ func _broadcast_quick_chat(message: Dictionary, except_steam_id: String = "") ->
 
 func _handle_quick_chat_message(from_steam_id: String, message: Dictionary) -> void:
 	var quick_chat = _get_quick_chat_manager()
+	var sanitized_message = _sanitize_quick_chat_wire_message(message.duplicate(true))
 	if _is_game_host():
-		var relayed = message.duplicate(true)
+		var relayed = sanitized_message
 		relayed["msg_type"] = "quick_chat"
 		if not relayed.has("origin_steam_id") or str(relayed.get("origin_steam_id", "")) == "":
 			relayed["origin_steam_id"] = from_steam_id
@@ -2683,7 +2663,22 @@ func _handle_quick_chat_message(from_steam_id: String, message: Dictionary) -> v
 		_broadcast_quick_chat(relayed, from_steam_id)
 		return
 	if quick_chat != null and quick_chat.has_method("receive_remote_quick_chat"):
-		quick_chat.receive_remote_quick_chat(message)
+		quick_chat.receive_remote_quick_chat(sanitized_message)
+
+
+func _sanitize_quick_chat_wire_message(message: Dictionary) -> Dictionary:
+	if typeof(message) != TYPE_DICTIONARY:
+		return {}
+	# Custom quick chat deliberately uses the old-protocol literal-text fallback:
+	# quick_chat_id == "" and text == raw user text. Keep vanilla/id-based chat
+	# untouched so its localized strings retain their original length.
+	if str(message.get("quick_chat_id", "")) != "":
+		return message
+	var text = str(message.get("text", "")).replace("\r", " ").replace("\n", " ").strip_edges()
+	if text.length() > QUICK_CHAT_CUSTOM_TEXT_LIMIT:
+		text = text.substr(0, QUICK_CHAT_CUSTOM_TEXT_LIMIT)
+	message["text"] = text
+	return message
 
 
 func _build_client_content_capability_for_hello() -> Dictionary:
@@ -3333,10 +3328,6 @@ func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 				_lock_online_run_slots("client_scene_state:" + screen)
 			# game_start_commit is the preferred path. A direct screen=game scene-state is kept as a fallback
 			# for older hosts or duplicate broadcasts after the Host has already entered battle.
-		return
-
-	if msg_type == "upgrade_direct_action":
-		_handle_upgrade_direct_action(from_steam_id, message)
 		return
 
 	if msg_type == "run_page_action_sync":
@@ -5200,299 +5191,6 @@ func _get_difficulty_value_from_element(element) -> int:
 	if item.has_method("get"):
 		return int(item.get("value"))
 	return -1
-
-
-func _poll_direct_upgrade_action_sync() -> void:
-	if not _session_active:
-		_direct_upgrade_ui_instance_id = 0
-		_direct_upgrade_local_actions.clear()
-		_direct_upgrade_pending_remote_actions.clear()
-		return
-	# 普通商店页没有 CoopUpgradesUI，不能每帧递归扫整棵商店 UI。
-	# 升级页仍通过 main.tscn 的 UI/CoopUpgradesUI 直连路径处理。
-	if _is_in_shop_scene():
-		_direct_upgrade_ui_instance_id = 0
-		_prune_direct_upgrade_state(false)
-		return
-
-	var upgrade_ui = _get_active_coop_upgrades_ui()
-	if not _is_live_node(upgrade_ui):
-		_direct_upgrade_ui_instance_id = 0
-		_prune_direct_upgrade_state(false)
-		return
-
-	_connect_direct_upgrade_ui_signals(upgrade_ui)
-	_process_pending_direct_upgrade_actions(upgrade_ui)
-	_send_pending_local_direct_upgrade_actions(upgrade_ui)
-	_prune_direct_upgrade_state(true)
-
-
-func _get_active_coop_upgrades_ui() -> Node:
-	if _is_in_shop_scene():
-		return null
-	var current = get_tree().current_scene
-	if current == null or not current.has_node("UI/CoopUpgradesUI"):
-		return null
-	# CoopUpgradesUI is only resolved through main.tscn's fixed path.
-	# Other scenes must return immediately instead of recursively scanning their UI trees.
-	var upgrade_ui = current.get_node("UI/CoopUpgradesUI")
-	if not _is_live_node(upgrade_ui):
-		return null
-	if upgrade_ui.has_method("is_visible_in_tree") and not upgrade_ui.is_visible_in_tree():
-		return null
-	return upgrade_ui
-
-
-func _connect_direct_upgrade_ui_signals(upgrade_ui: Node) -> void:
-	if not _is_live_node(upgrade_ui):
-		return
-	var instance_id = upgrade_ui.get_instance_id()
-	if _direct_upgrade_ui_instance_id == instance_id:
-		return
-	_direct_upgrade_ui_instance_id = instance_id
-	if upgrade_ui.has_signal("upgrade_selected") and not upgrade_ui.is_connected("upgrade_selected", self, "_on_direct_upgrade_ui_upgrade_selected"):
-		upgrade_ui.connect("upgrade_selected", self, "_on_direct_upgrade_ui_upgrade_selected")
-
-
-func _on_direct_upgrade_ui_upgrade_selected(upgrade_data, upgrade) -> void:
-	if _direct_upgrade_apply_guard:
-		return
-	if not _session_active or upgrade_data == null or not is_instance_valid(upgrade_data) or upgrade == null:
-		return
-	if not RunData.is_coop_run:
-		return
-
-	var action = _build_direct_upgrade_action(upgrade_data, upgrade)
-	if action.empty():
-		return
-
-	var now = OS.get_ticks_msec()
-	_direct_upgrade_local_actions[str(action.get("action_id", ""))] = {
-		"message": action,
-		"first_send_msec": now + UPGRADE_DIRECT_FALLBACK_FIRST_SEND_MSEC,
-		"last_send_msec": 0,
-		"expires_msec": now + UPGRADE_DIRECT_FALLBACK_TTL_MSEC
-	}
-
-
-func _build_direct_upgrade_action(upgrade_data, upgrade) -> Dictionary:
-	_direct_upgrade_action_seq += 1
-	var action_id = _self_steam_id + ":upgrade_direct:" + str(_direct_upgrade_action_seq)
-	var upgrade_id = str(upgrade_data.upgrade_id)
-	var my_id = str(upgrade_data.my_id)
-	var upgrade_id_hash = int(upgrade_data.upgrade_id_hash)
-	var my_id_hash = int(upgrade_data.my_id_hash)
-	if upgrade_id_hash == 0 and upgrade_id != "":
-		upgrade_id_hash = int(Keys.generate_hash(upgrade_id))
-	if my_id_hash == 0 and my_id != "":
-		my_id_hash = int(Keys.generate_hash(my_id))
-
-	return {
-		"msg_type": "upgrade_direct_action",
-		"action_id": action_id,
-		"origin_steam_id": _self_steam_id,
-		"current_wave": int(RunData.current_wave),
-		"player_index": int(upgrade.player_index),
-		"level": int(upgrade.level),
-		"upgrade_id": upgrade_id,
-		"upgrade_id_hash": upgrade_id_hash,
-		"my_id": my_id,
-		"my_id_hash": my_id_hash,
-		"tier": int(upgrade_data.tier),
-		"resource_path": str(upgrade_data.resource_path),
-		"created_msec": OS.get_ticks_msec()
-	}
-
-
-func _send_pending_local_direct_upgrade_actions(upgrade_ui: Node) -> void:
-	if not _is_live_node(upgrade_ui):
-		return
-	var now = OS.get_ticks_msec()
-	for action_id in _direct_upgrade_local_actions.keys():
-		var record = _direct_upgrade_local_actions.get(action_id, {})
-		if typeof(record) != TYPE_DICTIONARY:
-			_direct_upgrade_local_actions.erase(action_id)
-			continue
-		if now > int(record.get("expires_msec", 0)):
-			_direct_upgrade_local_actions.erase(action_id)
-			continue
-		if now < int(record.get("first_send_msec", 0)):
-			continue
-		var last_send = int(record.get("last_send_msec", 0))
-		if last_send > 0 and now - last_send < UPGRADE_DIRECT_FALLBACK_RESEND_MSEC:
-			continue
-		var message = record.get("message", {})
-		if typeof(message) != TYPE_DICTIONARY or message.empty():
-			_direct_upgrade_local_actions.erase(action_id)
-			continue
-		_send_or_broadcast_direct_upgrade_action(message)
-		record["last_send_msec"] = now
-		_direct_upgrade_local_actions[action_id] = record
-
-
-func _send_or_broadcast_direct_upgrade_action(message: Dictionary) -> void:
-	if _is_game_host():
-		_broadcast_direct_upgrade_action(message, "")
-	else:
-		send_menu_message_to_host(message)
-
-
-func _broadcast_direct_upgrade_action(message: Dictionary, except_steam_id: String = "") -> void:
-	if not _is_game_host() or not _session_active:
-		return
-	for peer_key_value in _get_remote_ids_for_host_sync():
-		var steam_id = str(peer_key_value)
-		if steam_id == "" or steam_id == _self_steam_id:
-			continue
-		if except_steam_id != "" and steam_id == except_steam_id:
-			continue
-		_send_p2p_json(steam_id, message, true)
-
-
-func _handle_upgrade_direct_action(from_steam_id: String, message: Dictionary) -> void:
-	var action_id = str(message.get("action_id", ""))
-	if action_id == "":
-		action_id = from_steam_id + ":upgrade_direct_missing_id:" + str(message.get("player_index", -1)) + ":" + str(message.get("level", -1)) + ":" + str(message.get("my_id", ""))
-		message["action_id"] = action_id
-
-	if _direct_upgrade_seen_action_ids.has(action_id):
-		return
-	_direct_upgrade_seen_action_ids[action_id] = OS.get_ticks_msec()
-
-	if _is_game_host():
-		if str(message.get("origin_steam_id", "")) == "":
-			message["origin_steam_id"] = from_steam_id
-		var host_applied = _try_apply_direct_upgrade_action(message)
-		if host_applied:
-			_broadcast_direct_upgrade_action(message, "")
-		else:
-			_queue_pending_direct_upgrade_action(message)
-		return
-
-	var host_id = _get_game_host_steam_id()
-	if host_id != "" and from_steam_id != host_id:
-		return
-
-	# Own echo means the Host has seen the action. The local UI already executed it.
-	if str(message.get("origin_steam_id", "")) == _self_steam_id:
-		return
-
-	if not _try_apply_direct_upgrade_action(message):
-		_queue_pending_direct_upgrade_action(message)
-
-
-func _queue_pending_direct_upgrade_action(message: Dictionary) -> void:
-	var action_id = str(message.get("action_id", ""))
-	for existing in _direct_upgrade_pending_remote_actions:
-		if typeof(existing) == TYPE_DICTIONARY and str(existing.get("action_id", "")) == action_id:
-			return
-	var pending = message.duplicate(true)
-	pending["pending_since_msec"] = OS.get_ticks_msec()
-	_direct_upgrade_pending_remote_actions.append(pending)
-
-
-func _process_pending_direct_upgrade_actions(upgrade_ui: Node) -> void:
-	if _direct_upgrade_pending_remote_actions.empty():
-		return
-	var now = OS.get_ticks_msec()
-	var remaining = []
-	for pending in _direct_upgrade_pending_remote_actions:
-		if typeof(pending) != TYPE_DICTIONARY:
-			continue
-		if now - int(pending.get("pending_since_msec", now)) > UPGRADE_DIRECT_PENDING_TTL_MSEC:
-			continue
-		var applied = _try_apply_direct_upgrade_action(pending)
-		if applied:
-			if _is_game_host():
-				_broadcast_direct_upgrade_action(pending, "")
-		else:
-			remaining.append(pending)
-	_direct_upgrade_pending_remote_actions = remaining
-
-
-func _try_apply_direct_upgrade_action(message: Dictionary) -> bool:
-	var upgrade_ui = _get_active_coop_upgrades_ui()
-	if not _is_live_node(upgrade_ui):
-		return false
-	if not RunData.is_coop_run:
-		return true
-	if int(message.get("current_wave", RunData.current_wave)) != int(RunData.current_wave):
-		return true
-
-	var player_index = int(message.get("player_index", -1))
-	if player_index < 0 or player_index >= int(RunData.get_player_count()):
-		return true
-
-	var choosing = upgrade_ui.get("_player_is_choosing")
-	if typeof(choosing) == TYPE_ARRAY and player_index < choosing.size():
-		if not bool(choosing[player_index]):
-			return true
-
-	var upgrade_data = _find_visible_upgrade_data_for_direct_action(upgrade_ui, player_index, message)
-	if upgrade_data == null:
-		return false
-
-	_direct_upgrade_apply_guard = true
-	upgrade_ui.call("_on_choose_button_pressed", upgrade_data, player_index)
-	_direct_upgrade_apply_guard = false
-	return true
-
-
-func _find_visible_upgrade_data_for_direct_action(upgrade_ui: Node, player_index: int, message: Dictionary):
-	if not _is_live_node(upgrade_ui) or not upgrade_ui.has_method("_get_player_container"):
-		return null
-	var player_container = upgrade_ui.call("_get_player_container", player_index)
-	if not _is_live_node(player_container) or not player_container.has_method("_get_upgrade_uis"):
-		return null
-	var upgrade_uis = player_container.call("_get_upgrade_uis")
-	if typeof(upgrade_uis) != TYPE_ARRAY:
-		return null
-	for upgrade_ui_node in upgrade_uis:
-		if not _is_live_node(upgrade_ui_node):
-			continue
-		if upgrade_ui_node.has_method("is_visible_in_tree") and not upgrade_ui_node.is_visible_in_tree():
-			continue
-		var data = upgrade_ui_node.get("upgrade_data")
-		if data != null and _upgrade_data_matches_direct_action(data, message):
-			return data
-	return null
-
-
-func _upgrade_data_matches_direct_action(data, message: Dictionary) -> bool:
-	var msg_path = str(message.get("resource_path", ""))
-	if msg_path != "" and str(data.resource_path) == msg_path:
-		return true
-
-	var msg_my_id = str(message.get("my_id", ""))
-	if msg_my_id != "" and str(data.my_id) == msg_my_id:
-		return true
-
-	var msg_my_hash = int(message.get("my_id_hash", 0))
-	var data_my_hash = int(data.my_id_hash)
-	if data_my_hash == 0 and str(data.my_id) != "":
-		data_my_hash = int(Keys.generate_hash(str(data.my_id)))
-	if msg_my_hash != 0 and data_my_hash == msg_my_hash:
-		return true
-
-	return false
-
-
-func _prune_direct_upgrade_state(upgrade_ui_active: bool) -> void:
-	var now = OS.get_ticks_msec()
-	if not upgrade_ui_active:
-		_direct_upgrade_local_actions.clear()
-		return
-	if now - _direct_upgrade_last_prune_msec < 1500:
-		return
-	_direct_upgrade_last_prune_msec = now
-	for action_id in _direct_upgrade_local_actions.keys():
-		var record = _direct_upgrade_local_actions.get(action_id, {})
-		if typeof(record) != TYPE_DICTIONARY or now > int(record.get("expires_msec", 0)):
-			_direct_upgrade_local_actions.erase(action_id)
-	for action_id in _direct_upgrade_seen_action_ids.keys():
-		var seen_msec = int(_direct_upgrade_seen_action_ids.get(action_id, 0))
-		if seen_msec <= 0 or now - seen_msec > 30000:
-			_direct_upgrade_seen_action_ids.erase(action_id)
 
 
 func _is_in_difficulty_selection_scene() -> bool:

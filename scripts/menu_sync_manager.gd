@@ -7526,7 +7526,7 @@ func _resolve_progression_upgrade_data(state: Dictionary, slot_hint):
 	# The progression UI already owns the locally-created runtime UpgradeData for this
 	# slot. Reuse that class/effect structure by position, then overlay Host runtime
 	# effect values. Click authority is also slot-based, so this does not change the
-	# upgrade_direct_action / upgrade_select matching semantics.
+	# upgrade_select matching semantics.
 	if slot_hint != null and slot_hint is UpgradeData:
 		var copy = _duplicate_with_synced_value_if_needed(slot_hint, state)
 		_apply_item_parent_display_identity_from_state(copy, state)

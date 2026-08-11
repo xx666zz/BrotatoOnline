@@ -18,6 +18,29 @@ const META_LOCAL_INPUT_DEVICE_MODE = "brotato_online_local_input_device_mode"
 const META_LOCAL_INPUT_JOYPAD_ID = "brotato_online_local_input_joypad_id"
 const META_LOCAL_INPUT_JOYPAD_NAME = "brotato_online_local_input_joypad_name"
 
+const CUSTOM_QUICK_CHAT_MAX_LENGTH = 20
+const KEY_CUSTOM_QUICK_CHAT_PREFIX = "quick_chat_custom_"
+const QUICK_CHAT_OPTION_IDS = [
+	"come",
+	"help",
+	"wait",
+	"ready",
+	"buy",
+	"no_reroll",
+	"thanks",
+	"nice"
+]
+const QUICK_CHAT_TRANSLATION_KEYS = {
+	"come": "BROTATO_ONLINE_QUICK_CHAT_STAY_ALIVE",
+	"help": "BROTATO_ONLINE_QUICK_CHAT_HURRY",
+	"wait": "BROTATO_ONLINE_QUICK_CHAT_ELLIPSIS",
+	"ready": "BROTATO_ONLINE_QUICK_CHAT_THIS_ONE",
+	"buy": "BROTATO_ONLINE_QUICK_CHAT_STRONG_STRONG",
+	"no_reroll": "BROTATO_ONLINE_QUICK_CHAT_QUESTION",
+	"thanks": "BROTATO_ONLINE_QUICK_CHAT_NO",
+	"nice": "BROTATO_ONLINE_QUICK_CHAT_WAIT_A_SEC"
+}
+
 const SETTINGS_BUTTON_NAME = "BrotatoOnlineSettingsButton"
 const SETTINGS_OVERLAY_NAME = "BrotatoOnlineSettingsOverlay"
 const META_LOCAL_OUTLINE_COLOR = "brotato_online_local_outline_color"
@@ -28,6 +51,7 @@ var _auto_join_host_player_enabled = DEFAULT_AUTO_JOIN_HOST_PLAYER
 var _local_input_device_mode = DEFAULT_LOCAL_INPUT_DEVICE_MODE
 var _local_input_joypad_id = -1
 var _local_input_joypad_name = ""
+var _custom_quick_chat_texts = {}
 var _last_scan_msec = 0
 var _settings_button = null
 var _settings_overlay = null
@@ -38,6 +62,16 @@ var _input_device_option_button = null
 var _input_device_description_label = null
 var _input_device_option_values = []
 var _last_input_device_list_key = ""
+var _quick_chat_customize_toggle = null
+var _quick_chat_customize_description_label = null
+var _quick_chat_customize_container = null
+var _quick_chat_editors = {}
+var _quick_chat_editor_normalizing = false
+var _active_quick_chat_editor = null
+var _text_edit_session_ending = false
+var _suppressed_focus_controls = []
+var _suspended_focus_emulators = []
+var _settings_panel = null
 var _title_label = null
 var _description_label = null
 var _back_button = null
@@ -84,7 +118,19 @@ func _input(event) -> void:
 		return
 	if not _settings_overlay.visible:
 		return
+
+	# Do not use LineEdit.focus_exited as the end of a text-edit session.
+	# Windows IME composition can temporarily disturb GUI focus. If Brotato's
+	# menu focus handling is restored at that moment, the first Pinyin letter
+	# navigates the menu instead of remaining in the editor.
+	var active_editor = _get_active_quick_chat_editor()
+	if active_editor != null and event is InputEventMouseButton and event.pressed:
+		if not active_editor.get_global_rect().has_point(event.position):
+			_end_quick_chat_text_edit_session()
+			active_editor = null
+
 	if event.is_action_released("ui_cancel"):
+		_end_quick_chat_text_edit_session()
 		_close_settings_overlay()
 		get_tree().set_input_as_handled()
 
@@ -126,6 +172,32 @@ func get_local_input_joypad_id() -> int:
 
 func get_local_input_joypad_name() -> String:
 	return _local_input_joypad_name
+
+
+func get_custom_quick_chat_text(option_id: String) -> String:
+	if not QUICK_CHAT_OPTION_IDS.has(option_id):
+		return ""
+	return str(_custom_quick_chat_texts.get(option_id, ""))
+
+
+func set_custom_quick_chat_text(option_id: String, text: String) -> void:
+	if not QUICK_CHAT_OPTION_IDS.has(option_id):
+		return
+	var normalized = _sanitize_custom_quick_chat_text(text)
+	if str(_custom_quick_chat_texts.get(option_id, "")) == normalized:
+		return
+	if normalized == "":
+		_custom_quick_chat_texts.erase(option_id)
+	else:
+		_custom_quick_chat_texts[option_id] = normalized
+	_save_settings()
+
+
+func _sanitize_custom_quick_chat_text(text: String) -> String:
+	var normalized = text.replace("\r", " ").replace("\n", " ").strip_edges()
+	if normalized.length() > CUSTOM_QUICK_CHAT_MAX_LENGTH:
+		normalized = normalized.substr(0, CUSTOM_QUICK_CHAT_MAX_LENGTH)
+	return normalized
 
 
 func set_local_input_device(mode: String, joypad_id: int = -1, joypad_name: String = "") -> void:
@@ -207,6 +279,15 @@ func _load_settings() -> void:
 			KEY_LOCAL_INPUT_JOYPAD_NAME,
 			""
 		))
+		_custom_quick_chat_texts.clear()
+		for option_id in QUICK_CHAT_OPTION_IDS:
+			var custom_text = _sanitize_custom_quick_chat_text(str(config.get_value(
+				SETTINGS_SECTION,
+				KEY_CUSTOM_QUICK_CHAT_PREFIX + str(option_id),
+				""
+			)))
+			if custom_text != "":
+				_custom_quick_chat_texts[str(option_id)] = custom_text
 		if _local_input_device_mode != INPUT_DEVICE_MODE_KEYBOARD and _local_input_device_mode != INPUT_DEVICE_MODE_JOYPAD:
 			_local_input_device_mode = INPUT_DEVICE_MODE_AUTO
 	else:
@@ -215,6 +296,7 @@ func _load_settings() -> void:
 		_local_input_device_mode = DEFAULT_LOCAL_INPUT_DEVICE_MODE
 		_local_input_joypad_id = -1
 		_local_input_joypad_name = ""
+		_custom_quick_chat_texts.clear()
 
 
 func _save_settings() -> void:
@@ -225,6 +307,12 @@ func _save_settings() -> void:
 	config.set_value(SETTINGS_SECTION, KEY_LOCAL_INPUT_DEVICE_MODE, _local_input_device_mode)
 	config.set_value(SETTINGS_SECTION, KEY_LOCAL_INPUT_JOYPAD_ID, _local_input_joypad_id)
 	config.set_value(SETTINGS_SECTION, KEY_LOCAL_INPUT_JOYPAD_NAME, _local_input_joypad_name)
+	for option_id in QUICK_CHAT_OPTION_IDS:
+		config.set_value(
+			SETTINGS_SECTION,
+			KEY_CUSTOM_QUICK_CHAT_PREFIX + str(option_id),
+			str(_custom_quick_chat_texts.get(option_id, ""))
+		)
 	var _save_err = config.save(SETTINGS_FILE_PATH)
 
 
@@ -257,6 +345,7 @@ func _try_inject_title_screen_settings_button() -> void:
 
 	var main_menu = tree.current_scene.get_node_or_null("Menus/MainMenu")
 	if main_menu == null or not is_instance_valid(main_menu):
+		_end_quick_chat_text_edit_session()
 		_settings_button = null
 		_settings_overlay = null
 		_local_outline_button = null
@@ -266,6 +355,11 @@ func _try_inject_title_screen_settings_button() -> void:
 		_input_device_description_label = null
 		_input_device_option_values.clear()
 		_last_input_device_list_key = ""
+		_quick_chat_customize_toggle = null
+		_quick_chat_customize_description_label = null
+		_quick_chat_customize_container = null
+		_quick_chat_editors.clear()
+		_settings_panel = null
 		_title_label = null
 		_description_label = null
 		_back_button = null
@@ -354,16 +448,28 @@ func _ensure_settings_overlay(title_screen: Node) -> void:
 	var existing_overlay = title_screen.get_node_or_null(SETTINGS_OVERLAY_NAME)
 	if existing_overlay != null and is_instance_valid(existing_overlay):
 		_settings_overlay = existing_overlay
+		_settings_panel = existing_overlay.get_node_or_null("CenterContainer/PanelContainer")
 		_title_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/TitleLabel")
 		_local_outline_button = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/LocalCharacterOutlineButton")
 		_local_outline_description_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/LocalCharacterOutlineDescriptionLabel")
 		_input_device_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/InputDeviceLabel")
 		_input_device_option_button = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/InputDeviceOptionButton")
 		_input_device_description_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/InputDeviceDescriptionLabel")
+		_quick_chat_customize_toggle = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/QuickChatCustomizeToggle")
+		_quick_chat_customize_description_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/QuickChatCustomizeDescriptionLabel")
+		_quick_chat_customize_container = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/QuickChatCustomizeGrid")
+		_quick_chat_editors.clear()
+		if _quick_chat_customize_container != null and is_instance_valid(_quick_chat_customize_container):
+			for option_id in QUICK_CHAT_OPTION_IDS:
+				var editor = _quick_chat_customize_container.get_node_or_null("QuickChatEntry_" + str(option_id) + "/LineEdit")
+				if editor != null and is_instance_valid(editor):
+					_configure_quick_chat_editor(editor, str(option_id))
+					_quick_chat_editors[str(option_id)] = editor
 		_description_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/DescriptionLabel")
 		_back_button = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/BackButton")
 		_connect_runtime_mouse_focus(_input_device_option_button)
 		_connect_runtime_mouse_focus(_local_outline_button)
+		_connect_runtime_mouse_focus(_quick_chat_customize_toggle)
 		_connect_runtime_mouse_focus(_back_button)
 		_refresh_input_device_options(true)
 		return
@@ -397,6 +503,7 @@ func _ensure_settings_overlay(title_screen: Node) -> void:
 	panel.name = "PanelContainer"
 	panel.rect_min_size = Vector2(900, 560)
 	center.add_child(panel)
+	_settings_panel = panel
 
 	var margin = MarginContainer.new()
 	margin.name = "MarginContainer"
@@ -470,6 +577,63 @@ func _ensure_settings_overlay(title_screen: Node) -> void:
 	_local_outline_description_label = local_outline_description
 	_description_label = local_outline_description
 
+	var quick_chat_separator = _create_settings_separator("QuickChatSeparator")
+	vbox.add_child(quick_chat_separator)
+
+	var quick_chat_toggle = Button.new()
+	quick_chat_toggle.name = "QuickChatCustomizeToggle"
+	quick_chat_toggle.toggle_mode = true
+	quick_chat_toggle.pressed = false
+	quick_chat_toggle.rect_min_size = Vector2(0, 56)
+	quick_chat_toggle.align = 0
+	quick_chat_toggle.focus_mode = Control.FOCUS_ALL
+	quick_chat_toggle.mouse_filter = Control.MOUSE_FILTER_STOP
+	_configure_settings_action_button(quick_chat_toggle)
+	vbox.add_child(quick_chat_toggle)
+	var _quick_chat_toggle_err = quick_chat_toggle.connect("toggled", self, "_on_quick_chat_customize_toggled")
+	_quick_chat_customize_toggle = quick_chat_toggle
+	_connect_runtime_mouse_focus(_quick_chat_customize_toggle)
+
+	var quick_chat_description = _create_settings_description_label("QuickChatCustomizeDescriptionLabel", "BROTATO_ONLINE_QUICK_CHAT_CUSTOM_DESC")
+	quick_chat_description.visible = false
+	vbox.add_child(quick_chat_description)
+	_quick_chat_customize_description_label = quick_chat_description
+
+	var quick_chat_grid = GridContainer.new()
+	quick_chat_grid.name = "QuickChatCustomizeGrid"
+	quick_chat_grid.columns = 4
+	quick_chat_grid.add_constant_override("hseparation", 10)
+	quick_chat_grid.add_constant_override("vseparation", 8)
+	quick_chat_grid.visible = false
+	vbox.add_child(quick_chat_grid)
+	_quick_chat_customize_container = quick_chat_grid
+	_quick_chat_editors.clear()
+	for i in range(QUICK_CHAT_OPTION_IDS.size()):
+		var option_id = str(QUICK_CHAT_OPTION_IDS[i])
+		var entry = HBoxContainer.new()
+		entry.name = "QuickChatEntry_" + option_id
+		entry.rect_min_size = Vector2(190, 44)
+		entry.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		entry.add_constant_override("separation", 6)
+		quick_chat_grid.add_child(entry)
+
+		var index_label = Label.new()
+		index_label.name = "IndexLabel"
+		index_label.text = str(i + 1)
+		index_label.align = Label.ALIGN_CENTER
+		index_label.valign = Label.VALIGN_CENTER
+		index_label.rect_min_size = Vector2(24, 40)
+		entry.add_child(index_label)
+
+		var editor = LineEdit.new()
+		editor.name = "LineEdit"
+		editor.text = get_custom_quick_chat_text(option_id)
+		editor.rect_min_size = Vector2(150, 40)
+		editor.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		entry.add_child(editor)
+		_configure_quick_chat_editor(editor, option_id)
+		_quick_chat_editors[option_id] = editor
+
 	var spacer = Control.new()
 	spacer.name = "Spacer"
 	spacer.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -497,8 +661,10 @@ func _ensure_settings_overlay(title_screen: Node) -> void:
 		check.focus_neighbour_top = check.get_path_to(_input_device_option_button)
 	else:
 		check.focus_neighbour_top = check.get_path_to(back_button)
-	check.focus_neighbour_bottom = check.get_path_to(back_button)
-	back_button.focus_neighbour_top = back_button.get_path_to(check)
+	check.focus_neighbour_bottom = check.get_path_to(quick_chat_toggle)
+	quick_chat_toggle.focus_neighbour_top = quick_chat_toggle.get_path_to(check)
+	quick_chat_toggle.focus_neighbour_bottom = quick_chat_toggle.get_path_to(back_button)
+	back_button.focus_neighbour_top = back_button.get_path_to(quick_chat_toggle)
 	if _input_device_option_button != null and is_instance_valid(_input_device_option_button):
 		back_button.focus_neighbour_bottom = back_button.get_path_to(_input_device_option_button)
 	else:
@@ -686,6 +852,27 @@ func _input_device_option_matches_setting(option_data: Dictionary) -> bool:
 	return option_id == _local_input_joypad_id and (_local_input_joypad_name == "" or option_name == _local_input_joypad_name)
 
 
+func _configure_quick_chat_editor(editor, option_id: String) -> void:
+	if editor == null or not is_instance_valid(editor):
+		return
+	# Keep IME composition independent from the custom-chat character cap. The
+	# committed value is normalized here and again at the network boundary.
+	editor.max_length = 0
+	editor.placeholder_text = _quick_chat_original_text(option_id)
+	editor.focus_mode = Control.FOCUS_CLICK
+	editor.mouse_filter = Control.MOUSE_FILTER_STOP
+	if editor.is_connected("mouse_entered", self, "_on_runtime_focusable_mouse_entered"):
+		editor.disconnect("mouse_entered", self, "_on_runtime_focusable_mouse_entered")
+	if editor.is_connected("mouse_exited", self, "_on_runtime_focusable_mouse_exited"):
+		editor.disconnect("mouse_exited", self, "_on_runtime_focusable_mouse_exited")
+	if not editor.is_connected("text_changed", self, "_on_custom_quick_chat_text_changed"):
+		var _editor_err = editor.connect("text_changed", self, "_on_custom_quick_chat_text_changed", [option_id])
+	if not editor.is_connected("focus_entered", self, "_on_custom_quick_chat_editor_focus_entered"):
+		var _editor_focus_in_err = editor.connect("focus_entered", self, "_on_custom_quick_chat_editor_focus_entered", [option_id])
+	if not editor.is_connected("focus_exited", self, "_on_custom_quick_chat_editor_focus_exited"):
+		var _editor_focus_out_err = editor.connect("focus_exited", self, "_on_custom_quick_chat_editor_focus_exited", [option_id])
+
+
 func _connect_runtime_mouse_focus(control) -> void:
 	if control == null or not is_instance_valid(control):
 		return
@@ -711,11 +898,8 @@ func _on_runtime_focusable_mouse_exited(control) -> void:
 		return
 	if not (control is Control):
 		return
-	var viewport = get_viewport()
-	if viewport != null and viewport.has_method("gui_get_focus_owner"):
-		var focus_owner = viewport.call("gui_get_focus_owner")
-		if focus_owner == control:
-			control.release_focus()
+	if control.has_focus():
+		control.release_focus()
 
 
 func _refresh_localized_texts() -> void:
@@ -733,8 +917,187 @@ func _refresh_localized_texts() -> void:
 		_input_device_label.text = _txt("BROTATO_ONLINE_INPUT_DEVICE")
 	if _input_device_description_label != null and is_instance_valid(_input_device_description_label):
 		_input_device_description_label.text = _txt("BROTATO_ONLINE_INPUT_DEVICE_DESC")
+	if _quick_chat_customize_toggle != null and is_instance_valid(_quick_chat_customize_toggle):
+		var arrow = "▼ " if _quick_chat_customize_toggle.pressed else "▶ "
+		_quick_chat_customize_toggle.text = arrow + _txt("BROTATO_ONLINE_QUICK_CHAT_CUSTOM_TITLE")
+	if _quick_chat_customize_description_label != null and is_instance_valid(_quick_chat_customize_description_label):
+		_quick_chat_customize_description_label.text = _txt("BROTATO_ONLINE_QUICK_CHAT_CUSTOM_DESC")
+	for option_id in _quick_chat_editors.keys():
+		var editor = _quick_chat_editors.get(option_id, null)
+		if editor != null and is_instance_valid(editor):
+			editor.placeholder_text = _quick_chat_original_text(str(option_id))
 	if _back_button != null and is_instance_valid(_back_button):
 		_back_button.text = _txt("MENU_BACK")
+
+
+func _quick_chat_original_text(option_id: String) -> String:
+	var key = str(QUICK_CHAT_TRANSLATION_KEYS.get(option_id, ""))
+	return _txt(key) if key != "" else ""
+
+
+func _on_quick_chat_customize_toggled(button_pressed: bool) -> void:
+	if _quick_chat_customize_description_label != null and is_instance_valid(_quick_chat_customize_description_label):
+		_quick_chat_customize_description_label.visible = button_pressed
+	if _quick_chat_customize_container != null and is_instance_valid(_quick_chat_customize_container):
+		_quick_chat_customize_container.visible = button_pressed
+	if _settings_panel != null and is_instance_valid(_settings_panel):
+		_settings_panel.rect_min_size = Vector2(900, 700 if button_pressed else 560)
+	_refresh_localized_texts()
+
+
+func _on_custom_quick_chat_text_changed(_text: String, option_id: String) -> void:
+	if _quick_chat_editor_normalizing:
+		return
+	# Defer normalization until the current GUI/IME event has completed. This
+	# avoids rewriting the LineEdit while Windows is still composing Pinyin.
+	call_deferred("_normalize_custom_quick_chat_editor", option_id)
+
+
+func _normalize_custom_quick_chat_editor(option_id: String) -> void:
+	if not _quick_chat_editors.has(option_id):
+		return
+	var editor = _quick_chat_editors.get(option_id, null)
+	if editor == null or not is_instance_valid(editor):
+		return
+	var normalized = _sanitize_custom_quick_chat_text(str(editor.text))
+	if str(editor.text) != normalized:
+		_quick_chat_editor_normalizing = true
+		editor.text = normalized
+		_quick_chat_editor_normalizing = false
+	set_custom_quick_chat_text(option_id, normalized)
+
+
+func _on_custom_quick_chat_editor_focus_entered(option_id: String) -> void:
+	var editor = _quick_chat_editors.get(option_id, null)
+	if editor == null or not is_instance_valid(editor):
+		return
+	_begin_quick_chat_text_edit_session(editor)
+
+
+func _on_custom_quick_chat_editor_focus_exited(option_id: String) -> void:
+	var editor = _quick_chat_editors.get(option_id, null)
+	if editor == null or not is_instance_valid(editor):
+		return
+	if editor != _active_quick_chat_editor or _text_edit_session_ending:
+		return
+	# IME composition can produce a transient GUI focus loss. Keep the edit
+	# session alive and restore the LineEdit focus after the current event.
+	call_deferred("_ensure_active_quick_chat_editor_focus")
+
+
+func _get_active_quick_chat_editor():
+	if _active_quick_chat_editor == null:
+		return null
+	if not is_instance_valid(_active_quick_chat_editor):
+		_active_quick_chat_editor = null
+		return null
+	return _active_quick_chat_editor
+
+
+func _begin_quick_chat_text_edit_session(editor) -> void:
+	if editor == null or not is_instance_valid(editor):
+		return
+	if _active_quick_chat_editor == editor and not _text_edit_session_ending:
+		return
+	_end_quick_chat_text_edit_session()
+	_text_edit_session_ending = false
+	_active_quick_chat_editor = editor
+	_suspend_focus_emulators_for_text_edit()
+	_suppress_other_focus_controls_for_text_edit(editor)
+	call_deferred("_ensure_active_quick_chat_editor_focus")
+
+
+func _end_quick_chat_text_edit_session() -> void:
+	_text_edit_session_ending = true
+	_active_quick_chat_editor = null
+	_restore_suppressed_focus_controls()
+	_restore_suspended_focus_emulators()
+	_text_edit_session_ending = false
+
+
+func _ensure_active_quick_chat_editor_focus() -> void:
+	if _text_edit_session_ending:
+		return
+	if _settings_overlay == null or not is_instance_valid(_settings_overlay) or not _settings_overlay.visible:
+		return
+	var editor = _get_active_quick_chat_editor()
+	if editor == null or not editor.is_visible_in_tree():
+		return
+	if not editor.has_focus():
+		editor.grab_focus()
+
+
+func _suppress_other_focus_controls_for_text_edit(editor) -> void:
+	_restore_suppressed_focus_controls()
+	var tree = get_tree()
+	if tree == null or tree.current_scene == null:
+		return
+	_suppress_focus_controls_recursive(tree.current_scene, editor)
+
+
+func _suppress_focus_controls_recursive(node: Node, editor) -> void:
+	if node == null or not is_instance_valid(node):
+		return
+	if node is Control and node != editor and node.focus_mode != Control.FOCUS_NONE:
+		_suppressed_focus_controls.append({
+			"node": node,
+			"focus_mode": node.focus_mode
+		})
+		node.focus_mode = Control.FOCUS_NONE
+	for child in node.get_children():
+		_suppress_focus_controls_recursive(child, editor)
+
+
+func _restore_suppressed_focus_controls() -> void:
+	for state in _suppressed_focus_controls:
+		if typeof(state) != TYPE_DICTIONARY:
+			continue
+		var control = state.get("node", null)
+		if control == null or not is_instance_valid(control) or not (control is Control):
+			continue
+		control.focus_mode = int(state.get("focus_mode", Control.FOCUS_NONE))
+	_suppressed_focus_controls.clear()
+
+
+func _suspend_focus_emulators_for_text_edit() -> void:
+	if not _suspended_focus_emulators.empty():
+		return
+	if Utils == null:
+		return
+	for player_index in range(8):
+		var focus_emulator = Utils.get_focus_emulator(player_index)
+		if focus_emulator == null or not is_instance_valid(focus_emulator):
+			continue
+		var was_processing = focus_emulator.is_processing_input()
+		var viewport = focus_emulator.get_viewport()
+		var had_gui_focus_connection = false
+		if viewport != null and is_instance_valid(viewport):
+			had_gui_focus_connection = viewport.is_connected("gui_focus_changed", focus_emulator, "_on_focus_changed")
+			if had_gui_focus_connection:
+				viewport.disconnect("gui_focus_changed", focus_emulator, "_on_focus_changed")
+		_suspended_focus_emulators.append({
+			"node": focus_emulator,
+			"was_processing": was_processing,
+			"viewport": viewport,
+			"had_gui_focus_connection": had_gui_focus_connection
+		})
+		if was_processing:
+			focus_emulator.set_process_input(false)
+
+
+func _restore_suspended_focus_emulators() -> void:
+	for state in _suspended_focus_emulators:
+		if typeof(state) != TYPE_DICTIONARY:
+			continue
+		var focus_emulator = state.get("node", null)
+		if focus_emulator == null or not is_instance_valid(focus_emulator):
+			continue
+		focus_emulator.set_process_input(bool(state.get("was_processing", false)))
+		var viewport = state.get("viewport", null)
+		if bool(state.get("had_gui_focus_connection", false)) and viewport != null and is_instance_valid(viewport):
+			if not viewport.is_connected("gui_focus_changed", focus_emulator, "_on_focus_changed"):
+				var _focus_reconnect_err = viewport.connect("gui_focus_changed", focus_emulator, "_on_focus_changed")
+	_suspended_focus_emulators.clear()
 
 
 func _on_settings_button_pressed() -> void:
@@ -750,9 +1113,8 @@ func _open_settings_overlay() -> void:
 		return
 
 	var focus_owner = null
-	var viewport = get_viewport()
-	if viewport != null and viewport.has_method("gui_get_focus_owner"):
-		focus_owner = viewport.call("gui_get_focus_owner")
+	if _settings_button != null and is_instance_valid(_settings_button) and _settings_button is Control:
+		focus_owner = _settings_button.get_focus_owner()
 	if focus_owner != null and focus_owner is Control:
 		_last_focus_owner = focus_owner
 	else:
@@ -761,6 +1123,19 @@ func _open_settings_overlay() -> void:
 	_refresh_input_device_options(true)
 	if _local_outline_button != null and is_instance_valid(_local_outline_button):
 		_local_outline_button.set_pressed_no_signal(_local_character_outline_enabled)
+	for option_id in _quick_chat_editors.keys():
+		var editor = _quick_chat_editors.get(option_id, null)
+		if editor != null and is_instance_valid(editor):
+			editor.text = get_custom_quick_chat_text(str(option_id))
+	var quick_chat_expanded = false
+	if _quick_chat_customize_toggle != null and is_instance_valid(_quick_chat_customize_toggle):
+		quick_chat_expanded = bool(_quick_chat_customize_toggle.pressed)
+	if _quick_chat_customize_description_label != null and is_instance_valid(_quick_chat_customize_description_label):
+		_quick_chat_customize_description_label.visible = quick_chat_expanded
+	if _quick_chat_customize_container != null and is_instance_valid(_quick_chat_customize_container):
+		_quick_chat_customize_container.visible = quick_chat_expanded
+	if _settings_panel != null and is_instance_valid(_settings_panel):
+		_settings_panel.rect_min_size = Vector2(900, 700 if quick_chat_expanded else 560)
 
 	_refresh_localized_texts()
 	_settings_overlay.show()
@@ -782,6 +1157,7 @@ func _focus_first_settings_control() -> void:
 func _close_settings_overlay() -> void:
 	if _settings_overlay == null or not is_instance_valid(_settings_overlay):
 		return
+	_end_quick_chat_text_edit_session()
 	_settings_overlay.hide()
 	set_process_input(false)
 	if _last_focus_owner != null and is_instance_valid(_last_focus_owner):

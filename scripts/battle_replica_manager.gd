@@ -55,12 +55,29 @@ const BULLET_HELL_PHASE_DRIFT_CORRECTION_SEC = 0.20
 const BULLET_HELL_CLEAR_LOCAL_PROJECTILES_ON_FIRST_SYNC = true
 const UNKNOWN_ENTITY_RESYNC_REQUEST_INTERVAL_MSEC = 2000
 
+# Client battle teardown is intentionally split into a quiesce barrier and vanilla cleanup.
+# Never free combat objects while callbacks from the same battle can still be queued.
+const CLIENT_BATTLE_PHASE_INACTIVE = 0
+const CLIENT_BATTLE_PHASE_ACTIVE = 1
+const CLIENT_BATTLE_PHASE_QUIESCING = 2
+const CLIENT_BATTLE_PHASE_VANILLA_CLEANUP = 3
+const CLIENT_QUIESCE_KIND_WAVE_TIMEOUT = "wave_timeout"
+const CLIENT_QUIESCE_KIND_ROOM_CLEANUP = "room_cleanup"
+const CLIENT_QUIESCE_KIND_FAILURE = "failure"
+
 var _latest_snapshot = {}
 var _latest_snapshot_tick = -1
 var _last_applied_tick = -1
 var _last_scene_was_game = false
 var _last_game_scene_instance_id = 0
 var _client_battle_terminal_cleanup_suspended = false
+var _client_battle_phase = CLIENT_BATTLE_PHASE_INACTIVE
+var _client_quiesce_token = 0
+var _client_quiesce_reason = ""
+var _client_quiesce_kind = ""
+var _client_quiesce_wave_failed = false
+var _client_quiesce_run_lost = false
+var _client_quiesce_run_won = false
 var _client_world_prepared = false
 var _client_initial_entity_cleanup_done = false
 var _last_local_suppress_msec = 0
@@ -131,9 +148,14 @@ func receive_battle_terminal_state_from_host(message: Dictionary) -> void:
 		return
 	if not _is_in_game_scene():
 		return
-	if _client_battle_terminal_cleanup_suspended:
+	# Terminal state remains authoritative while QUIESCING: a stopped Host timer can
+	# arrive just before the failure/run-won terminal packet. Normal battle packets are
+	# blocked during quiescence, but this packet may still upgrade the pending outcome.
+	if _client_battle_phase == CLIENT_BATTLE_PHASE_VANILLA_CLEANUP:
 		return
-	if _is_client_main_terminal_cleanup_active():
+	if _client_battle_terminal_cleanup_suspended and _client_battle_phase != CLIENT_BATTLE_PHASE_QUIESCING:
+		return
+	if _is_client_main_terminal_cleanup_active() and _client_battle_phase != CLIENT_BATTLE_PHASE_QUIESCING:
 		return
 
 	var now = OS.get_ticks_msec()
@@ -163,11 +185,21 @@ func receive_battle_terminal_state_from_host(message: Dictionary) -> void:
 	_apply_owned_terminal_player_state_from_host(snapshot)
 
 	if bool(message.get("wave_failed", false)) or bool(message.get("run_lost", false)) or bool(message.get("retry_visible", false)):
-		_neutralize_client_combat_threats("host_terminal_state")
-		_queue_client_failed_cleanup_from_host("host_terminal_state", bool(message.get("run_lost", false)), _terminal_packet_all_players_dead(snapshot))
+		_begin_client_battle_quiescence(
+			"host_terminal_state",
+			CLIENT_QUIESCE_KIND_FAILURE,
+			true,
+			bool(message.get("run_lost", false)),
+			false
+		)
 	elif bool(message.get("run_won", false)):
-		_neutralize_client_combat_threats("host_run_won_terminal")
-		_queue_client_wave_end_from_host("host_run_won_terminal", true)
+		_begin_client_battle_quiescence(
+			"host_run_won_terminal",
+			CLIENT_QUIESCE_KIND_WAVE_TIMEOUT,
+			false,
+			false,
+			true
+		)
 
 
 func _apply_owned_terminal_player_state_from_host(snapshot: Dictionary) -> void:
@@ -219,47 +251,6 @@ func _force_owned_player_dead_from_host_terminal(hp: int) -> void:
 		_force_remote_player_death_pose(player)
 
 
-func _terminal_packet_all_players_dead(snapshot: Dictionary) -> bool:
-	var players = snapshot.get("players", [])
-	if typeof(players) != TYPE_ARRAY or players.empty():
-		return false
-	var expected_count = max(1, int(snapshot.get("player_count", RunData.get_player_count())))
-	if players.size() < expected_count:
-		return false
-	for state in players:
-		if typeof(state) != TYPE_DICTIONARY:
-			continue
-		var hp = int(state.get("health", state.get("hp", -1)))
-		if not bool(state.get("dead", false)) and not (hp >= 0 and hp <= 0):
-			return false
-	return true
-
-
-func _queue_client_failed_cleanup_from_host(reason: String, run_lost: bool, force_from_packet: bool) -> void:
-	call_deferred("_deferred_force_client_failed_cleanup_from_host", reason, run_lost, force_from_packet)
-
-
-func _deferred_force_client_failed_cleanup_from_host(reason: String, run_lost: bool, force_from_packet: bool) -> void:
-	if _is_game_host() or not _is_online_session_active() or not _is_in_game_scene():
-		return
-	var main = _get_current_main_node()
-	if main == null:
-		return
-	if _safe_node_bool(main, "_cleaning_up", false) or _safe_node_bool(main, "_is_wave_failed", false) or _safe_node_bool(main, "_is_run_lost", false):
-		return
-	var retry_wave = _safe_node_get(main, "_retry_wave", null)
-	if _is_valid_node(retry_wave) and retry_wave is CanvasItem and retry_wave.visible:
-		return
-	if not force_from_packet and not _local_all_players_dead_for_terminal():
-		return
-	if main.get("_is_wave_failed") != null:
-		main.set("_is_wave_failed", true)
-	if run_lost and main.get("_is_run_lost") != null:
-		main.set("_is_run_lost", true)
-	if main.has_method("clean_up_room"):
-		main.clean_up_room()
-
-
 func _local_all_players_dead_for_terminal() -> bool:
 	var locator = _get_runtime_locator()
 	if locator == null or not locator.has_method("get_players"):
@@ -267,44 +258,55 @@ func _local_all_players_dead_for_terminal() -> bool:
 	var players = locator.get_players()
 	if typeof(players) != TYPE_ARRAY or players.empty():
 		return false
+	var valid_players = 0
 	for player in players:
 		if not _is_valid_node(player):
 			continue
+		valid_players += 1
 		var current_stats = player.get("current_stats")
 		var hp = int(current_stats.health) if current_stats != null else -1
 		var dead = bool(player.get("dead")) if player.get("dead") != null else false
 		if not dead and not (hp >= 0 and hp <= 0):
 			return false
+	# During main.tscn construction RuntimeLocator may briefly expose only invalid/stale
+	# player refs. Never mistake that scene-entry window for an all-player death.
+	return valid_players > 0
+
+
+func _begin_failure_quiescence_if_all_players_dead(source: String) -> bool:
+	if _is_game_host() or not _is_online_session_active() or not _is_in_game_scene():
+		return false
+	if _client_battle_phase != CLIENT_BATTLE_PHASE_ACTIVE:
+		return _client_battle_phase == CLIENT_BATTLE_PHASE_QUIESCING or _client_battle_phase == CLIENT_BATTLE_PHASE_VANILLA_CLEANUP
+	if not _local_all_players_dead_for_terminal():
+		return false
+	# Do this synchronously at every replica/spawn boundary. Main._on_player_died() is
+	# only one listener of Player.died; another already-scheduled callback (notably
+	# EntityBirth.call_deferred("birth")) can run after the last Player became dead but
+	# before Main reaches clean_up_room(). Once there is no live target, spawning another
+	# vanilla Enemy violates Enemy.init()/update_target()'s invariant.
+	send_owned_player_terminal_state(null, "all_players_dead:" + source)
+	_begin_client_battle_quiescence("all_players_dead:" + source, CLIENT_QUIESCE_KIND_FAILURE, true, false, false)
 	return true
 
 
-func _queue_client_wave_end_from_host(reason: String, run_won: bool) -> void:
-	call_deferred("_deferred_force_client_wave_end_from_host", reason, run_won)
-
-
-func _deferred_force_client_wave_end_from_host(reason: String, run_won: bool) -> void:
+func _client_battle_accepts_combat_spawn_work(source: String) -> bool:
 	if _is_game_host() or not _is_online_session_active() or not _is_in_game_scene():
-		return
-	var main = _get_current_main_node()
-	if main == null:
-		return
-	if _safe_node_bool(main, "_cleaning_up", false) or _safe_node_bool(main, "_is_wave_failed", false) or _safe_node_bool(main, "_is_run_lost", false) or _safe_node_bool(main, "_is_run_won", false):
-		return
-	var already_forced = main.has_meta("brotato_online_host_wave_timeout_forced") and bool(main.get_meta("brotato_online_host_wave_timeout_forced"))
-	if run_won and main.get("_is_run_won") != null:
-		# Final-wave boss kill can finish the Host before WaveTimer reaches 0. Mark the
-		# client terminal state first, then drive the normal vanilla wave timeout path.
-		main.set("_is_run_won", true)
-	if already_forced:
-		# _apply_host_wave_timer_state() may already have started the local Timer at
-		# 0.05 / queued _on_WaveTimer_timeout from the same terminal packet. Do not
-		# schedule a duplicate; setting _is_run_won above is enough for that path.
-		return
-	main.set_meta("brotato_online_host_wave_timeout_forced", true)
-	if main.has_method("_on_WaveTimer_timeout"):
-		main.call_deferred("_on_WaveTimer_timeout")
-	elif main.has_method("clean_up_room"):
-		main.call_deferred("clean_up_room")
+		return false
+	# Network callbacks can beat this manager's first _process() on a freshly entered
+	# main.tscn. Lazily open the ACTIVE phase here so the lifecycle gate does not drop
+	# legitimate first-frame Host births just because process ordering differed.
+	if _client_battle_phase == CLIENT_BATTLE_PHASE_INACTIVE:
+		_reset_client_battle_lifecycle(true, "lazy_combat_spawn:" + source)
+	if _client_battle_phase != CLIENT_BATTLE_PHASE_ACTIVE:
+		return false
+	if _client_battle_terminal_cleanup_suspended:
+		return false
+	if _begin_failure_quiescence_if_all_players_dead(source):
+		return false
+	if _is_client_main_terminal_cleanup_active():
+		return false
+	return true
 
 
 func receive_battle_snapshot_from_host(snapshot: Dictionary) -> void:
@@ -316,6 +318,8 @@ func receive_battle_snapshot_from_host(snapshot: Dictionary) -> void:
 	# Late wave-1 packets can otherwise become _latest_snapshot and get applied to the
 	# next main.tscn, which is exactly the risky second-wave entry path.
 	if not _is_in_game_scene():
+		return
+	if _begin_failure_quiescence_if_all_players_dead("snapshot_receive"):
 		return
 	if _is_client_main_terminal_cleanup_active():
 		send_owned_player_terminal_state(null, "client_terminal_cleanup_snapshot")
@@ -358,6 +362,8 @@ func receive_battle_reliable_events_from_host(message: Dictionary) -> void:
 	_update_host_clock_offset(server_time_msec, now)
 	if not _is_in_game_scene():
 		return
+	if _begin_failure_quiescence_if_all_players_dead("reliable_receive"):
+		return
 	if _is_client_main_terminal_cleanup_active():
 		send_owned_player_terminal_state(null, "client_terminal_cleanup_reliable")
 		_suspend_client_battle_layer("client_terminal_cleanup_reliable")
@@ -389,6 +395,8 @@ func receive_battle_reliable_events_from_host(message: Dictionary) -> void:
 
 
 func _apply_reliable_entity_birth_state(state: Dictionary, server_time_msec: int, now: int) -> void:
+	if not _client_battle_accepts_combat_spawn_work("reliable_entity_birth"):
+		return
 	var net_id = str(state.get("net_id", ""))
 	if net_id == "" or _locally_killed_until.has(net_id):
 		return
@@ -422,7 +430,7 @@ func _process(delta: float) -> void:
 			_clear_all("left_game_scene")
 		_last_scene_was_game = false
 		_last_game_scene_instance_id = 0
-		_client_battle_terminal_cleanup_suspended = false
+		_reset_client_battle_lifecycle(false, "left_game_scene")
 		_client_world_prepared = false
 		_client_initial_entity_cleanup_done = false
 		_snapshot_gate_scene_instance_id = 0
@@ -434,7 +442,7 @@ func _process(delta: float) -> void:
 	if _last_scene_was_game and _last_game_scene_instance_id != 0 and scene_instance_id != 0 and scene_instance_id != _last_game_scene_instance_id:
 		_clear_all("game_scene_replaced")
 		_last_scene_was_game = false
-		_client_battle_terminal_cleanup_suspended = false
+		_reset_client_battle_lifecycle(false, "game_scene_replaced")
 		_client_world_prepared = false
 		_client_initial_entity_cleanup_done = false
 		_reset_snapshot_gate_for_scene(scene_instance_id, "game_scene_replaced")
@@ -450,7 +458,7 @@ func _process(delta: float) -> void:
 			_clear_all("online_session_inactive")
 		_last_scene_was_game = false
 		_last_game_scene_instance_id = 0
-		_client_battle_terminal_cleanup_suspended = false
+		_reset_client_battle_lifecycle(false, "online_session_inactive")
 		_client_world_prepared = false
 		_client_initial_entity_cleanup_done = false
 		_snapshot_gate_scene_instance_id = 0
@@ -462,6 +470,8 @@ func _process(delta: float) -> void:
 		return
 
 	if _client_battle_terminal_cleanup_suspended:
+		return
+	if _begin_failure_quiescence_if_all_players_dead("process"):
 		return
 	if _is_client_main_terminal_cleanup_active():
 		# The local death / fail path can start Main.clean_up_room() before the normal
@@ -480,6 +490,7 @@ func _process(delta: float) -> void:
 			get_tree().paused = false
 		_last_scene_was_game = true
 		_last_game_scene_instance_id = scene_instance_id
+		_reset_client_battle_lifecycle(true, "client_enter_game_scene")
 		_reset_snapshot_gate_for_scene(scene_instance_id, "client_enter_game_scene")
 		_prepare_client_host_controlled_world(true)
 
@@ -623,9 +634,184 @@ func _snapshot_has_terminal_progression(snapshot: Dictionary) -> bool:
 	return false
 
 
+func intercept_client_wave_timeout(reason: String = "main_wave_timer_timeout") -> bool:
+	if _is_game_host() or not _is_online_session_active() or not _is_in_game_scene():
+		return false
+	if _client_battle_phase == CLIENT_BATTLE_PHASE_VANILLA_CLEANUP:
+		return false
+	_begin_client_battle_quiescence(reason, CLIENT_QUIESCE_KIND_WAVE_TIMEOUT, false, false, false)
+	return true
+
+
+func intercept_client_room_cleanup(reason: String = "main_clean_up_room") -> bool:
+	if _is_game_host() or not _is_online_session_active() or not _is_in_game_scene():
+		return false
+	if _client_battle_phase == CLIENT_BATTLE_PHASE_VANILLA_CLEANUP:
+		return false
+	var main = _get_current_main_node()
+	var wave_failed = false
+	var run_lost = false
+	var run_won = false
+	if main != null:
+		wave_failed = _safe_node_bool(main, "_is_wave_failed", false)
+		run_lost = _safe_node_bool(main, "_is_run_lost", false)
+		run_won = _safe_node_bool(main, "_is_run_won", false)
+	# Local all-player death reaches Main.clean_up_room() before vanilla _set_run_states().
+	# Classify it as failure here so death/retry uses exactly the same barrier as Host failure.
+	if not wave_failed and not run_lost and _local_all_players_dead_for_terminal():
+		wave_failed = true
+	var kind = CLIENT_QUIESCE_KIND_FAILURE if wave_failed or run_lost else CLIENT_QUIESCE_KIND_ROOM_CLEANUP
+	_begin_client_battle_quiescence(reason, kind, wave_failed, run_lost, run_won)
+	return true
+
+
+func _reset_client_battle_lifecycle(active: bool, reason: String) -> void:
+	_client_quiesce_token += 1
+	_client_battle_phase = CLIENT_BATTLE_PHASE_ACTIVE if active else CLIENT_BATTLE_PHASE_INACTIVE
+	_client_battle_terminal_cleanup_suspended = false
+	_client_quiesce_reason = ""
+	_client_quiesce_kind = ""
+	_client_quiesce_wave_failed = false
+	_client_quiesce_run_lost = false
+	_client_quiesce_run_won = false
+
+
+func _begin_client_battle_quiescence(reason: String, kind: String, wave_failed: bool, run_lost: bool, run_won: bool) -> void:
+	if _is_game_host() or not _is_online_session_active() or not _is_in_game_scene():
+		return
+	if _client_battle_phase == CLIENT_BATTLE_PHASE_VANILLA_CLEANUP:
+		return
+
+	# A later terminal packet may refine a timer-based wave end into failure/run-won.
+	_client_quiesce_wave_failed = _client_quiesce_wave_failed or wave_failed
+	_client_quiesce_run_lost = _client_quiesce_run_lost or run_lost
+	_client_quiesce_run_won = _client_quiesce_run_won or run_won
+	if kind == CLIENT_QUIESCE_KIND_FAILURE:
+		_client_quiesce_kind = CLIENT_QUIESCE_KIND_FAILURE
+	elif _client_quiesce_kind == "":
+		_client_quiesce_kind = kind
+	if _client_quiesce_reason == "":
+		_client_quiesce_reason = reason
+
+	if _client_battle_phase == CLIENT_BATTLE_PHASE_QUIESCING:
+		return
+
+	_client_battle_phase = CLIENT_BATTLE_PHASE_QUIESCING
+	_client_quiesce_token += 1
+	var token = _client_quiesce_token
+
+	# Lifecycle barrier order is strict:
+	# 1) block new Host battle work; 2) stop local combat producers without freeing or
+	# disabling collision objects; 3) wait across idle+physics; 4) let vanilla teardown.
+	_suspend_client_battle_layer("quiesce:" + reason)
+	_freeze_client_battle_producers(reason)
+	print("[BO][ENDWAVE][QUIESCE] reason=", reason, " kind=", _client_quiesce_kind, " wave_failed=", _client_quiesce_wave_failed, " run_lost=", _client_quiesce_run_lost, " run_won=", _client_quiesce_run_won)
+	call_deferred("_drain_client_battle_quiescence", token)
+
+
+func _drain_client_battle_quiescence(token: int):
+	# call_deferred gets us out of the current Timer/network callback. Wait through an
+	# idle boundary and a complete physics step, then commit from the following idle
+	# phase. This guarantees vanilla queue_free() does not begin inside physics flushing.
+	yield(get_tree(), "idle_frame")
+	yield(get_tree(), "physics_frame")
+	call_deferred("_commit_client_battle_cleanup_after_drain", token)
+
+
+func _commit_client_battle_cleanup_after_drain(token: int) -> void:
+	if token != _client_quiesce_token:
+		return
+	if _client_battle_phase != CLIENT_BATTLE_PHASE_QUIESCING:
+		return
+	_commit_client_battle_cleanup()
+
+
+func _commit_client_battle_cleanup() -> void:
+	var main = _get_current_main_node()
+	if main == null or not is_instance_valid(main):
+		_reset_client_battle_lifecycle(false, "commit_no_main")
+		return
+
+	_client_battle_phase = CLIENT_BATTLE_PHASE_VANILLA_CLEANUP
+	if _client_quiesce_wave_failed and main.get("_is_wave_failed") != null:
+		main.set("_is_wave_failed", true)
+	if _client_quiesce_run_lost and main.get("_is_run_lost") != null:
+		main.set("_is_run_lost", true)
+	if _client_quiesce_run_won and main.get("_is_run_won") != null:
+		main.set("_is_run_won", true)
+
+	var kind = _client_quiesce_kind
+	print("[BO][ENDWAVE][COMMIT] reason=", _client_quiesce_reason, " kind=", kind)
+	if kind == CLIENT_QUIESCE_KIND_WAVE_TIMEOUT and main.has_method("_on_WaveTimer_timeout"):
+		main.call("_on_WaveTimer_timeout")
+	elif main.has_method("clean_up_room"):
+		main.call("clean_up_room")
+
+
+func _freeze_client_battle_producers(reason: String) -> void:
+	# QUIESCING must be non-destructive. In particular, do not queue_free projectiles,
+	# do not set EntitySpawner._cleaning_up early, and do not toggle collision shapes.
+	# Those actions belong to vanilla cleanup after the frame barrier.
+	var locator = _get_runtime_locator()
+	var spawner = locator.get_entity_spawner() if locator != null and locator.has_method("get_entity_spawner") else null
+	if _is_valid_node(spawner):
+		spawner.set_process(false)
+		spawner.set_physics_process(false)
+		if spawner.get("active_births") != null:
+			spawner.set("active_births", 0)
+		_clear_spawner_queues(spawner)
+		var structure_timer = spawner.get_node_or_null("StructureTimer")
+		if _is_valid_node(structure_timer) and structure_timer is Timer:
+			structure_timer.stop()
+		for prop in ["enemies", "bosses", "charmed_enemies", "neutrals"]:
+			var arr = spawner.get(prop)
+			if typeof(arr) == TYPE_ARRAY:
+				for node in arr:
+					_freeze_client_combat_node(node)
+
+	var wave_manager = locator.get_wave_manager() if locator != null and locator.has_method("get_wave_manager") else null
+	if _is_valid_node(wave_manager):
+		wave_manager.set_process(false)
+		wave_manager.set_physics_process(false)
+
+	# Replica EntityBirth markers are producers too. EntityBirth schedules birth() with
+	# call_deferred(), so merely stopping _physics_process() is insufficient: a birth()
+	# that was already queued can still emit birth_timeout during the drain barrier. Freeze
+	# future ticks and clear the pending spawn intents; the timeout handler is also gated.
+	for marker_value in _birth_markers.values():
+		if _is_valid_node(marker_value):
+			_disable_logic_tree(marker_value)
+	_birth_marker_states.clear()
+
+	for id_value in _host_entities.keys():
+		var id = str(id_value)
+		var category = str(_host_entity_category.get(id, ""))
+		if category == "enemy" or category == "boss" or category == "neutral":
+			_freeze_client_combat_node(_host_entities[id])
+
+	var main = _get_current_main_node()
+	var enemy_projectiles = main.get("_enemy_projectiles") if main != null else null
+	if not _is_valid_node(enemy_projectiles) and main != null:
+		enemy_projectiles = main.get_node_or_null("EnemyProjectiles")
+	if _is_valid_node(enemy_projectiles):
+		# Stop BulletHell/projectile generators and projectile processing, but keep every
+		# node alive until vanilla queues the container for deletion after the barrier.
+		for child in enemy_projectiles.get_children():
+			if _is_valid_node(child):
+				_disable_logic_tree(child)
+
+
+func _freeze_client_combat_node(node: Node) -> void:
+	if not _is_valid_node(node):
+		return
+	if node.get("_can_move") != null:
+		node.set("_can_move", false)
+	if node.get("_move_locked") != null:
+		node.set("_move_locked", true)
+	_disable_logic_tree(node)
+
+
 func _suspend_client_battle_layer(reason: String) -> void:
-	if not _client_battle_terminal_cleanup_suspended:
-		pass
 	_client_battle_terminal_cleanup_suspended = true
 	# Do not free replicated combat entities here. Main may set _is_run_won/_is_wave_failed
 	# before its vanilla clean_up_room() has run; deleting Host replicas at this point
@@ -1129,6 +1315,11 @@ func _prime_pooled_player_index_before_spawn(spawner: Node, packed: PackedScene,
 
 
 func _spawn_local_combat_entity(scene_path: String, entity_type: int, pos: Vector2, player_index: int, data_res: Resource = null) -> Node:
+	# Final lifecycle gate: no caller may create combat objects once the battle has begun
+	# quiescing or once every local mirrored Player is dead. This preserves vanilla's
+	# invariant that Enemy.init() always has at least one live target.
+	if not _client_battle_accepts_combat_spawn_work("spawn_local_combat_entity"):
+		return null
 	if scene_path == "":
 		return null
 	var packed = load(scene_path)
@@ -2080,6 +2271,8 @@ func _clear_birth_markers(reason: String) -> void:
 
 
 func _apply_reliable_birth_marker_state(birth_state: Dictionary, server_time_msec: int) -> void:
+	if not _client_battle_accepts_combat_spawn_work("birth_marker_state"):
+		return
 	if not ENABLE_BIRTH_MARKERS:
 		return
 	if typeof(birth_state) != TYPE_DICTIONARY or birth_state.empty():
@@ -2103,6 +2296,8 @@ func _apply_reliable_birth_marker_state(birth_state: Dictionary, server_time_mse
 
 
 func _spawn_entity_from_birth_marker_state(birth_id: String, birth_state: Dictionary) -> bool:
+	if not _client_battle_accepts_combat_spawn_work("birth_marker_spawn"):
+		return false
 	if birth_id == "" or typeof(birth_state) != TYPE_DICTIONARY or birth_state.empty():
 		return false
 	var entity_net_id = str(birth_state.get("spawn_net_id", birth_state.get("entity_net_id", "")))
@@ -2288,6 +2483,8 @@ func _predict_birth_remaining_units(birth_state: Dictionary) -> float:
 
 
 func _update_birth_markers() -> void:
+	if not _client_battle_accepts_combat_spawn_work("birth_marker_update"):
+		return
 	if not ENABLE_BIRTH_MARKERS or _birth_markers.empty():
 		return
 	var to_remove = []
@@ -2311,6 +2508,11 @@ func _update_birth_markers() -> void:
 
 
 func _on_replica_birth_marker_timeout(birth: Node, id: String) -> void:
+	# EntityBirth.birth() can already be queued with call_deferred() when quiescence starts.
+	# The callback therefore needs the same central lifecycle gate as packet-driven spawns.
+	if not _client_battle_accepts_combat_spawn_work("birth_marker_timeout"):
+		_remove_birth_marker(id)
+		return
 	var state = _birth_marker_states.get(id, {})
 	if typeof(state) == TYPE_DICTIONARY:
 		_spawn_entity_from_birth_marker_state(id, state)
@@ -2366,30 +2568,7 @@ func _handle_host_battle_inactive_state(state: Dictionary) -> void:
 	if now - _last_host_battle_inactive_cleanup_msec < 250:
 		return
 	_last_host_battle_inactive_cleanup_msec = now
-	_neutralize_client_combat_threats("host_battle_inactive")
-	_nudge_local_wave_timeout_from_host()
-
-
-func _nudge_local_wave_timeout_from_host() -> void:
-	var main = get_tree().current_scene
-	if main == null:
-		return
-	if bool(main.get("_cleaning_up")):
-		return
-	if main.has_meta("brotato_online_host_wave_timeout_forced") and bool(main.get_meta("brotato_online_host_wave_timeout_forced")):
-		return
-	var timer = _get_wave_timer()
-	# The Host has already ended the wave. Trigger the vanilla client cleanup path
-	# almost immediately instead of waiting for local timer drift to catch up.
-	# Some late-wave clients already have a stopped local Timer, so starting it is not
-	# enough; fall back to the vanilla timeout handler directly.
-	if timer != null and not timer.is_stopped():
-		main.set_meta("brotato_online_host_wave_timeout_forced", true)
-		timer.start(0.05)
-		return
-	if main.has_method("_on_WaveTimer_timeout"):
-		main.set_meta("brotato_online_host_wave_timeout_forced", true)
-		main.call_deferred("_on_WaveTimer_timeout")
+	_begin_client_battle_quiescence("host_battle_inactive", CLIENT_QUIESCE_KIND_WAVE_TIMEOUT, false, false, false)
 
 
 func _update_host_wave_timer_from_cached_state(force: bool) -> void:
@@ -3271,61 +3450,6 @@ func _is_host_battle_inactive_cached() -> bool:
 	return true
 
 
-func prepare_client_room_cleanup() -> void:
-	_neutralize_client_combat_threats("main_clean_up_room_pre")
-
-
-func _neutralize_client_combat_threats(reason: String) -> void:
-	if _is_game_host() or not _is_in_game_scene():
-		return
-	_clear_birth_markers(reason)
-	var locator = _get_runtime_locator()
-	var spawner = locator.get_entity_spawner() if locator != null and locator.has_method("get_entity_spawner") else null
-	if spawner != null:
-		spawner.set("_cleaning_up", true)
-		spawner.set("active_births", 0)
-		spawner.set("_all_enemy_dirty", true)
-		_clear_spawner_queues(spawner)
-		for prop in ["enemies", "bosses", "charmed_enemies"]:
-			var arr = spawner.get(prop)
-			if typeof(arr) == TYPE_ARRAY:
-				for node in arr:
-					_neutralize_combat_threat_node(node)
-	for id_value in _host_entities.keys():
-		var id = str(id_value)
-		var category = str(_host_entity_category.get(id, ""))
-		if category == "enemy" or category == "boss":
-			_neutralize_combat_threat_node(_host_entities[id])
-	_clear_enemy_projectiles()
-
-
-func _neutralize_combat_threat_node(node: Node) -> void:
-	if not _is_valid_node(node):
-		return
-	if node.get("_can_move") != null:
-		node.set("_can_move", false)
-	if node.get("_move_locked") != null:
-		node.set("_move_locked", true)
-	node.set_physics_process(false)
-	node.set_process(false)
-	_disable_behavior_children(node)
-	_disable_collision_tree(node)
-
-
-func _clear_enemy_projectiles() -> void:
-	var main = get_tree().current_scene
-	if main == null:
-		return
-	var enemy_projectiles = main.get("_enemy_projectiles")
-	if not _is_valid_node(enemy_projectiles):
-		enemy_projectiles = main.get_node_or_null("EnemyProjectiles")
-	if not _is_valid_node(enemy_projectiles):
-		return
-	for child in enemy_projectiles.get_children():
-		if _is_valid_node(child):
-			child.queue_free()
-
-
 func _remove_host_entity(id: String, free_node: bool) -> void:
 	if _host_entities.has(id):
 		var node = _host_entities[id]
@@ -3450,6 +3574,7 @@ func _clear_all(reason: String) -> void:
 	_cached_owned_player_node = null
 	_cached_owned_player_scene_instance_id = 0
 	_last_applied_tick = -1
+	_reset_client_battle_lifecycle(false, "clear_all:" + reason)
 	_sanitize_stats_manager_queues("clear_all_after:" + reason)
 
 

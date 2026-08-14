@@ -330,11 +330,17 @@ func _brotato_online_restart_wave_timer_while_waiting_for_host(reason: String) -
 func _on_WaveTimer_timeout() -> void:
 	# Online clients must not let their local vanilla Timer complete the wave before
 	# at least one clearly-active Host snapshot has been accepted for this battle.
-	# Otherwise wave-1/pre-start Timer state can run Main._set_run_states() locally
-	# and show an instant victory while Host is still in combat.
 	if _brotato_online_should_block_local_wave_timeout():
 		_brotato_online_restart_wave_timer_while_waiting_for_host("wait_host_active_snapshot")
 		return
+
+	# Root end-wave barrier: stop combat producers first and let already-queued
+	# animation/timer/physics callbacks drain before vanilla starts queue_free().
+	if _brotato_online_is_online_client():
+		var replica = _brotato_online_get_battle_replica_manager()
+		if replica != null and replica.has_method("intercept_client_wave_timeout"):
+			if bool(replica.intercept_client_wave_timeout("main_wave_timer_timeout")):
+				return
 	._on_WaveTimer_timeout()
 
 
@@ -384,17 +390,15 @@ func _brotato_online_discard_client_end_wave_pickups(reason: String) -> void:
 
 func clean_up_room() -> void:
 	if _brotato_online_is_online_client():
-		# Stop client-side enemy attack animations before vanilla frees EnemyProjectiles.
-		# Animation method tracks can still call ShootingAttackBehavior.shoot() even after
-		# the behavior node itself has stopped processing, racing the projectile container
-		# teardown during end-wave cleanup.
 		var replica = _brotato_online_get_battle_replica_manager()
-		if replica != null and replica.has_method("prepare_client_room_cleanup"):
-			replica.prepare_client_room_cleanup()
+		if replica != null and replica.has_method("intercept_client_room_cleanup"):
+			# This also covers the failure path: Main._on_player_died() calls clean_up_room()
+			# directly when the last local player dies, bypassing WaveTimer timeout.
+			if bool(replica.intercept_client_room_cleanup("main_clean_up_room")):
+				return
 
-		# The Host already owns bonus-gold/material and item-box queues. Letting the
-		# client run vanilla end-wave attraction briefly appends local boxes/materials,
-		# which makes HUD icons multiply or flash before the Host correction arrives.
+		# The Host already owns bonus-gold/material and item-box queues. This remains
+		# immediately before vanilla cleanup, after the lifecycle barrier has committed.
 		_brotato_online_discard_client_end_wave_pickups("client_clean_up_room_pre")
 	.clean_up_room()
 

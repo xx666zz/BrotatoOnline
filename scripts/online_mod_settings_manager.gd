@@ -19,6 +19,8 @@ const META_LOCAL_INPUT_JOYPAD_ID = "brotato_online_local_input_joypad_id"
 const META_LOCAL_INPUT_JOYPAD_NAME = "brotato_online_local_input_joypad_name"
 
 const CUSTOM_QUICK_CHAT_MAX_LENGTH = 20
+const KEY_DISABLE_CUSTOM_QUICK_CHAT = "disable_custom_quick_chat"
+const DEFAULT_DISABLE_CUSTOM_QUICK_CHAT = false
 const KEY_CUSTOM_QUICK_CHAT_PREFIX = "quick_chat_custom_"
 const QUICK_CHAT_OPTION_IDS = [
 	"come",
@@ -51,6 +53,7 @@ var _auto_join_host_player_enabled = DEFAULT_AUTO_JOIN_HOST_PLAYER
 var _local_input_device_mode = DEFAULT_LOCAL_INPUT_DEVICE_MODE
 var _local_input_joypad_id = -1
 var _local_input_joypad_name = ""
+var _disable_custom_quick_chat_enabled = DEFAULT_DISABLE_CUSTOM_QUICK_CHAT
 var _custom_quick_chat_texts = {}
 var _last_scan_msec = 0
 var _settings_button = null
@@ -62,6 +65,7 @@ var _input_device_option_button = null
 var _input_device_description_label = null
 var _input_device_option_values = []
 var _last_input_device_list_key = ""
+var _disable_custom_quick_chat_button = null
 var _quick_chat_customize_toggle = null
 var _quick_chat_customize_description_label = null
 var _quick_chat_customize_container = null
@@ -174,6 +178,17 @@ func get_local_input_joypad_name() -> String:
 	return _local_input_joypad_name
 
 
+func get_disable_custom_quick_chat_enabled() -> bool:
+	return _disable_custom_quick_chat_enabled
+
+
+func set_disable_custom_quick_chat_enabled(enabled: bool) -> void:
+	if _disable_custom_quick_chat_enabled == enabled:
+		return
+	_disable_custom_quick_chat_enabled = enabled
+	_save_settings()
+
+
 func get_custom_quick_chat_text(option_id: String) -> String:
 	if not QUICK_CHAT_OPTION_IDS.has(option_id):
 		return ""
@@ -279,6 +294,11 @@ func _load_settings() -> void:
 			KEY_LOCAL_INPUT_JOYPAD_NAME,
 			""
 		))
+		_disable_custom_quick_chat_enabled = bool(config.get_value(
+			SETTINGS_SECTION,
+			KEY_DISABLE_CUSTOM_QUICK_CHAT,
+			DEFAULT_DISABLE_CUSTOM_QUICK_CHAT
+		))
 		_custom_quick_chat_texts.clear()
 		for option_id in QUICK_CHAT_OPTION_IDS:
 			var custom_text = _sanitize_custom_quick_chat_text(str(config.get_value(
@@ -296,6 +316,7 @@ func _load_settings() -> void:
 		_local_input_device_mode = DEFAULT_LOCAL_INPUT_DEVICE_MODE
 		_local_input_joypad_id = -1
 		_local_input_joypad_name = ""
+		_disable_custom_quick_chat_enabled = DEFAULT_DISABLE_CUSTOM_QUICK_CHAT
 		_custom_quick_chat_texts.clear()
 
 
@@ -307,6 +328,7 @@ func _save_settings() -> void:
 	config.set_value(SETTINGS_SECTION, KEY_LOCAL_INPUT_DEVICE_MODE, _local_input_device_mode)
 	config.set_value(SETTINGS_SECTION, KEY_LOCAL_INPUT_JOYPAD_ID, _local_input_joypad_id)
 	config.set_value(SETTINGS_SECTION, KEY_LOCAL_INPUT_JOYPAD_NAME, _local_input_joypad_name)
+	config.set_value(SETTINGS_SECTION, KEY_DISABLE_CUSTOM_QUICK_CHAT, _disable_custom_quick_chat_enabled)
 	for option_id in QUICK_CHAT_OPTION_IDS:
 		config.set_value(
 			SETTINGS_SECTION,
@@ -355,6 +377,7 @@ func _try_inject_title_screen_settings_button() -> void:
 		_input_device_description_label = null
 		_input_device_option_values.clear()
 		_last_input_device_list_key = ""
+		_disable_custom_quick_chat_button = null
 		_quick_chat_customize_toggle = null
 		_quick_chat_customize_description_label = null
 		_quick_chat_customize_container = null
@@ -455,6 +478,7 @@ func _ensure_settings_overlay(title_screen: Node) -> void:
 		_input_device_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/InputDeviceLabel")
 		_input_device_option_button = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/InputDeviceOptionButton")
 		_input_device_description_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/InputDeviceDescriptionLabel")
+		_disable_custom_quick_chat_button = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/DisableCustomQuickChatButton")
 		_quick_chat_customize_toggle = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/QuickChatCustomizeToggle")
 		_quick_chat_customize_description_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/QuickChatCustomizeDescriptionLabel")
 		_quick_chat_customize_container = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/QuickChatCustomizeGrid")
@@ -469,6 +493,7 @@ func _ensure_settings_overlay(title_screen: Node) -> void:
 		_back_button = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/BackButton")
 		_connect_runtime_mouse_focus(_input_device_option_button)
 		_connect_runtime_mouse_focus(_local_outline_button)
+		_connect_runtime_mouse_focus(_disable_custom_quick_chat_button)
 		_connect_runtime_mouse_focus(_quick_chat_customize_toggle)
 		_connect_runtime_mouse_focus(_back_button)
 		_refresh_input_device_options(true)
@@ -580,6 +605,20 @@ func _ensure_settings_overlay(title_screen: Node) -> void:
 	var quick_chat_separator = _create_settings_separator("QuickChatSeparator")
 	vbox.add_child(quick_chat_separator)
 
+	var disable_custom_quick_chat = CheckButton.new()
+	disable_custom_quick_chat.name = "DisableCustomQuickChatButton"
+	disable_custom_quick_chat.text = _txt("BROTATO_ONLINE_QUICK_CHAT_DISABLE_CUSTOM")
+	disable_custom_quick_chat.pressed = _disable_custom_quick_chat_enabled
+	disable_custom_quick_chat.rect_min_size = Vector2(0, 58)
+	disable_custom_quick_chat.focus_mode = Control.FOCUS_ALL
+	disable_custom_quick_chat.mouse_filter = Control.MOUSE_FILTER_STOP
+	disable_custom_quick_chat.align = 0
+	_configure_option_check_button(disable_custom_quick_chat)
+	vbox.add_child(disable_custom_quick_chat)
+	var _disable_custom_quick_chat_err = disable_custom_quick_chat.connect("toggled", self, "_on_disable_custom_quick_chat_toggled")
+	_disable_custom_quick_chat_button = disable_custom_quick_chat
+	_connect_runtime_mouse_focus(_disable_custom_quick_chat_button)
+
 	var quick_chat_toggle = Button.new()
 	quick_chat_toggle.name = "QuickChatCustomizeToggle"
 	quick_chat_toggle.toggle_mode = true
@@ -661,8 +700,10 @@ func _ensure_settings_overlay(title_screen: Node) -> void:
 		check.focus_neighbour_top = check.get_path_to(_input_device_option_button)
 	else:
 		check.focus_neighbour_top = check.get_path_to(back_button)
-	check.focus_neighbour_bottom = check.get_path_to(quick_chat_toggle)
-	quick_chat_toggle.focus_neighbour_top = quick_chat_toggle.get_path_to(check)
+	check.focus_neighbour_bottom = check.get_path_to(disable_custom_quick_chat)
+	disable_custom_quick_chat.focus_neighbour_top = disable_custom_quick_chat.get_path_to(check)
+	disable_custom_quick_chat.focus_neighbour_bottom = disable_custom_quick_chat.get_path_to(quick_chat_toggle)
+	quick_chat_toggle.focus_neighbour_top = quick_chat_toggle.get_path_to(disable_custom_quick_chat)
 	quick_chat_toggle.focus_neighbour_bottom = quick_chat_toggle.get_path_to(back_button)
 	back_button.focus_neighbour_top = back_button.get_path_to(quick_chat_toggle)
 	if _input_device_option_button != null and is_instance_valid(_input_device_option_button):
@@ -917,6 +958,8 @@ func _refresh_localized_texts() -> void:
 		_input_device_label.text = _txt("BROTATO_ONLINE_INPUT_DEVICE")
 	if _input_device_description_label != null and is_instance_valid(_input_device_description_label):
 		_input_device_description_label.text = _txt("BROTATO_ONLINE_INPUT_DEVICE_DESC")
+	if _disable_custom_quick_chat_button != null and is_instance_valid(_disable_custom_quick_chat_button):
+		_disable_custom_quick_chat_button.text = _txt("BROTATO_ONLINE_QUICK_CHAT_DISABLE_CUSTOM")
 	if _quick_chat_customize_toggle != null and is_instance_valid(_quick_chat_customize_toggle):
 		var arrow = "▼ " if _quick_chat_customize_toggle.pressed else "▶ "
 		_quick_chat_customize_toggle.text = arrow + _txt("BROTATO_ONLINE_QUICK_CHAT_CUSTOM_TITLE")
@@ -933,6 +976,10 @@ func _refresh_localized_texts() -> void:
 func _quick_chat_original_text(option_id: String) -> String:
 	var key = str(QUICK_CHAT_TRANSLATION_KEYS.get(option_id, ""))
 	return _txt(key) if key != "" else ""
+
+
+func _on_disable_custom_quick_chat_toggled(button_pressed: bool) -> void:
+	set_disable_custom_quick_chat_enabled(button_pressed)
 
 
 func _on_quick_chat_customize_toggled(button_pressed: bool) -> void:
@@ -1123,6 +1170,8 @@ func _open_settings_overlay() -> void:
 	_refresh_input_device_options(true)
 	if _local_outline_button != null and is_instance_valid(_local_outline_button):
 		_local_outline_button.set_pressed_no_signal(_local_character_outline_enabled)
+	if _disable_custom_quick_chat_button != null and is_instance_valid(_disable_custom_quick_chat_button):
+		_disable_custom_quick_chat_button.set_pressed_no_signal(_disable_custom_quick_chat_enabled)
 	for option_id in _quick_chat_editors.keys():
 		var editor = _quick_chat_editors.get(option_id, null)
 		if editor != null and is_instance_valid(editor):

@@ -156,6 +156,8 @@ func _process(_delta: float) -> void:
 func receive_remote_quick_chat(message: Dictionary) -> void:
 	if typeof(message) != TYPE_DICTIONARY or message.empty():
 		return
+	if _custom_quick_chat_disabled() and _is_custom_literal_message(message):
+		return
 	var key = _quick_chat_key(message)
 	if key != "" and _seen_chat_keys.has(key):
 		return
@@ -545,6 +547,8 @@ func _build_bubble(holder: Control, bubble_w: int, bubble_h: int, text: String) 
 
 
 func _resolve_message_text(message: Dictionary) -> String:
+	if _custom_quick_chat_disabled() and _is_custom_literal_message(message):
+		return ""
 	var id = str(message.get("quick_chat_id", ""))
 	if id != "":
 		var text_by_id = _option_text_by_id(id)
@@ -786,6 +790,8 @@ func _option_text_by_index(index: int) -> String:
 
 
 func _custom_option_text_by_id(id: String) -> String:
+	if _custom_quick_chat_disabled():
+		return ""
 	var parent = get_parent()
 	if parent == null:
 		return ""
@@ -793,6 +799,21 @@ func _custom_option_text_by_id(id: String) -> String:
 	if settings != null and settings.has_method("get_custom_quick_chat_text"):
 		return str(settings.call("get_custom_quick_chat_text", id)).strip_edges()
 	return ""
+
+
+func _custom_quick_chat_disabled() -> bool:
+	var parent = get_parent()
+	if parent == null:
+		return false
+	var settings = parent.get_node_or_null("BrotatoOnlineModSettingsManager")
+	if settings != null and settings.has_method("get_disable_custom_quick_chat_enabled"):
+		return bool(settings.call("get_disable_custom_quick_chat_enabled"))
+	return false
+
+
+func _is_custom_literal_message(message: Dictionary) -> bool:
+	var id = str(message.get("quick_chat_id", ""))
+	return id == "" or not OPTION_IDS.has(id)
 
 
 func _option_text_by_id(id: String) -> String:

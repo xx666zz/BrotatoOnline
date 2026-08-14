@@ -2743,6 +2743,8 @@ func send_battle_message_to_host(message: Dictionary, reliable: bool = true) -> 
 func send_or_broadcast_quick_chat(message: Dictionary) -> bool:
 	if not _session_active:
 		return false
+	if _local_custom_quick_chat_disabled() and str(message.get("quick_chat_id", "")) == "":
+		return false
 	var wire = _sanitize_quick_chat_wire_message(message.duplicate(true))
 	wire["msg_type"] = "quick_chat"
 	if not wire.has("origin_steam_id") or str(wire.get("origin_steam_id", "")) == "":
@@ -8858,6 +8860,16 @@ func _get_quick_chat_manager() -> Node:
 	if parent == null:
 		return null
 	return parent.get_node_or_null("BrotatoOnlineQuickChatWheel")
+
+
+func _local_custom_quick_chat_disabled() -> bool:
+	var parent = get_parent()
+	if parent == null:
+		return false
+	var settings = parent.get_node_or_null("BrotatoOnlineModSettingsManager")
+	if settings != null and settings.has_method("get_disable_custom_quick_chat_enabled"):
+		return bool(settings.call("get_disable_custom_quick_chat_enabled"))
+	return false
 
 
 func _get_state_snapshot_manager() -> Node:

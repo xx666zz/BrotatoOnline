@@ -2,114 +2,181 @@
 
 [简体中文](README.md) | **English**
 
-Brotato Online is a mod that adds remote multiplayer support to *Brotato*.
+> Remote and LAN multiplayer support for *Brotato*, using a host-led hybrid synchronization model.
 
-The mod uses Steam lobbies and network synchronization to allow players to play together with their Steam friends. It synchronizes character selection, weapon selection, menu flow, combat state, player input, and selected combat events. It also provides multiplayer lobbies, Steam friend invitations, a quick-chat wheel, local-player outlines, and other online features.
+![Brotato](https://img.shields.io/badge/Brotato-1.1.15.4-6c5ce7)
+![ModLoader](https://img.shields.io/badge/ModLoader-6.2.0-0984e3)
+![Players](https://img.shields.io/badge/Players-1--4-00b894)
+![License](https://img.shields.io/badge/License-GPL--3.0-f39c12)
+
+Brotato Online is a mod that adds multiplayer support to *Brotato*. It currently supports Steam friend lobbies, Steam public lobbies, and LAN sessions while synchronizing the main flow from character and weapon selection through combat, upgrades, shops, and continued runs.
+
+The goal is not to replace Brotato's original co-op flow with a completely different multiplayer mode. Instead, the project tries to preserve the vanilla co-op experience and mod compatibility while allowing players on different machines to share the same run.
+
+## Usage
+
+### Steam
+
+1. Install and enable Brotato Online for every player.
+2. The host creates a lobby in-game.
+3. Invite friends through Steam or make the lobby public.
+4. Clients join through the Steam invite or the in-game lobby browser.
+5. Once everyone is in the same session, use the normal co-op character, weapon, and run flow.
+
+### LAN
+
+LAN sessions can be used directly without Steam lobby discovery.
+
+- Prefer automatic LAN discovery in the lobby browser.
+- If broadcast discovery is unavailable, use **Direct Connect (LAN)** with the host IP and port.
+- The default game port is `27462`; LAN discovery uses `27463`.
+
+> Steam public lobbies and discovered LAN rooms appear in the same lobby browser.
 
 ## Features
 
-- Steam friend multiplayer support
+### Sessions and lobbies
 
-- Synchronization of character selection, weapon selection, difficulty, zone, and overall game flow
+- Up to 4 players
+- Steam friend lobbies and friend invitations
+- Steam public lobby browser
+- Public lobby host, player count, phase, and latency display
+- View the host's loaded mod list before joining
+- Automatic LAN lobby discovery
+- Manual LAN connection by IP and port
+- Shared session logic across Steam and LAN transports
+- Clear errors for version/protocol mismatch, full rooms, stale lobbies, and other join failures
 
-- Synchronization of player input, health, enemies, pickups, and important combat states
+### Game-flow synchronization
 
-- Multiplayer lobby creation and restoration when continuing a saved run
+- Character and weapon selection
+- Difficulty, zone, and run configuration
+- Game start and scene transitions
+- Wave progression and important combat state
+- Player HP, death, and failed-wave flow
+- Upgrades, item boxes, and shop progression
+- Ready/cancel-ready and other online menu actions
+- Continuing vanilla co-op saves
+- Reserved in-run slots and reconnect flow for continued runs
 
-- Quick-chat wheel support
+### Combat synchronization
 
-- Optional outline for locally controlled characters, making it easier to identify which character you control
+Brotato Online is not a fully host-authoritative simulation. Different kinds of state use different synchronization strategies. The Host leads shared progression and critical state, while Clients still simulate substantial parts of the game locally so Brotato's original logic can be reused without replicating everything at high frequency.
 
-- A simple API that allows other mods to access Brotato Online multiplayer state and network messaging
+### Multiplayer UX
+
+- Quick-chat wheel
+- Custom quick-chat phrases, up to 20 characters each
+- Option to disable custom quick chat and accept only built-in phrases
+- Selectable local multiplayer input device
+- Keyboard/mouse and gamepad support
+- Optional outline for locally controlled characters
+- Safe return to the main menu when the host disconnects unexpectedly
+- Chinese and English UI text
 
 ## Installation
 
-Subscribe to the mod through the Steam Workshop.
+### Steam Workshop
 
-## Basic Synchronization Model
+If you use the Workshop build, subscribe to Brotato Online and enable it in ModLoader.
 
-Brotato Online uses a host-authoritative networking model.
+### Manual/development build
 
-In general:
+Install the project as a ModLoader-compatible Godot mod and keep the expected mod directory name:
 
-- The host controls the main game flow, wave progression, important combat state, and final results.
-
-- Clients handle local input, selected presentation-layer prediction, and remote state display.
-
-- During menu phases, the host broadcasts the current selections, page state, and run configuration.
-
-- During combat, clients are kept synchronized through snapshots, events, and compatibility patches where necessary.
-
-- Third-party mods should avoid executing logic on clients that directly changes authoritative gameplay results.
-
-Third-party mods are encouraged to follow this pattern:
-
-```gdscript
-if bo_api == null or bo_api.should_run_authoritative_logic():
-    # Run real gameplay logic offline or on the host
-    run_real_gameplay_logic()
-else:
-    # Clients should only run local visuals, requests, or UI logic
-    run_client_visual_or_request_logic()
+```text
+six666-BrotatoOnline
 ```
 
-## Project Structure
+Current compatibility:
+
+| Component                       | Version    |
+| ------------------------------- | ---------- |
+| Brotato                         | `1.1.15.4` |
+| ModLoader                       | `6.2.0`    |
+| Brotato Online network protocol | `4.0.0`    |
+| Maximum players                 | `4`        |
+
+## Network Architecture
+
+```mermaid
+flowchart TD
+    A[Steam Lobby / SteamNetworkingMessages] --> S[SessionManager]
+    B[LAN Discovery / ENet] --> S
+
+    S --> M[MenuSyncManager]
+    S --> I[OnlineInputManager]
+    S --> R[BattleReplicaManager]
+
+    M --> G[Vanilla Brotato co-op flow]
+    I --> G
+    R --> G
+
+    S --> API[BrotatoOnlineAPI]
+    API --> MOD[Third-party mods]
+```
+
+The central rule is simple: **SessionManager owns session state, Host/Client roles, and message routing; Steam/LAN only provide transport; menu, input, and combat each use synchronization suited to their own state.**
+
+This keeps gameplay logic independent from a single networking backend and allows combat synchronization to evolve without rewriting lobby/session handling.
+
+## Main Modules
 
 ```text
 six666-BrotatoOnline/
 ├─ manifest.json
 ├─ mod_main.gd
 ├─ scripts/
-│  ├─ steam_lobby_manager.gd
+│  ├─ session_manager.gd
+│  ├─ steam_transport.gd
+│  ├─ lan_transport.gd
+│  ├─ lan_discovery.gd
+│  ├─ public_lobby_browser.gd
 │  ├─ menu_sync_manager.gd
 │  ├─ online_player_slot_manager.gd
 │  ├─ online_input_manager.gd
 │  ├─ battle_replica_manager.gd
 │  ├─ state_snapshot.gd
-│  ├─ net_id_registry.gd
-│  ├─ runtime_locator.gd
+│  ├─ upgrade_runtime_sync.gd
 │  ├─ online_mod_settings_manager.gd
 │  ├─ quick_chat_wheel.gd
-│  └─ brotato_online_api.gd
-├─ extensions/
-│  ├─ main_safe_pool_exit.gd
-│  ├─ entity_spawner_online_player_count_guard.gd
-│  ├─ player_local_outline.gd
-│  ├─ player_safe_room_cleanup.gd
-│  ├─ stats_manager_safe_queues.gd
+│  ├─ brotato_online_api.gd
 │  └─ ...
+├─ extensions/
+│  └─ ...
+├─ docs/
+│  ├─ API.md
+│  └─ API.en.md
 └─ translations/
-   ├─ brotato_online_en.txt
-   └─ brotato_online_zh.txt
+   ├─ brotato_online_zh.txt
+   └─ brotato_online_en.txt
 ```
 
-Main modules:
+| Module                           | Role                                                                                         |
+| -------------------------------- | -------------------------------------------------------------------------------------------- |
+| `session_manager.gd`             | Session ownership, host/client roles, connections, disconnect/reconnect, and message routing |
+| `steam_transport.gd`             | Steam lobby callbacks and SteamNetworkingMessages transport                                  |
+| `lan_transport.gd`               | LAN/ENet connections and data transport                                                      |
+| `lan_discovery.gd`               | LAN lobby broadcast discovery                                                                |
+| `public_lobby_browser.gd`        | Steam public lobbies, LAN rooms, latency probing, and host mod information                   |
+| `menu_sync_manager.gd`           | Character, weapon, upgrade, shop, and other menu-phase synchronization                       |
+| `online_player_slot_manager.gd`  | Player slots, remote placeholders, and input-device mapping                                  |
+| `online_input_manager.gd`        | Client input capture and host-side input application                                         |
+| `battle_replica_manager.gd`      | Client combat-state application, entity presentation, and battle-end coordination            |
+| `state_snapshot.gd`              | Host combat snapshots, important state, and event serialization                              |
+| `upgrade_runtime_sync.gd`        | Runtime upgrade-state synchronization                                                        |
+| `online_mod_settings_manager.gd` | Input device, player outline, quick-chat, and multiplayer settings                           |
+| `brotato_online_api.gd`          | Stable integration API for third-party mods                                                  |
 
-| Module                           | Description                                                                                           |
-| -------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `steam_lobby_manager.gd`         | Manages Steam lobbies, P2P messages, joining, invitations, and host/client state                      |
-| `menu_sync_manager.gd`           | Synchronizes character selection, weapon selection, difficulty, shops, upgrades, and other menu flows |
-| `online_player_slot_manager.gd`  | Manages local players, remote player placeholders, player indices, and input-device mappings          |
-| `online_input_manager.gd`        | Captures client input and applies it on the host                                                      |
-| `battle_replica_manager.gd`      | Synchronizes combat entities, players, enemies, pickups, and presentation events                      |
-| `state_snapshot.gd`              | Builds and applies combat-state snapshots                                                             |
-| `net_id_registry.gd`             | Manages network IDs for runtime entities                                                              |
-| `runtime_locator.gd`             | Locates runtime nodes in the active game scene                                                        |
-| `online_mod_settings_manager.gd` | Manages Brotato Online settings and local display options                                             |
-| `quick_chat_wheel.gd`            | Implements the quick-chat wheel                                                                       |
-| `brotato_online_api.gd`          | Exposes a simplified API to third-party mods                                                          |
+Scripts under `extensions/` handle vanilla edge cases exposed by cross-machine multiplayer, including invalid node access, player-count differences, scene exit, shop interaction, pause-menu focus, and combat cleanup timing.
 
-Scripts in the `extensions/` directory mainly patch edge cases in the original game logic that become problematic in multiplayer. These include prematurely freed objects, inconsistent player counts, client-side room cleanup, and delayed queues referencing invalid nodes.
+## Third-party Mod API
 
-## Developer API
+Brotato Online exposes a public API so other mods do not need to depend on internal manager nodes.
 
-Brotato Online provides a simple API that allows other mods to determine whether the game is currently online, whether the local machine is the host, whether a player belongs to the local machine, and to send custom network messages.
+Full documentation: [`docs/API.en.md`](docs/API.en.md)
 
-The complete API documentation is available here:
-
-- [Brotato Online API Documentation](docs/API.en.md)
-
-Minimal setup:
+### Get the API
 
 ```gdscript
 var bo_api = null
@@ -120,48 +187,57 @@ func _ready():
         bo_api = apis[0]
 ```
 
-If `bo_api == null`, Brotato Online is not enabled. Other mods should then continue using their normal offline behavior.
+### Helper for one-owner gameplay logic in third-party mods
 
-## Network Messaging Guidelines
+```gdscript
+if bo_api == null or bo_api.should_run_authoritative_logic():
+    # Offline or host: mutate the real game state
+    run_gameplay_logic()
+else:
+    # Client: local visuals/UI or a request to the host only
+    run_client_visual_logic()
+```
 
-When sending messages through the Brotato Online API, third-party mods should follow these conventions:
+The API also exposes:
 
-- Use a stable and unique string for `mod_id`, such as `"author_mod_name"`.
+- Online/host/client state
+- Current multiplayer phase and context
+- Local player indices and ownership checks
+- Client-to-host custom messages
+- Host broadcast and per-player messages
+- Phase, slot-layout, and third-party message events
 
-- Use short strings for `route` to distinguish message types, such as `"request_spawn"`, `"sync_state"`, or `"play_fx"`.
+`should_run_authoritative_logic()` is a safe default helper for third-party mods: if custom logic changes shared game state and must only run once, it should usually run offline or on the Host. The function name does **not** mean that all internal Brotato Online combat simulation is host-authoritative.
 
-- Include only necessary data in `payload`. Avoid sending large objects, node references, or non-serializable values.
+Third-party mods should use `BrotatoOnlineAPI` instead of reaching into Brotato Online's internal managers directly.
 
-- Use `scope = "battle"` for combat-related messages.
+## Mod Compatibility
 
-- Use `scope = "menu"` for menu or settings synchronization.
+Brotato Online tries to preserve vanilla co-op behavior, but online play requires a clear separation between host and client responsibilities.
 
-- Use reliable delivery for important state changes.
+Mods that are usually easier to support:
 
-- High-frequency presentation events may use unreliable delivery.
+- Content mods that only add characters, weapons, or similar data and are installed by all players
+- Content additions that do not replace vanilla online menus or critical synchronization flows
+- Mods that explicitly integrate through the Brotato Online API
 
-Third-party mods should not directly access Brotato Online's internal manager nodes. Use the interfaces exposed by `BrotatoOnlineAPI` whenever possible.
+Mods that are more likely to conflict:
 
-## Compatibility
+- Mods that alter character selection, weapon selection, upgrades, shops, or other UI interactions; button presses, focus, and page state may no longer synchronize correctly between host and clients
+- Heavy rewrites of enemies, shops, upgrades, battle-end logic, or scene transitions
+- Replacing vanilla co-op player slots or input mapping
 
-- Game version: Brotato 1.1.15.4
+Adding new content and replacing an existing flow are very different compatibility cases. A newly added character or weapon can usually reuse Brotato Online's existing selection and synchronization path. A UI mod, however, may replace buttons, focus handling, or page-transition logic and can therefore break synchronized clicks even when it looks purely cosmetic.
 
-- ModLoader version: 6.2.0
-
-- Multiplayer platform: Steam
-
-## Compatibility Notes
-
-Brotato Online applies several runtime extensions to the original game flow. Compatibility with other mods therefore depends on which parts of the game those mods modify.
+The public lobby browser can show the host's mod list before joining, but **matching mod lists do not guarantee compatibility, and different mod lists do not automatically mean the session cannot work**. Compatibility depends on what those mods actually change. 
 
 ## Documentation
 
-- README.md: Chinese project overview, developer integration entry point, and compatibility information
+- [`README.md`](README.md): 中文README
+- [`docs/API.md`](docs/API.md): Chinese API documentation
+- [`docs/API.en.md`](docs/API.en.md): English API documentation
+- [`scripts/brotato_online_api.gd`](scripts/brotato_online_api.gd): API implementation exposed to other mods
 
-- README.en.md: English project overview
+## License
 
-- docs/API.md: Complete Chinese Brotato Online API documentation
-
-- docs/API.en.md: Complete English Brotato Online API documentation
-
-- scripts/brotato_online_api.gd: API node exposed to third-party mods
+This project is licensed under the [GNU General Public License v3.0](LICENSE).

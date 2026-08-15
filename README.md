@@ -2,116 +2,181 @@
 
 **简体中文** | [English](README.en.md)
 
-Brotato Online 是一个为《Brotato》添加远程联机支持的模组。
+> 为《Brotato》提供远程联机与局域网联机支持，采用Host主导的混合同步方案。
 
-该模组通过 Steam 大厅和网络同步，让玩家可以和 Steam 好友一起进行游戏。它会同步选人、选武器、菜单流程、战斗状态、玩家输入、部分战斗事件，并提供联机大厅、好友邀请、快捷聊天、本机角色描边等功能。
+![Brotato](https://img.shields.io/badge/Brotato-1.1.15.4-6c5ce7)
+![ModLoader](https://img.shields.io/badge/ModLoader-6.2.0-0984e3)
+![Players](https://img.shields.io/badge/Players-1--4-00b894)
+![License](https://img.shields.io/badge/License-GPL--3.0-f39c12)
+
+Brotato Online是一个为《土豆兄弟》添加多人联机支持的Mod。目前支持Steam好友大厅、Steam公共大厅和LAN联机，并同步从角色选择、武器选择、难度选择到战斗、升级、商店和继续游戏的主要流程。
+
+项目目标在尽量保留原版合作流程和Mod兼容性的前提下，让不同机器上的玩家共享同一局游戏。
+
+## 如何使用
+
+### Steam联机
+
+1. 所有玩家安装并启用Brotato Online。
+2. 房主在游戏内创建大厅。
+3. 通过Steam邀请好友，或将大厅设为公开。
+4. Client通过Steam邀请或“加入大厅”进入房间。
+5. 所有人进入同一联机会话后，按正常合作模式进行角色、武器和游戏流程选择。
+
+### LAN联机
+
+同一局域网内可以直接使用LAN模式，不依赖Steam大厅发现。
+
+- 优先使用大厅列表中的LAN自动发现房间；
+- 如果广播发现不可用，可使用“IP直连（LAN）”输入房主IP和端口；
+- 默认游戏端口为`27462`，LAN发现使用`27463`。
+
+> 公共大厅和LAN大厅会显示在同一个大厅浏览界面中。
 
 ## 功能
 
-- 支持 Steam 好友联机
+### 联机与大厅
 
-- 同步角色选择、武器选择、难度、区域和游戏流程
+- 最多支持4名玩家联机
+- Steam好友大厅与好友邀请
+- Steam公共大厅浏览
+- 公共大厅显示房主、人数、游戏阶段和延迟
+- 加入前查看房主加载的Mod列表
+- LAN房间自动发现
+- LAN手动IP+端口直连
+- Steam与LAN共用同一套游戏会话逻辑
+- 协议/版本不兼容、房间已满、房间失效等情况提供明确提示
 
-- 同步战斗中的玩家输入、血量、敌人、掉落物和关键状态
+### 游戏流程同步
 
-- 支持继续游戏时创建或恢复联机大厅
+- 角色选择与武器选择
+- 难度、区域和Run配置
+- 游戏开始与场景切换
+- 战斗波次与关键战斗状态
+- 玩家血量、死亡与失败流程
+- 升级选择、物品箱和商店流程
+- 准备/取消准备等联机菜单操作
+- 原版合作存档继续游戏
+- 运行中断线槽位保留与继续游戏重连流程
 
-- 支持快捷聊天轮盘
+### 战斗同步
 
-- 支持本机控制角色描边，方便区分自己控制的角色
+Brotato Online并不是完整的Host权威模拟，而是根据不同状态采用不同同步策略。整体上由Host主导共享流程和关键状态，同时保留Client本地模拟，以尽量复用Brotato原版逻辑并降低同步开销。
 
-- 提供简单 API，方便其他模组接入 Brotato Online 的联机状态和网络消息系统
+### 联机体验
+
+- 快捷聊天轮盘
+- 支持自定义快捷用语，单条最多20个字符
+- 可禁用自定义快捷用语，只接收原版快捷用语
+- 可选择本机联机输入设备
+- 支持键鼠和手柄
+- 可为本机控制角色添加描边，方便多人战斗时识别
+- 主机异常断开时，Client会安全结束当前联机会话并返回主菜单
+- 中英文界面文本
 
 ## 安装
 
-在 Steam 创意工坊中订阅。
+### Steam创意工坊
 
-## 基本同步模型
+如果使用创意工坊版本，订阅Brotato Online并在ModLoader中启用即可。
 
-Brotato Online 使用 Host 权威模型。
+### 手动安装/开发版本
 
-通常情况下：
+将项目作为ModLoader可识别的Godot Mod安装，并确保目录名与Mod标识保持一致：
 
-- Host 负责主要游戏流程、波次推进、关键战斗状态和最终结果；
-
-- Client 负责本地输入、部分表现层预测和远程状态展示；
-
-- 菜单阶段由 Host 广播当前选择、页面状态和运行配置；
-
-- 战斗阶段通过快照、事件和必要的兼容补丁维持客户端状态；
-
-- 第三方模组应避免在 Client 上直接执行会改变真实游戏结果的逻辑。
-
-对于第三方模组，建议遵循以下原则：
-
-```gdscript
-if bo_api == null or bo_api.should_run_authoritative_logic():
-    # 离线或 Host 执行真实逻辑
-    run_real_gameplay_logic()
-else:
-    # Client 只执行本地表现、请求或 UI 逻辑
-    run_client_visual_or_request_logic()
+```text
+six666-BrotatoOnline
 ```
 
-## 项目结构
+当前兼容版本：
+
+| 项目                 | 版本         |
+| ------------------ | ---------- |
+| Brotato            | `1.1.15.4` |
+| ModLoader          | `6.2.0`    |
+| Brotato Online网络协议 | `4.0.0`    |
+| 最大玩家数              | `4`        |
+
+## 网络架构
+
+```mermaid
+flowchart TD
+    A[Steam Lobby / SteamNetworkingMessages] --> S[SessionManager]
+    B[LAN Discovery / ENet] --> S
+
+    S --> M[MenuSyncManager]
+    S --> I[OnlineInputManager]
+    S --> R[BattleReplicaManager]
+
+    M --> G[Brotato原版合作流程]
+    I --> G
+    R --> G
+
+    S --> API[BrotatoOnlineAPI]
+    API --> MOD[第三方Mod]
+```
+
+核心原则：**SessionManager负责会话、Host/Client角色和消息路由，Steam/LAN只负责传输；菜单、输入和战斗分别采用适合自身状态的同步方式。**
+
+这样可以避免把游戏逻辑绑定到单一网络后端，也方便后续继续调整战斗同步而不影响大厅与连接层。
+
+## 主要模块
 
 ```text
 six666-BrotatoOnline/
 ├─ manifest.json
 ├─ mod_main.gd
 ├─ scripts/
-│  ├─ steam_lobby_manager.gd
+│  ├─ session_manager.gd
+│  ├─ steam_transport.gd
+│  ├─ lan_transport.gd
+│  ├─ lan_discovery.gd
+│  ├─ public_lobby_browser.gd
 │  ├─ menu_sync_manager.gd
 │  ├─ online_player_slot_manager.gd
 │  ├─ online_input_manager.gd
 │  ├─ battle_replica_manager.gd
 │  ├─ state_snapshot.gd
-│  ├─ net_id_registry.gd
-│  ├─ runtime_locator.gd
+│  ├─ upgrade_runtime_sync.gd
 │  ├─ online_mod_settings_manager.gd
 │  ├─ quick_chat_wheel.gd
-│  └─ brotato_online_api.gd
-├─ extensions/
-│  ├─ main_safe_pool_exit.gd
-│  ├─ entity_spawner_online_player_count_guard.gd
-│  ├─ player_local_outline.gd
-│  ├─ player_safe_room_cleanup.gd
-│  ├─ stats_manager_safe_queues.gd
+│  ├─ brotato_online_api.gd
 │  └─ ...
+├─ extensions/
+│  └─ ...
+├─ docs/
+│  ├─ API.md
+│  └─ API.en.md
 └─ translations/
-   ├─ brotato_online_en.txt
-   └─ brotato_online_zh.txt
+   ├─ brotato_online_zh.txt
+   └─ brotato_online_en.txt
 ```
 
-主要模块说明：
-
-| 模块                               | 说明                                     |
+| 模块                               | 作用                                     |
 | -------------------------------- | -------------------------------------- |
-| `steam_lobby_manager.gd`         | Steam 大厅、P2P 消息、加入/邀请、Host/Client 状态管理 |
-| `menu_sync_manager.gd`           | 选人、选武器、难度、商店、升级等菜单流程同步                 |
-| `online_player_slot_manager.gd`  | 本地玩家、远程玩家占位、玩家索引和输入设备映射                |
-| `online_input_manager.gd`        | 客户端输入采集和 Host 侧输入应用                    |
-| `battle_replica_manager.gd`      | 战斗内实体、玩家、敌人、掉落物和表现事件同步                 |
-| `state_snapshot.gd`              | 战斗状态快照构建和应用                            |
-| `net_id_registry.gd`             | 运行时实体网络 ID 管理                          |
-| `runtime_locator.gd`             | 查找当前游戏场景中的运行时节点                        |
-| `online_mod_settings_manager.gd` | Brotato Online 设置项和本地显示选项              |
-| `quick_chat_wheel.gd`            | 快捷聊天轮盘                                 |
-| `brotato_online_api.gd`          | 对第三方模组暴露的简化 API                        |
+| `session_manager.gd`             | 统一管理联机会话、Host/Client角色、连接、断线、重连和网络消息路由 |
+| `steam_transport.gd`             | Steam大厅回调与SteamNetworkingMessages传输    |
+| `lan_transport.gd`               | LAN/ENet连接与数据传输                        |
+| `lan_discovery.gd`               | 局域网房间广播发现                              |
+| `public_lobby_browser.gd`        | Steam公共大厅、LAN房间、延迟测试和房主Mod信息界面         |
+| `menu_sync_manager.gd`           | 角色、武器、升级、商店等菜单阶段同步                     |
+| `online_player_slot_manager.gd`  | 玩家槽位、远程玩家占位和输入设备映射                     |
+| `online_input_manager.gd`        | Client输入采集与Host侧输入应用                   |
+| `battle_replica_manager.gd`      | Client战斗状态应用、实体表现和战斗结束流程协调             |
+| `state_snapshot.gd`              | Host战斗快照、关键状态和事件序列化                    |
+| `upgrade_runtime_sync.gd`        | 升级运行时状态同步                              |
+| `online_mod_settings_manager.gd` | 输入设备、角色描边、快捷用语等联机设置                    |
+| `brotato_online_api.gd`          | 面向第三方Mod的稳定联机API                       |
 
-`extensions/` 目录中的脚本主要用于修补原版逻辑在联机场景下的边界问题，例如对象提前释放、玩家数量不一致、客户端清理房间、延迟队列访问失效节点等。
+`extensions/`中的脚本用于处理原版逻辑在跨机器联机后出现的边界情况，例如失效节点访问、玩家数量差异、场景退出、商店交互、暂停菜单焦点和战斗清理时序。
 
-## 开发者 API
+## 第三方Mod API
 
-Brotato Online 提供了一个简单 API，供其他模组判断当前是否处于联机状态、当前机器是否为主机、某个玩家是否归属于本机，以及发送自定义网络消息。
+Brotato Online提供公开API，第三方Mod不需要直接依赖内部Manager。
 
-完整 API 文档见：
+完整文档：[`docs/API.md`](docs/API.md)
 
-```text
-docs/API.md
-```
-
-最小使用方式：
+### 获取API
 
 ```gdscript
 var bo_api = null
@@ -122,44 +187,58 @@ func _ready():
         bo_api = apis[0]
 ```
 
-如果 `bo_api == null`，说明 Brotato Online 没有启用，其他模组应按普通离线逻辑运行。
+### 第三方Mod的权威逻辑辅助判断
 
-## 网络消息建议
+```gdscript
+if bo_api == null or bo_api.should_run_authoritative_logic():
+    # 离线或Host：执行真正改变游戏结果的逻辑
+    run_gameplay_logic()
+else:
+    # Client：只执行本地表现、UI或向Host发送请求
+    run_client_visual_logic()
+```
 
-第三方模组通过 Brotato Online API 发送消息时，建议遵守以下约定：
+API还提供：
 
-- `mod_id` 使用稳定且唯一的字符串，例如 `"author_mod_name"`；
+- 当前是否联机，以及当前机器是Host还是Client
+- 当前联机阶段与上下文
+- 本机拥有的玩家索引
+- 判断某个玩家是否属于本机
+- Client向Host发送自定义消息
+- Host广播或向指定玩家发送消息
+- 阶段变化、槽位变化和第三方Mod消息事件
 
-- `route` 使用短字符串区分消息类型，例如 `"request_spawn"`、`"sync_state"`、`"play_fx"`；
+`should_run_authoritative_logic()`是给第三方Mod使用的安全默认判断：当某段自定义逻辑只能执行一次并会改变共享游戏状态时，通常应只在离线或Host执行。它并不表示Brotato Online内部所有战斗逻辑都采用Host权威模拟。
 
-- `payload` 只放必要数据，避免发送大型对象、节点引用或不可序列化内容；
+第三方Mod应优先通过`BrotatoOnlineAPI`接入，不要直接访问内部Manager节点。
 
-- 战斗内消息使用 `scope = "battle"`；
+## Mod兼容性
 
-- 菜单或设置同步使用 `scope = "menu"`；
+Brotato Online会尽量保留原版合作逻辑，但联机环境下仍需要区分Host与Client的职责。
 
-- 关键状态使用可靠发送；
+通常兼容性较好的Mod：
 
-- 高频表现事件可以使用非可靠发送。
+- 仅新增角色、武器等游戏内容，且联机双方都安装了对应Mod
+- 不改写原版联机菜单交互或关键同步流程的内容型Mod
+- 使用Brotato Online API显式适配联机的Mod
 
-不要依赖其他模组直接访问 Brotato Online 的内部 manager 节点。优先使用 `BrotatoOnlineAPI` 暴露的接口。
+更容易产生冲突的Mod：
 
-## 兼容性
+- 修改角色选择、武器选择、升级、商店等UI交互的Mod；按钮点击、焦点和页面状态可能无法在Host与Client之间正确同步
+- 大幅重写敌人、商店、升级、战斗结束或场景切换流程
+- 修改原版合作玩家槽位或输入映射
 
-- 游戏版本：Brotato 1.1.15.4
+单纯“新增内容”和“改写现有流程”是两类情况。比如新增角色或武器通常可以直接沿用现有选择与同步流程；而即使只是UI类Mod，只要替换了按钮、焦点或页面推进逻辑，也可能导致客户端点击无法同步。
 
-- ModLoader：6.2.0
-
-- 联机方式：Steam
-
-## 兼容性说明
-
-Brotato Online 对原版流程做了较多运行时扩展，因此与其他模组的兼容性取决于它们修改的范围。
+公共大厅可以在加入前查看房主的Mod列表，但**Mod列表一致不代表一定兼容，Mod列表不一致也不代表无法联机**。最终仍取决于相关Mod是否修改了需要同步的游戏逻辑。
 
 ## 文档
 
-- [`README.md`](README.md)：项目说明、开发者接入入口和兼容性说明；
-- [`README.en.md`](README.en.md)：英文项目说明；
-- [`docs/API.md`](docs/API.md)：完整 Brotato Online API 文档；
-- [`docs/API.en.md`](docs/API.en.md)：英文 API 文档；
-- [`scripts/brotato_online_api.gd`](scripts/brotato_online_api.gd)：实际暴露给第三方模组的 API 节点。
+- [`README.en.md`](README.en.md)：English README
+- [`docs/API.md`](docs/API.md)：中文API文档
+- [`docs/API.en.md`](docs/API.en.md)：English API documentation
+- [`scripts/brotato_online_api.gd`](scripts/brotato_online_api.gd)：实际暴露的API实现
+
+## License
+
+本项目使用[GNU General Public License v3.0](LICENSE)发布。

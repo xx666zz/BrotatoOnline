@@ -24,7 +24,6 @@ const LOBBY_LIST_RESULT_LIMIT = 50
 const LOBBY_LIST_AUTO_REFRESH_MSEC = 10000
 const LOBBY_LIST_REQUEST_TIMEOUT_MSEC = 8000
 const PUBLIC_JOIN_VERIFY_TIMEOUT_MSEC = 6000
-const HOST_METADATA_REFRESH_MSEC = 1000
 const UI_SCAN_INTERVAL_MSEC = 300
 const HOST_MODS_FORMAT_VERSION = "1"
 const HOST_MODS_LOBBY_MAX_PARTS = 24
@@ -41,7 +40,6 @@ const PING_PENDING_TTL_MSEC = 4000
 var _steam = null
 var _public_lobby_enabled = DEFAULT_PUBLIC_LOBBY_ENABLED
 var _last_ui_scan_msec = 0
-var _last_host_metadata_refresh_msec = 0
 
 var _main_menu_button = null
 var _main_menu_button_parent = null
@@ -80,14 +78,6 @@ var _mods_body_edit = null
 var _mods_close_button = null
 var _mods_return_focus = null
 
-# Lobby metadata writes are cached. Rewriting the same Steam lobby data every
-# second emits lobby_data_update callbacks; those callbacks used to rebuild the
-# host slot layout and flood clients with selection_state packets.
-var _published_lobby_id = 0
-var _published_lobby_metadata = {}
-var _published_lobby_joinable = null
-
-
 func _ready() -> void:
 	pause_mode = Node.PAUSE_MODE_PROCESS
 	_load_public_lobby_preference()
@@ -118,8 +108,6 @@ func _process(_delta: float) -> void:
 		_poll_character_public_toggle()
 		_refresh_localized_texts()
 		_update_public_toggle_state()
-
-	_poll_host_lobby_metadata(now)
 
 	if _overlay_open:
 		_poll_browser_ping_packets()
@@ -525,7 +513,6 @@ func _on_public_toggle_toggled(button_pressed: bool) -> void:
 	if _public_toggle_signal_guard:
 		return
 	_public_lobby_enabled = button_pressed
-	_reset_host_metadata_cache()
 	_save_public_lobby_preference()
 	_publish_public_lobby_preference()
 	_apply_public_preference_to_lobby_manager()
@@ -1586,95 +1573,6 @@ func _clear_ping_state() -> void:
 	_ping_label_by_lobby_id.clear()
 	_ping_state_by_lobby_id.clear()
 	_pending_ping_by_nonce.clear()
-
-
-func _reset_host_metadata_cache() -> void:
-	_published_lobby_id = 0
-	_published_lobby_metadata.clear()
-	_published_lobby_joinable = null
-
-
-func _set_lobby_data_if_changed(lobby_id: int, key: String, value: String) -> void:
-	if _published_lobby_metadata.has(key) and str(_published_lobby_metadata.get(key, "")) == value:
-		return
-	# _setup_lobby_data() already publishes the initial values. Seed the cache from
-	# Steam instead of writing the same value again on the browser's first poll.
-	if not _published_lobby_metadata.has(key) and _steam_has_method("getLobbyData"):
-		if str(_steam.getLobbyData(lobby_id, key)) == value:
-			_published_lobby_metadata[key] = value
-			return
-	_steam.setLobbyData(lobby_id, key, value)
-	_published_lobby_metadata[key] = value
-
-
-func _poll_host_lobby_metadata(now: int) -> void:
-	if now - _last_host_metadata_refresh_msec < HOST_METADATA_REFRESH_MSEC:
-		return
-	_last_host_metadata_refresh_msec = now
-	if _steam == null:
-		return
-
-	# Private/friends-only sessions keep the original code path. Public discovery
-	# must be dormant outside an explicitly public host lobby.
-	if not _public_lobby_enabled:
-		_reset_host_metadata_cache()
-		return
-
-	var manager = _get_session_manager()
-	if manager == null or not manager.has_method("get_lobby_id") or not manager.has_method("is_host"):
-		_reset_host_metadata_cache()
-		return
-	var lobby_id = int(manager.call("get_lobby_id"))
-	if lobby_id == 0 or not bool(manager.call("is_host")):
-		_reset_host_metadata_cache()
-		return
-	if not _steam_has_method("setLobbyData"):
-		return
-
-	if _published_lobby_id != lobby_id:
-		_reset_host_metadata_cache()
-		_published_lobby_id = lobby_id
-
-	var state = _detect_host_lobby_state()
-	var member_count = int(manager.call("get_session_member_count")) if manager.has_method("get_session_member_count") else 1
-
-	_set_lobby_data_if_changed(lobby_id, "state", state)
-	_set_lobby_data_if_changed(lobby_id, "member_count", str(member_count))
-	_set_lobby_data_if_changed(lobby_id, "member_limit", "4")
-	_set_lobby_data_if_changed(lobby_id, "visibility", "public")
-	if _steam_has_method("getPersonaName"):
-		var persona_name = str(_steam.getPersonaName()).strip_edges()
-		if persona_name.length() > 64:
-			persona_name = persona_name.substr(0, 64)
-		_set_lobby_data_if_changed(lobby_id, "host_name", persona_name)
-
-	if _steam_has_method("setLobbyJoinable"):
-		var joinable = member_count < 4 and (state == "character_selection" or state == "coop_resume")
-		if _published_lobby_joinable == null or bool(_published_lobby_joinable) != joinable:
-			_steam.setLobbyJoinable(lobby_id, joinable)
-			_published_lobby_joinable = joinable
-
-
-func _detect_host_lobby_state() -> String:
-	var tree = get_tree()
-	if tree == null or tree.current_scene == null:
-		return "busy"
-	var current = tree.current_scene
-	var filename = str(current.filename).to_lower()
-	var node_name = str(current.name).to_lower()
-	if filename.find("character_selection") != -1 or node_name.find("characterselection") != -1:
-		return "character_selection"
-	if filename.find("coop_resume") != -1 or node_name.find("coopresume") != -1 or node_name.find("coop_resume") != -1:
-		return "coop_resume"
-	if filename.find("weapon_selection") != -1 or node_name.find("weaponselection") != -1:
-		return "weapon_selection"
-	if filename.find("difficulty_selection") != -1 or node_name.find("difficultyselection") != -1:
-		return "difficulty_selection"
-	if filename.find("/shop") != -1 or filename.find("shop/") != -1 or node_name.find("shop") != -1:
-		return "shop"
-	if filename.find("main.tscn") != -1 or node_name == "main" or node_name.find("battle") != -1:
-		return "game"
-	return "busy"
 
 
 func _refresh_localized_texts() -> void:

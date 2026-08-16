@@ -12,10 +12,6 @@ var _prefix_by_net_id = {}
 var _last_seen_msec_by_net_id = {}
 
 
-func _ready() -> void:
-	pass
-
-
 func get_player_net_id(player_index: int) -> String:
 	return "player_%s" % str(player_index)
 
@@ -115,4 +111,3 @@ func reset() -> void:
 	_instance_by_net_id.clear()
 	_prefix_by_net_id.clear()
 	_last_seen_msec_by_net_id.clear()
-

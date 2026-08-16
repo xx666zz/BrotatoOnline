@@ -10,7 +10,6 @@ const RUN_PAGE_CONSUME_SCAN_INTERVAL_MSEC = 120
 const PROGRESSION_UI_RECURSIVE_SCAN_INTERVAL_MSEC = 1000
 const RUN_PAGE_GAME_START_GUARD_MSEC = 10000
 const MENU_SCENE_CHANGE_IN_FLIGHT_MSEC = 12000
-const SHOP_RUN_DATA_ITEMS_COMPACT_VERSION = 1
 const SHOP_RUN_DATA_ID_ONLY_VERSION = 1
 const SHOP_HELD_ITEMS_SYNC_COMPACT = "compact"
 const SHOP_HELD_ITEMS_SYNC_HASH_ONLY = "hash_only"
@@ -19,16 +18,9 @@ const ENDLESS_INCREMENTAL_ITEMS_ONLY_START_WAVE = 21
 const SHOP_ITEMS_RESYNC_REQUEST_COOLDOWN_MSEC = 1500
 const SHOP_CUSTOM_POPUP_BUTTON_ACTION = "shop_custom_popup_button"
 
-# ItemService.TierData indexes. The enum is internal to ItemService, so mirror only
-# the stable fields required to validate its unlocked pools before opening a shop.
-const ITEM_SERVICE_TIER_ITEMS = 1
-const ITEM_SERVICE_TIER_WEAPONS = 2
-const ITEM_SERVICE_TIER_CONSUMABLES = 3
-const ITEM_SERVICE_TIER_UPGRADES = 4
-
+# Routine polls, focus changes and screen changes stay silent. Log only a single
+# expensive call, repeated medium-cost calls, input storms or queue backlogs.
 const BO_UI_DIAG_ENABLED = true
-# Lag log policy: routine polls / focus / screen changes are silent.  Only a single
-# expensive call, repeated medium-cost calls, input storms, or backlog states are logged.
 const BO_UI_DIAG_SINGLE_COST_USEC = 10000
 const BO_UI_DIAG_BURST_COST_USEC = 3000
 const BO_UI_DIAG_BURST_TOTAL_USEC = 20000
@@ -38,9 +30,15 @@ const BO_UI_DIAG_INPUT_BURST_WINDOW_MSEC = 1000
 const BO_UI_DIAG_INPUT_BURST_COUNT = 18
 const BO_UI_DIAG_QUEUE_WARN_COUNT = 4
 
+# ItemService.TierData indexes. The enum is internal to ItemService, so mirror only
+# the stable fields required to validate its unlocked pools before opening a shop.
+const ITEM_SERVICE_TIER_ITEMS = 1
+const ITEM_SERVICE_TIER_WEAPONS = 2
+const ITEM_SERVICE_TIER_CONSUMABLES = 3
+const ITEM_SERVICE_TIER_UPGRADES = 4
+
 var _bo_ui_diag_last_screen = ""
 var _bo_ui_diag_last_focus_key = ""
-var _bo_ui_diag_input_count = 0
 var _bo_ui_diag_input_window_start_msec = 0
 var _bo_ui_diag_input_window_count = 0
 var _bo_ui_diag_last_input_summary = ""
@@ -182,57 +180,25 @@ var _shop_inventory_custom_button_descriptor_cache = {}
 var _property_exists_cache = {}
 
 func _bo_ui_diag_log(tag: String, msg: String) -> void:
-	if not BO_UI_DIAG_ENABLED:
-		return
-	print("[BO_LAG][UI][" + tag + "] " + msg)
+	if BO_UI_DIAG_ENABLED:
+		print("[BO_LAG][UI][" + tag + "] " + msg)
 
 
 func _bo_ui_diag_node_desc(node) -> String:
 	if not _is_live_ref(node):
 		return "null"
-	var node_name = ""
-	if node is Node:
-		node_name = str(node.name)
-	var cls = node.get_class() if node.has_method("get_class") else "Object"
-	return cls + "#" + str(node.get_instance_id()) + "(" + node_name + ")"
-
-
-func _bo_ui_diag_players_desc() -> String:
-	var parts = []
-	if CoopService == null:
-		return "no_coop"
-	for i in range(CoopService.connected_players.size()):
-		var p = CoopService.connected_players[i]
-		if typeof(p) == TYPE_ARRAY and p.size() >= 2:
-			parts.append("P" + str(i) + "{dev=" + str(p[0]) + ",type=" + str(p[1]) + "}")
-		else:
-			parts.append("P" + str(i) + "{" + str(p) + "}")
-	return "[" + ";".join(parts) + "]"
-
-
-func _bo_ui_diag_focus_key() -> String:
-	var parts = []
-	var count = int(max(4, int(RunData.get_player_count()))) if RunData != null and RunData.has_method("get_player_count") else 4
-	for player_index in range(count):
-		var fe = Utils.get_focus_emulator(player_index) if Utils != null else null
-		if not _is_live_ref(fe):
-			parts.append("P" + str(player_index) + "=null")
-			continue
-		var focused = _safe_get(fe, "focused_control", null)
-		var device = int(_safe_get(fe, "_device", -999))
-		var process_input = fe.is_processing_input() if fe.has_method("is_processing_input") else false
-		var visible = fe.visible if fe is CanvasItem else false
-		parts.append("P" + str(player_index) + "{dev=" + str(device) + ",in=" + str(process_input) + ",vis=" + str(visible) + ",focus=" + _bo_ui_diag_node_desc(focused) + "}")
-	return " | ".join(parts)
+	var node_name = str(node.name) if node is Node else ""
+	var node_class = node.get_class() if node.has_method("get_class") else "Object"
+	return node_class + "#" + str(node.get_instance_id()) + "(" + node_name + ")"
 
 
 func _bo_ui_diag_log_focus(reason: String, force: bool = false) -> void:
-	# Focus owner snapshots are expensive and noisy.  Keep this callable for existing
-	# call sites, but only emit when the focus layer is changing while a queue/backlog
-	# is already suspicious.
+	# Focus snapshots are expensive and noisy, so only build one while a queue is
+	# already suspicious.
 	if not BO_UI_DIAG_ENABLED:
 		return
-	var queued = _queued_local_client_menu_messages.size() + _queued_local_run_page_action_messages.size() + _pending_shop_states_from_host.size()
+	var sizes = _bo_ui_diag_queue_sizes()
+	var queued = int(sizes[0]) + int(sizes[1]) + int(sizes[2])
 	if queued < BO_UI_DIAG_QUEUE_WARN_COUNT:
 		return
 	var key = _bo_ui_diag_focus_key()
@@ -240,20 +206,6 @@ func _bo_ui_diag_log_focus(reason: String, force: bool = false) -> void:
 		return
 	_bo_ui_diag_last_focus_key = key
 	_bo_ui_diag_log("FOCUS_BACKLOG", "reason=" + reason + " queued=" + str(queued) + " screen=" + _get_current_menu_screen_fast() + " host=" + str(_is_game_host()) + " local_idx=" + str(_get_local_client_player_index()) + " run_players=" + str(_get_run_player_count()) + " coop=" + _bo_ui_diag_players_desc() + " fe=" + key)
-
-
-func _bo_ui_diag_extra_context(extra: String = "") -> String:
-	var parts = []
-	parts.append("screen=" + _get_current_menu_screen_fast())
-	parts.append("host=" + str(_is_game_host()))
-	parts.append("queued_menu=" + str(_queued_local_client_menu_messages.size()))
-	parts.append("queued_run=" + str(_queued_local_run_page_action_messages.size()))
-	parts.append("pending_shop=" + str(_pending_shop_states_from_host.size()))
-	if _bo_ui_diag_last_input_summary != "":
-		parts.append("last_input=" + _bo_ui_diag_last_input_summary)
-	if extra != "":
-		parts.append(extra)
-	return " ".join(parts)
 
 
 func _bo_ui_diag_log_cost(scope: String, start_usec: int, extra: String = "") -> void:
@@ -274,9 +226,7 @@ func _bo_ui_diag_log_cost(scope: String, start_usec: int, extra: String = "") ->
 	stats["max_usec"] = max(int(stats.get("max_usec", 0)), cost)
 	_bo_ui_diag_cost_stats_by_scope[scope] = stats
 	var should_log = int(stats.get("count", 0)) >= BO_UI_DIAG_BURST_COUNT or int(stats.get("total_usec", 0)) >= BO_UI_DIAG_BURST_TOTAL_USEC
-	if not should_log:
-		return
-	if now - int(stats.get("last_log_msec", 0)) < BO_UI_DIAG_BURST_WINDOW_MSEC:
+	if not should_log or now - int(stats.get("last_log_msec", 0)) < BO_UI_DIAG_BURST_WINDOW_MSEC:
 		return
 	stats["last_log_msec"] = now
 	_bo_ui_diag_cost_stats_by_scope[scope] = stats
@@ -284,9 +234,7 @@ func _bo_ui_diag_log_cost(scope: String, start_usec: int, extra: String = "") ->
 
 
 func _bo_ui_diag_log_input_event(event: InputEvent, source: String = "input") -> void:
-	if not BO_UI_DIAG_ENABLED:
-		return
-	if event == null:
+	if not BO_UI_DIAG_ENABLED or event == null:
 		return
 	var is_key = event is InputEventKey
 	var is_joy_button = event is InputEventJoypadButton
@@ -312,7 +260,6 @@ func _bo_ui_diag_log_input_event(event: InputEvent, source: String = "input") ->
 			hits.append(action)
 	if hits.empty() and is_joy_motion:
 		return
-	_bo_ui_diag_input_count += 1
 	var now = OS.get_ticks_msec()
 	if _bo_ui_diag_input_window_start_msec <= 0 or now - _bo_ui_diag_input_window_start_msec > BO_UI_DIAG_INPUT_BURST_WINDOW_MSEC:
 		_bo_ui_diag_input_window_start_msec = now
@@ -331,16 +278,76 @@ func _bo_ui_diag_process_tick(screen: String) -> void:
 		_bo_ui_diag_last_screen = screen
 		_bo_ui_diag_last_focus_key = ""
 		return
-	var now = OS.get_ticks_msec()
-	var queued = _queued_local_client_menu_messages.size() + _queued_local_run_page_action_messages.size() + _pending_shop_states_from_host.size()
+	var sizes = _bo_ui_diag_queue_sizes()
+	var queued = int(sizes[0]) + int(sizes[1]) + int(sizes[2])
 	if queued < BO_UI_DIAG_QUEUE_WARN_COUNT:
 		return
-	var key = screen + ":" + str(_queued_local_client_menu_messages.size()) + ":" + str(_queued_local_run_page_action_messages.size()) + ":" + str(_pending_shop_states_from_host.size())
+	var now = OS.get_ticks_msec()
+	var key = screen + ":" + str(sizes[0]) + ":" + str(sizes[1]) + ":" + str(sizes[2])
 	if key == _bo_ui_diag_last_queue_key and now - _bo_ui_diag_last_queue_log_msec < BO_UI_DIAG_BURST_WINDOW_MSEC:
 		return
 	_bo_ui_diag_last_queue_key = key
 	_bo_ui_diag_last_queue_log_msec = now
-	_bo_ui_diag_log("QUEUE", "screen=" + screen + " queued_menu=" + str(_queued_local_client_menu_messages.size()) + " queued_run=" + str(_queued_local_run_page_action_messages.size()) + " pending_shop=" + str(_pending_shop_states_from_host.size()) + " host=" + str(_is_game_host()))
+	_bo_ui_diag_log("QUEUE", "screen=" + screen + " queued_menu=" + str(sizes[0]) + " queued_run=" + str(sizes[1]) + " pending_shop=" + str(sizes[2]) + " host=" + str(_is_game_host()))
+
+
+func _bo_ui_diag_extra_context(extra: String) -> String:
+	var sizes = _bo_ui_diag_queue_sizes()
+	var parts = [
+		"screen=" + _get_current_menu_screen_fast(),
+		"host=" + str(_is_game_host()),
+		"queued_menu=" + str(sizes[0]),
+		"queued_run=" + str(sizes[1]),
+		"pending_shop=" + str(sizes[2])
+	]
+	if _bo_ui_diag_last_input_summary != "":
+		parts.append("last_input=" + _bo_ui_diag_last_input_summary)
+	if extra != "":
+		parts.append(extra)
+	return " ".join(parts)
+
+
+func _bo_ui_diag_focus_key() -> String:
+	var parts = []
+	var count = int(max(4, int(RunData.get_player_count()))) if RunData != null and RunData.has_method("get_player_count") else 4
+	for player_index in range(count):
+		var focus_emulator = Utils.get_focus_emulator(player_index) if Utils != null else null
+		if not _is_live_ref(focus_emulator):
+			parts.append("P" + str(player_index) + "=null")
+			continue
+		var focused = _safe_get(focus_emulator, "focused_control", null)
+		var device = int(_safe_get(focus_emulator, "_device", -999))
+		var process_input = focus_emulator.is_processing_input() if focus_emulator.has_method("is_processing_input") else false
+		var visible = focus_emulator.visible if focus_emulator is CanvasItem else false
+		parts.append("P" + str(player_index) + "{dev=" + str(device) + ",in=" + str(process_input) + ",vis=" + str(visible) + ",focus=" + _bo_ui_diag_node_desc(focused) + "}")
+	return " | ".join(parts)
+
+
+func _bo_ui_diag_players_desc() -> String:
+	var parts = []
+	if CoopService == null:
+		return "no_coop"
+	for i in range(CoopService.connected_players.size()):
+		var player = CoopService.connected_players[i]
+		if typeof(player) == TYPE_ARRAY and player.size() >= 2:
+			parts.append("P" + str(i) + "{dev=" + str(player[0]) + ",type=" + str(player[1]) + "}")
+		else:
+			parts.append("P" + str(i) + "{" + str(player) + "}")
+	return "[" + ";".join(parts) + "]"
+
+
+func _bo_ui_diag_queue_sizes() -> Array:
+	return [
+		_bo_ui_diag_collection_size(_queued_local_client_menu_messages),
+		_bo_ui_diag_collection_size(_queued_local_run_page_action_messages),
+		_bo_ui_diag_collection_size(_pending_shop_states_from_host)
+	]
+
+
+func _bo_ui_diag_collection_size(value) -> int:
+	if typeof(value) == TYPE_ARRAY or typeof(value) == TYPE_DICTIONARY:
+		return value.size()
+	return 0
 
 
 func _is_client_interactive_selection_screen(screen: String) -> bool:

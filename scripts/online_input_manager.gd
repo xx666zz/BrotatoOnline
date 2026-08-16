@@ -26,14 +26,7 @@ var _held_actions_by_player = {}
 
 
 func _ready() -> void:
-	set_process(true)
 	set_physics_process(true)
-
-
-func _process(_delta: float) -> void:
-	# 不在这里自动发包；SessionManager 统一选择 Steam 或 LAN Transport。
-	# SessionManager 每帧/定时调用 consume_local_battle_input_messages() 即可。
-	pass
 
 
 func _physics_process(_delta: float) -> void:

@@ -54,7 +54,6 @@ const P2P_JSON_CHUNK_SENDS_PER_FRAME = 1
 # When SteamNetworkingMessages refuses a reliable chunk because the send buffer is
 # full, keep the packet at the head of the queue and retry after a few frames.
 const P2P_JSON_CHUNK_RETRY_DELAY_MSEC = 100
-const P2P_JSON_CHUNK_RETRY_LOG_INTERVAL_MSEC = 1000
 const P2P_JSON_CHUNK_TTL_MSEC = 15000
 # Retry after 2s, then 4s, then cap at one hello every 8s until a valid Host reply arrives.
 const CLIENT_HELLO_RETRY_DELAYS_MSEC = [2000, 4000, 8000]
@@ -123,6 +122,13 @@ var _lan_game_port = DEFAULT_LAN_PORT
 var _host_mod_list_payload_cache = ""
 var _host_mod_list_cache_ready = false
 var _lobby_id = 0
+# SessionManager is the sole lobby-metadata writer. Keep the last successfully
+# published value per field so periodic session polling does not emit redundant
+# lobby_data_update callbacks.
+var _lobby_metadata_cache_lobby_id = 0
+var _lobby_metadata_cache = {}
+var _lobby_joinable_cache_valid = false
+var _lobby_joinable_cache = false
 var _is_lobby_owner = false
 var _online_role = "none" # "none" / "host" / "client". Game authority never follows Steam owner migration.
 var _game_host_steam_id = ""
@@ -136,7 +142,6 @@ var _client_host_disconnect_teardown_active = false
 # be destroyed together with the frozen battle/shop scene.
 var _host_disconnect_notice_pending = false
 var _online_run_slots_locked = false
-var _last_slot_lock_skip_log_msec = 0
 var _self_steam_id = ""
 var _members = []
 var _open_invite_overlay_after_create = false
@@ -191,7 +196,6 @@ var _last_host_phase_poll_msec = 0
 var _last_battle_snapshot_send_msec = 0
 var _last_battle_snapshot_sent_tick_by_steam_id = {}
 var _last_battle_reliable_sent_key_by_steam_id = {}
-var _last_battle_snapshot_tx_log_msec = 0
 var _client_battle_snapshot_rx_count = 0
 var _last_client_battle_snapshot_rx_log_msec = 0
 var _last_client_battle_snapshot_rx_tick = -1
@@ -794,20 +798,57 @@ func _publish_host_mod_lobby_data() -> void:
 		return
 	var payload = get_host_mod_list_payload()
 	var part_count = max(1, int(ceil(float(payload.length()) / float(HOST_MODS_LOBBY_CHUNK_CHARS))))
-	_steam.setLobbyData(_lobby_id, "host_mods_format", HOST_MODS_FORMAT_VERSION)
+	_set_lobby_metadata_if_changed("host_mods_format", HOST_MODS_FORMAT_VERSION)
 	if part_count > HOST_MODS_LOBBY_MAX_PARTS:
 		# Do not publish malformed/truncated JSON. This edge case remains purely
 		# informational and must never affect whether the room can be joined.
-		_steam.setLobbyData(_lobby_id, "host_mods_parts", "0")
-		_steam.setLobbyData(_lobby_id, "host_mods_too_large", "1")
+		_set_lobby_metadata_if_changed("host_mods_parts", "0")
+		_set_lobby_metadata_if_changed("host_mods_too_large", "1")
 		return
 
-	_steam.setLobbyData(_lobby_id, "host_mods_parts", str(part_count))
-	_steam.setLobbyData(_lobby_id, "host_mods_too_large", "0")
+	_set_lobby_metadata_if_changed("host_mods_parts", str(part_count))
+	_set_lobby_metadata_if_changed("host_mods_too_large", "0")
 	for i in range(part_count):
 		var offset = i * HOST_MODS_LOBBY_CHUNK_CHARS
 		var chunk = payload.substr(offset, HOST_MODS_LOBBY_CHUNK_CHARS)
-		_steam.setLobbyData(_lobby_id, "host_mods_" + str(i), chunk)
+		_set_lobby_metadata_if_changed("host_mods_" + str(i), chunk)
+
+
+func _reset_lobby_metadata_cache() -> void:
+	_lobby_metadata_cache_lobby_id = 0
+	_lobby_metadata_cache.clear()
+	_lobby_joinable_cache_valid = false
+	_lobby_joinable_cache = false
+
+
+func _prepare_lobby_metadata_cache() -> void:
+	if _lobby_metadata_cache_lobby_id == _lobby_id:
+		return
+	_reset_lobby_metadata_cache()
+	_lobby_metadata_cache_lobby_id = _lobby_id
+
+
+func _set_lobby_metadata_if_changed(key: String, value: String) -> void:
+	if _steam == null or _lobby_id == 0 or not _steam_has_method("setLobbyData"):
+		return
+	_prepare_lobby_metadata_cache()
+	if _lobby_metadata_cache.has(key) and str(_lobby_metadata_cache.get(key, "")) == value:
+		return
+	var result = _steam.setLobbyData(_lobby_id, key, value)
+	if typeof(result) != TYPE_BOOL or bool(result):
+		_lobby_metadata_cache[key] = value
+
+
+func _set_lobby_joinable_if_changed(joinable: bool) -> void:
+	if _steam == null or _lobby_id == 0 or not _steam_has_method("setLobbyJoinable"):
+		return
+	_prepare_lobby_metadata_cache()
+	if _lobby_joinable_cache_valid and _lobby_joinable_cache == joinable:
+		return
+	var result = _steam.setLobbyJoinable(_lobby_id, joinable)
+	if typeof(result) != TYPE_BOOL or bool(result):
+		_lobby_joinable_cache = joinable
+		_lobby_joinable_cache_valid = true
 
 
 func get_lan_discovery_info() -> Dictionary:
@@ -844,14 +885,12 @@ func _publish_session_metadata() -> void:
 	var count = get_session_member_count()
 	var state = get_lobby_state()
 	var joinable = count < MAX_LOBBY_MEMBERS and (state == "character_selection")
-	if _steam_has_method("setLobbyData"):
-		_steam.setLobbyData(_lobby_id, "session_id", _get_wire_session_id())
-		_steam.setLobbyData(_lobby_id, "member_count", str(count))
-		_steam.setLobbyData(_lobby_id, "member_limit", str(MAX_LOBBY_MEMBERS))
-		_steam.setLobbyData(_lobby_id, "state", state)
-		_steam.setLobbyData(_lobby_id, "joinable", "1" if joinable else "0")
-	if _steam_has_method("setLobbyJoinable"):
-		_steam.setLobbyJoinable(_lobby_id, joinable)
+	_set_lobby_metadata_if_changed("session_id", _get_wire_session_id())
+	_set_lobby_metadata_if_changed("member_count", str(count))
+	_set_lobby_metadata_if_changed("member_limit", str(MAX_LOBBY_MEMBERS))
+	_set_lobby_metadata_if_changed("state", state)
+	_set_lobby_metadata_if_changed("joinable", "1" if joinable else "0")
+	_set_lobby_joinable_if_changed(joinable)
 
 
 func _input(_event: InputEvent) -> void:
@@ -1249,11 +1288,9 @@ func leave_lobby() -> void:
 	_last_lobby_create_failed_result = 0
 	_open_invite_overlay_after_create = false
 	if _steam != null and leaving_lobby_id != 0:
-		if _steam_has_method("setLobbyJoinable"):
-			_steam.setLobbyJoinable(leaving_lobby_id, false)
-		if _steam_has_method("setLobbyData"):
-			_steam.setLobbyData(leaving_lobby_id, "state", "closed")
-			_steam.setLobbyData(leaving_lobby_id, "connect", "")
+		_set_lobby_joinable_if_changed(false)
+		_set_lobby_metadata_if_changed("state", "closed")
+		_set_lobby_metadata_if_changed("connect", "")
 		if _steam_has_method("leaveLobby"):
 			_steam.leaveLobby(leaving_lobby_id)
 	_session_active = false
@@ -1266,6 +1303,7 @@ func leave_lobby() -> void:
 			_lan_discovery.stop_search()
 
 	_lobby_id = 0
+	_reset_lobby_metadata_cache()
 	_session_id = ""
 	_pending_lan_join = false
 	_connection_by_peer_key.clear()
@@ -1309,7 +1347,6 @@ func leave_lobby() -> void:
 	_last_battle_reliable_sent_key_by_steam_id.clear()
 	_last_battle_terminal_state_key_by_steam_id.clear()
 	_last_battle_terminal_state_msec_by_steam_id.clear()
-	_last_battle_snapshot_tx_log_msec = 0
 	_client_battle_snapshot_rx_count = 0
 	_last_client_battle_snapshot_rx_log_msec = 0
 	_last_client_battle_snapshot_rx_tick = -1
@@ -1404,18 +1441,16 @@ func set_public_lobby_enabled(enabled: bool) -> void:
 	# Close first. This invalidates stale public-browser rows before changing the
 	# advertised type/metadata. A private lobby is reopened only through the
 	# explicit Invite Friend action below.
-	if _steam_has_method("setLobbyJoinable"):
-		_steam.setLobbyJoinable(_lobby_id, false)
+	_set_lobby_joinable_if_changed(false)
 
 	var lobby_type = _get_steam_const("LOBBY_TYPE_PUBLIC", LOBBY_TYPE_PUBLIC_FALLBACK) if enabled else _get_steam_const("LOBBY_TYPE_FRIENDS_ONLY", LOBBY_TYPE_FRIENDS_ONLY_FALLBACK)
 	if _steam_has_method("setLobbyType"):
 		_steam.setLobbyType(_lobby_id, lobby_type)
-	if _steam_has_method("setLobbyData"):
-		_steam.setLobbyData(_lobby_id, "visibility", "public" if enabled else "friends")
+	_set_lobby_metadata_if_changed("visibility", "public" if enabled else "friends")
 
-	if enabled and _steam_has_method("setLobbyJoinable"):
+	if enabled:
 		var joinable = get_session_member_count() < MAX_LOBBY_MEMBERS and (_is_host_at_character_selection_for_lobby() or _is_in_official_coop_resume_scene())
-		_steam.setLobbyJoinable(_lobby_id, joinable)
+		_set_lobby_joinable_if_changed(joinable)
 
 
 func _prepare_friends_only_lobby_for_invite() -> void:
@@ -1423,11 +1458,9 @@ func _prepare_friends_only_lobby_for_invite() -> void:
 		return
 	if _steam_has_method("setLobbyType"):
 		_steam.setLobbyType(_lobby_id, _get_steam_const("LOBBY_TYPE_FRIENDS_ONLY", LOBBY_TYPE_FRIENDS_ONLY_FALLBACK))
-	if _steam_has_method("setLobbyData"):
-		_steam.setLobbyData(_lobby_id, "visibility", "friends")
-	if _steam_has_method("setLobbyJoinable"):
-		var joinable = get_session_member_count() < MAX_LOBBY_MEMBERS and (_is_host_at_character_selection_for_lobby() or _is_in_official_coop_resume_scene())
-		_steam.setLobbyJoinable(_lobby_id, joinable)
+	_set_lobby_metadata_if_changed("visibility", "friends")
+	var joinable = get_session_member_count() < MAX_LOBBY_MEMBERS and (_is_host_at_character_selection_for_lobby() or _is_in_official_coop_resume_scene())
+	_set_lobby_joinable_if_changed(joinable)
 
 
 func _get_public_lobby_enabled() -> bool:
@@ -1807,8 +1840,7 @@ func _setup_lobby_data() -> void:
 	var lobby_type = _get_steam_const("LOBBY_TYPE_PUBLIC", LOBBY_TYPE_PUBLIC_FALLBACK) if public_lobby else _get_steam_const("LOBBY_TYPE_FRIENDS_ONLY", LOBBY_TYPE_FRIENDS_ONLY_FALLBACK)
 	if _steam_has_method("setLobbyType"):
 		_steam.setLobbyType(_lobby_id, lobby_type)
-	if _steam_has_method("setLobbyJoinable"):
-		_steam.setLobbyJoinable(_lobby_id, true)
+	_set_lobby_joinable_if_changed(true)
 
 	if _steam_has_method("setLobbyData"):
 		var host_name = _self_steam_id
@@ -1816,17 +1848,17 @@ func _setup_lobby_data() -> void:
 			host_name = str(_steam.getPersonaName()).strip_edges()
 		if host_name.length() > 64:
 			host_name = host_name.substr(0, 64)
-		_steam.setLobbyData(_lobby_id, "mod", "six666-BrotatoOnline")
-		_steam.setLobbyData(_lobby_id, "mod_version", NETWORK_PROTOCOL_VERSION)
-		_steam.setLobbyData(_lobby_id, "game_version", "1.1.15.4")
-		_steam.setLobbyData(_lobby_id, "state", "character_selection")
-		_steam.setLobbyData(_lobby_id, "host", _self_steam_id)
-		_steam.setLobbyData(_lobby_id, "host_name", host_name)
-		_steam.setLobbyData(_lobby_id, "session_id", _get_wire_session_id())
-		_steam.setLobbyData(_lobby_id, "member_count", str(get_session_member_count()))
-		_steam.setLobbyData(_lobby_id, "member_limit", str(MAX_LOBBY_MEMBERS))
-		_steam.setLobbyData(_lobby_id, "visibility", "public" if public_lobby else "friends")
-		_steam.setLobbyData(_lobby_id, "connect", _make_lobby_connect_string(_lobby_id))
+		_set_lobby_metadata_if_changed("mod", "six666-BrotatoOnline")
+		_set_lobby_metadata_if_changed("mod_version", NETWORK_PROTOCOL_VERSION)
+		_set_lobby_metadata_if_changed("game_version", "1.1.15.4")
+		_set_lobby_metadata_if_changed("state", "character_selection")
+		_set_lobby_metadata_if_changed("host", _self_steam_id)
+		_set_lobby_metadata_if_changed("host_name", host_name)
+		_set_lobby_metadata_if_changed("session_id", _get_wire_session_id())
+		_set_lobby_metadata_if_changed("member_count", str(get_session_member_count()))
+		_set_lobby_metadata_if_changed("member_limit", str(MAX_LOBBY_MEMBERS))
+		_set_lobby_metadata_if_changed("visibility", "public" if public_lobby else "friends")
+		_set_lobby_metadata_if_changed("connect", _make_lobby_connect_string(_lobby_id))
 		_publish_host_mod_lobby_data()
 
 
@@ -1955,7 +1987,6 @@ func _sync_host_coop_slots_from_lobby() -> void:
 	# battle/shop, never rebuild from Steam lobby membership; doing so can erase P2 while the
 	# authoritative run is alive.
 	if _should_freeze_online_run_slots():
-		_log_slot_sync_skipped("lobby_sync")
 		_sync_slot_manager_lock_flag()
 		return
 
@@ -2036,7 +2067,6 @@ func _ensure_host_coop_slot_for_remote(steam_id: String) -> bool:
 
 	if needs_sync:
 		if _should_freeze_online_run_slots():
-			_log_slot_sync_skipped("ensure_remote:" + steam_id)
 			return false
 		_sync_host_coop_slots_from_lobby()
 	return needs_sync
@@ -2395,6 +2425,7 @@ func _bump_online_session_generation(reason: String = "") -> void:
 
 func _reset_transient_online_state_for_new_session(reason: String = "") -> void:
 	_client_host_disconnect_teardown_active = false
+	_reset_lobby_metadata_cache()
 	_stop_client_hello_retry("new_session:" + str(reason))
 	_bump_online_session_generation(reason)
 	_restore_client_retry_wave_setting_override()
@@ -3580,9 +3611,6 @@ func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 			snapshot_manager_pickup.apply_pickup_claim(from_steam_id, message)
 		return
 
-	_print_unknown_p2p_message(from_steam_id, message)
-
-
 func _handle_battle_entity_resync_request(from_steam_id: String, message: Dictionary) -> void:
 	var snapshot_manager = _get_state_snapshot_manager()
 	if snapshot_manager == null or not snapshot_manager.has_method("build_battle_entity_resync_payload"):
@@ -3626,36 +3654,10 @@ func _handle_battle_entity_resync_request(from_steam_id: String, message: Dictio
 	_send_p2p_json(from_steam_id, reliable_msg, true)
 
 
-func _print_unknown_p2p_message(from_steam_id: String, message: Dictionary) -> void:
-	pass
-
-
-func _summarize_p2p_message_for_log(message: Dictionary) -> Dictionary:
-	var summary = {}
-	for key in message.keys():
-		var value = message[key]
-		if key == "payload_b64" or key == "chunk_data" or key == "payload" or key == "data":
-			var value_len = str(value).length()
-			summary[key] = "<omitted " + str(value_len) + " chars>"
-		elif typeof(value) == TYPE_STRING:
-			if value.length() > 512:
-				summary[key] = value.substr(0, 256) + "...<omitted " + str(value.length()) + " chars>"
-			else:
-				summary[key] = value
-		elif typeof(value) == TYPE_DICTIONARY:
-			summary[key] = "<dict keys=" + str(value.size()) + ">"
-		elif typeof(value) == TYPE_ARRAY:
-			summary[key] = "<array size=" + str(value.size()) + ">"
-		else:
-			summary[key] = value
-	return summary
-
-
 func _reset_game_start_sync_state() -> void:
 	_host_difficulty_intercept_selection_id = 0
 	_pending_host_game_start = {}
 	_host_game_start_ack_by_steam_id.clear()
-	_host_game_start_ready_by_steam_id.clear()
 	_host_game_start_ready_by_steam_id.clear()
 	_pending_client_game_start_commit = {}
 	_pending_client_game_start_apply_msec = 0
@@ -3688,7 +3690,7 @@ func _reset_game_start_sync_state() -> void:
 	_pending_client_game_scene_ready_old_scene_id = 0
 
 
-func _clear_retry_wave_sync_state(reason: String = "") -> void:
+func _clear_retry_wave_sync_state(_reason: String = "") -> void:
 	_retry_wave_ready_by_steam_id.clear()
 	_retry_wave_ready_context_key = ""
 	_retry_wave_local_waiting_context_key = ""
@@ -3697,11 +3699,9 @@ func _clear_retry_wave_sync_state(reason: String = "") -> void:
 	_retry_wave_last_started_context_key = ""
 	_retry_wave_host_context_key = ""
 	_retry_wave_ending_context_key = ""
-	if reason != "":
-		pass
 
 
-func _clear_client_retry_wave_waiting_latch(reason: String = "") -> void:
+func _clear_client_retry_wave_waiting_latch(_reason: String = "") -> void:
 	if _retry_wave_local_waiting_context_key == "":
 		return
 	_retry_wave_local_waiting_context_key = ""
@@ -5616,22 +5616,9 @@ func _poll_and_send_host_battle_snapshot() -> void:
 		_last_battle_snapshot_sent_tick_by_steam_id[steam_id] = tick
 
 		# experimental; it can reduce remote-player drift at the cost of possible backlog.
-		var ok = _send_p2p_json(steam_id, wire_snapshot, true)
-		_maybe_log_battle_snapshot_tx(steam_id, wire_snapshot, ok)
+		_send_p2p_json(steam_id, wire_snapshot, true)
 	if reliable_needed and reliable_attempted and reliable_all_ok and snapshot_manager.has_method("mark_battle_reliable_events_sent"):
 		snapshot_manager.mark_battle_reliable_events_sent(reliable_msg)
-
-
-func _maybe_log_battle_snapshot_tx(target_steam_id: String, snapshot: Dictionary, ok: bool) -> void:
-	var now = OS.get_ticks_msec()
-	var compact = _safe_bool(snapshot.get("compact", false))
-	var entity_count = _safe_array_size(snapshot.get("e", [])) if compact else _safe_array_size(snapshot.get("entities", []))
-	var event_count = _safe_array_size(snapshot.get("events", []))
-	var player_count = _safe_array_size(snapshot.get("p", [])) if compact else _safe_array_size(snapshot.get("players", []))
-	if ok and now - _last_battle_snapshot_tx_log_msec < 5000:
-		return
-	_last_battle_snapshot_tx_log_msec = now
-	var payload_size = to_json(snapshot).to_utf8().size()
 
 
 func _make_battle_reliable_events_message(snapshot: Dictionary, pending_reliable: Dictionary) -> Dictionary:
@@ -5648,13 +5635,6 @@ func _make_battle_reliable_events_message(snapshot: Dictionary, pending_reliable
 		for birth in birth_markers:
 			if typeof(birth) == TYPE_DICTIONARY:
 				reliable_birth_markers.append(birth.duplicate(true))
-
-	for state in reliable_entities:
-		if typeof(state) == TYPE_DICTIONARY and str(state.get("category", "")) == "structure":
-			pass
-	for birth in reliable_birth_markers:
-		if typeof(birth) == TYPE_DICTIONARY and str(birth.get("spawn_category", birth.get("category", ""))) == "structure":
-			pass
 
 	var death_events = []
 	var events = pending_reliable.get("events", snapshot.get("events", []))
@@ -6596,7 +6576,7 @@ func _add_target_client_slot_to_selection_state(state: Dictionary, steam_id: Str
 	state["client_player_index"] = player_index
 
 
-func _send_selection_state_to_client(steam_id: String, force: bool = false) -> void:
+func _send_selection_state_to_client(steam_id: String, _force: bool = false) -> void:
 	if not _is_game_host() or not _session_active:
 		return
 
@@ -6615,8 +6595,6 @@ func _send_selection_state_to_client(steam_id: String, force: bool = false) -> v
 		return
 
 	_send_p2p_json(steam_id, state, true)
-	if force:
-		pass
 
 func _poll_and_broadcast_selection_state() -> void:
 	if not _is_game_host() or not _session_active:
@@ -6747,10 +6725,8 @@ func _send_p2p_json(target_steam_id: String, message: Dictionary, reliable: bool
 
 	var result = _send_transport_payload(target_steam_id, payload, channel, reliable or FORCE_ALL_STEAM_MESSAGES_RELIABLE)
 	var ok = _steam_networking_send_ok(result)
-	var result_name = _steam_networking_result_name(result)
 	if not ok:
 		_bo_net_diag_log_large_or_queued_send(target_steam_id, msg_type, payload.size(), channel, reliable or FORCE_ALL_STEAM_MESSAGES_RELIABLE, "send_failed", _pending_p2p_chunk_sends.size())
-		_log_steam_message_send_failure(target_steam_id, msg_type, payload.size(), send_flags, channel, result, result_name)
 		if payload.size() > P2P_JSON_CHUNK_RAW_BYTES:
 			return _queue_p2p_json_chunks(target_steam_id, payload, msg_type, send_flags, channel, coalesce_key)
 		if coalesce_key != "":
@@ -6947,12 +6923,8 @@ func _poll_pending_p2p_chunk_sends() -> void:
 		var channel = int(queued.get("channel", P2P_CHANNEL_MENU))
 		var result = _send_transport_payload(target_steam_id, payload, channel, send_flags == STEAM_NETWORKING_SEND_RELIABLE)
 		var ok = _steam_networking_send_ok(result)
-		var final_msg_type = str(queued.get("final_msg_type", ""))
-		var is_direct = bool(queued.get("direct", false))
 		if not ok:
 			var result_name = _steam_networking_result_name(result)
-			var log_type = final_msg_type if is_direct else "p2p_json_chunk:" + final_msg_type
-			_log_steam_message_send_failure(target_steam_id, log_type, payload.size(), send_flags, channel, result, result_name)
 			var retry_count = int(queued.get("retry_count", 0)) + 1
 			queued["retry_count"] = retry_count
 			queued["last_result"] = result
@@ -7137,12 +7109,6 @@ func _steam_networking_result_name(result) -> String:
 		60: "k_EResultRemoteFileConflict"
 	}
 	return str(names.get(code, "k_EResultUnknown_" + str(code)))
-
-
-func _log_steam_message_send_failure(target_steam_id: String, msg_type: String, bytes: int, send_flags: int, channel: int, result, result_name: String) -> void:
-	var retry_left = 0
-	if _client_hello_retry_active and _client_hello_next_retry_msec > 0:
-		retry_left = max(0, _client_hello_next_retry_msec - OS.get_ticks_msec())
 
 
 func _get_p2p_channel_for_message_type(msg_type: String) -> int:
@@ -7476,13 +7442,6 @@ func _should_freeze_online_run_slots() -> bool:
 	if _is_in_official_coop_resume_scene():
 		return false
 	return _online_run_slots_locked or _is_in_active_online_run_scene()
-
-
-func _log_slot_sync_skipped(reason: String) -> void:
-	var now = OS.get_ticks_msec()
-	if now - _last_slot_lock_skip_log_msec < 1000:
-		return
-	_last_slot_lock_skip_log_msec = now
 
 
 func _is_in_game_scene() -> bool:

@@ -69,9 +69,6 @@ var _host_entity_by_net_id = {}
 var _host_entity_by_short_id = {}
 var _host_pickup_by_net_id = {}
 var _host_pickup_kind_by_net_id = {}
-var _last_damage_claim_log_msec = 0
-var _damage_claim_batches_applied = 0
-var _damage_claim_damage_applied = 0
 var _birth_only_announced_net_ids = {}
 var _birth_only_first_seen_msec = {}
 var _announced_death_net_ids = {}
@@ -1689,8 +1686,6 @@ func apply_damage_claim_batch(from_steam_id: String, message: Dictionary) -> voi
 	if player_index < 0:
 		return
 
-	var applied_count = 0
-	var applied_damage = 0
 	for claim in claims:
 		var short_id = -1
 		var damage_sum = 0
@@ -1717,51 +1712,12 @@ func apply_damage_claim_batch(from_steam_id: String, message: Dictionary) -> voi
 		if bool(target.get("dead")):
 			continue
 		_apply_trusted_damage_to_host_entity(target, damage_sum, player_index, flags, hit_count)
-		applied_count += 1
-		applied_damage += damage_sum
-	_damage_claim_batches_applied += 1
-	_damage_claim_damage_applied += applied_damage
-	_maybe_log_damage_claim_batch(from_steam_id, int(message.get("seq", 0)), claims.size(), applied_count, applied_damage, player_index)
 
 
 func apply_player_hp_state(from_steam_id: String, message: Dictionary) -> void:
 	if not _is_game_host():
 		return
 	apply_player_state(from_steam_id, message)
-	return
-	var player_index = int(message.get("player_index", -1))
-	if player_index < 0:
-		player_index = _get_player_index_for_steam_id(from_steam_id)
-	if player_index < 0:
-		return
-	var locator = _get_runtime_locator()
-	if locator == null or not locator.has_method("get_players"):
-		return
-	var players = locator.get_players()
-	if typeof(players) != TYPE_ARRAY or player_index >= players.size():
-		return
-	var player = players[player_index]
-	if not _is_valid_node(player):
-		return
-	var current_stats = player.get("current_stats")
-	var max_stats = player.get("max_stats")
-	if current_stats == null:
-		return
-	var incoming_dead = bool(message.get("dead", false))
-	var hp = int(message.get("hp", current_stats.health))
-	if hp <= 0:
-		incoming_dead = true
-	if incoming_dead:
-		hp = REMOTE_DEAD_DISPLAY_HP
-	current_stats.health = hp
-	if max_stats != null and int(message.get("max_hp", -1)) >= 0:
-		max_stats.health = int(message.get("max_hp", max_stats.health))
-	if player.get("dead") != null and bool(player.get("dead")):
-		player.set("dead", false)
-	player.set_meta("brotato_online_remote_dead", incoming_dead)
-	if player.has_signal("health_updated"):
-		var max_hp = int(max_stats.health) if max_stats != null else hp
-		player.emit_signal("health_updated", player, hp, max_hp)
 
 
 func _apply_trusted_damage_to_host_entity(target: Node, damage_sum: int, player_index: int, flags: int, _hit_count: int) -> void:
@@ -1788,13 +1744,6 @@ func _apply_trusted_damage_to_host_entity(target: Node, damage_sum: int, player_
 			var current_stats = target.get("current_stats")
 			if bool(target.get("dead")) or (current_stats != null and int(current_stats.health) <= 0):
 				_queue_death_event_once(net_id, str(_last_entity_category_by_net_id.get(net_id, "enemy")), _get_global_pos(target), "damage_claim_batch", player_index)
-
-
-func _maybe_log_damage_claim_batch(from_steam_id: String, seq: int, claim_count: int, applied_count: int, applied_damage: int, player_index: int) -> void:
-	var now = OS.get_ticks_msec()
-	if now - _last_damage_claim_log_msec < 1000 and applied_count > 0:
-		return
-	_last_damage_claim_log_msec = now
 
 
 func _get_main_scene() -> Node:

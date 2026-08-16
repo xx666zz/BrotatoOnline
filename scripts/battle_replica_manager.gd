@@ -86,7 +86,6 @@ var _last_sent_player_dead_state = false
 var _sent_owned_player_terminal_state = false
 var _last_terminal_player_state_reason = ""
 var _last_boss_damage_send_msec = 0
-var _last_log_msec = 0
 var _apply_count = 0
 var _cached_owned_player_index = -1
 var _last_owned_index_log_msec = 0

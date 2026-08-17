@@ -63,8 +63,16 @@ func receive_battle_input(from_steam_id: String, message: Dictionary) -> void:
 	var move = _sanitize_vector(_dict_to_vec(message.get("move", {})))
 	var aim = _sanitize_vector(_dict_to_vec(message.get("aim", {})))
 	var tick = int(message.get("tick", 0))
+	# battle_input is intentionally unreliable/latest-only. Ignore duplicate or
+	# out-of-order samples so a late UDP-style packet cannot rewind movement.
+	var previous = _remote_input_by_player.get(player_index, {})
+	if typeof(previous) == TYPE_DICTIONARY and str(previous.get("steam_id", "")) == from_steam_id:
+		var previous_tick = int(previous.get("tick", -1))
+		if tick > 0 and previous_tick >= tick:
+			return
 
 	_remote_input_by_player[player_index] = {
+		"steam_id": from_steam_id,
 		"move": move,
 		"aim": aim,
 		"tick": tick,

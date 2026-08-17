@@ -11,7 +11,6 @@ func _init() -> void:
 	_install_player_local_outline_extension()
 	_install_main_safe_pool_exit_extension()
 	_install_entity_spawner_online_player_count_guard_extension()
-	_install_jellyshield_safe_owner_extension()
 	_install_follow_target_safe_parent_extension()
 	_install_player_safe_room_cleanup_extension()
 	_install_player_projectile_safe_speed_extension()
@@ -33,15 +32,6 @@ func _install_main_safe_pool_exit_extension() -> void:
 
 func _install_entity_spawner_online_player_count_guard_extension() -> void:
 	var extension_path = mod_dir_path.plus_file("extensions/entity_spawner_online_player_count_guard.gd")
-	var file = File.new()
-	if file.file_exists(extension_path):
-		ModLoaderMod.install_script_extension(extension_path)
-	else:
-		pass
-
-
-func _install_jellyshield_safe_owner_extension() -> void:
-	var extension_path = mod_dir_path.plus_file("extensions/jellyshield_safe_owner.gd")
 	var file = File.new()
 	if file.file_exists(extension_path):
 		ModLoaderMod.install_script_extension(extension_path)
@@ -140,7 +130,6 @@ func _ready() -> void:
 	_add_state_snapshot()
 	_add_battle_replica_manager()
 	_add_brotato_online_api()
-	_remove_legacy_battle_ghost_layer_if_present()
 	_add_pause_focus_alias_manager()
 
 
@@ -289,17 +278,6 @@ func _add_brotato_online_api() -> void:
 		"scripts/brotato_online_api.gd",
 		true
 	)
-
-func _remove_legacy_battle_ghost_layer_if_present() -> void:
-	var old = get_node_or_null("BrotatoOnlineBattleGhostLayer")
-	if old != null and is_instance_valid(old):
-		old.queue_free()
-	var tree = get_tree()
-	if tree != null and tree.root != null:
-		var root_old = tree.root.get_node_or_null("BrotatoOnlineBattleGhostLayer")
-		if root_old != null and is_instance_valid(root_old):
-			root_old.queue_free()
-
 
 func _add_pause_focus_alias_manager() -> void:
 	# Minimal compatibility shim only for battle pause/options.

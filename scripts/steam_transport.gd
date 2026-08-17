@@ -84,9 +84,13 @@ func close_peer(peer) -> void:
 
 
 func send_packet(peer, data: PoolByteArray, channel: int, reliable: bool) -> bool:
+	var flags = STEAM_NETWORKING_SEND_RELIABLE if reliable else 0
+	return send_packet_with_flags(peer, data, channel, flags)
+
+
+func send_packet_with_flags(peer, data: PoolByteArray, channel: int, flags: int) -> bool:
 	if not is_available() or not _steam.has_method("sendMessageToUser"):
 		return false
-	var flags = STEAM_NETWORKING_SEND_RELIABLE if reliable else 0
 	var result = _steam.sendMessageToUser(int(peer), data, flags, channel)
 	if typeof(result) == TYPE_BOOL:
 		return bool(result)

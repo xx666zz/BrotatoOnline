@@ -4,9 +4,6 @@ const SETTINGS_FILE_PATH = "user://brotato_online_settings.cfg"
 const SETTINGS_SECTION = "display"
 const KEY_LOCAL_CHARACTER_OUTLINE = "local_character_outline"
 const DEFAULT_LOCAL_CHARACTER_OUTLINE = false
-const KEY_AUTO_JOIN_HOST_PLAYER = "auto_join_host_player"
-const DEFAULT_AUTO_JOIN_HOST_PLAYER = true
-const META_AUTO_JOIN_HOST_PLAYER = "brotato_online_auto_join_host_player"
 const KEY_LOCAL_INPUT_DEVICE_MODE = "local_input_device_mode"
 const KEY_LOCAL_INPUT_JOYPAD_ID = "local_input_joypad_id"
 const KEY_LOCAL_INPUT_JOYPAD_NAME = "local_input_joypad_name"
@@ -17,6 +14,10 @@ const DEFAULT_LOCAL_INPUT_DEVICE_MODE = INPUT_DEVICE_MODE_AUTO
 const META_LOCAL_INPUT_DEVICE_MODE = "brotato_online_local_input_device_mode"
 const META_LOCAL_INPUT_JOYPAD_ID = "brotato_online_local_input_joypad_id"
 const META_LOCAL_INPUT_JOYPAD_NAME = "brotato_online_local_input_joypad_name"
+
+const ROOM_NAME_MAX_LENGTH = 32
+const KEY_CUSTOM_ROOM_NAME = "custom_room_name"
+const DEFAULT_ROOM_NAME = "Brotato Online"
 
 const CUSTOM_QUICK_CHAT_MAX_LENGTH = 20
 const KEY_DISABLE_CUSTOM_QUICK_CHAT = "disable_custom_quick_chat"
@@ -49,10 +50,10 @@ const META_LOCAL_OUTLINE_COLOR = "brotato_online_local_outline_color"
 const META_LOCAL_OUTLINE_OWNED = "brotato_online_local_outline_owned"
 
 var _local_character_outline_enabled = DEFAULT_LOCAL_CHARACTER_OUTLINE
-var _auto_join_host_player_enabled = DEFAULT_AUTO_JOIN_HOST_PLAYER
 var _local_input_device_mode = DEFAULT_LOCAL_INPUT_DEVICE_MODE
 var _local_input_joypad_id = -1
 var _local_input_joypad_name = ""
+var _custom_room_name = ""
 var _disable_custom_quick_chat_enabled = DEFAULT_DISABLE_CUSTOM_QUICK_CHAT
 var _custom_quick_chat_texts = {}
 var _last_scan_msec = 0
@@ -65,6 +66,10 @@ var _input_device_option_button = null
 var _input_device_description_label = null
 var _input_device_option_values = []
 var _last_input_device_list_key = ""
+var _room_name_label = null
+var _room_name_editor = null
+var _room_name_description_label = null
+var _room_name_editor_normalizing = false
 var _disable_custom_quick_chat_button = null
 var _quick_chat_customize_toggle = null
 var _quick_chat_customize_description_label = null
@@ -152,20 +157,6 @@ func set_local_character_outline_enabled(enabled: bool) -> void:
 	_apply_outline_to_live_players()
 
 
-func get_auto_join_host_player_enabled() -> bool:
-	return true
-
-
-func set_auto_join_host_player_enabled(_enabled: bool) -> void:
-	# Player 1 is always created automatically. Keep this method for compatibility
-	# with older callers, but do not allow the behavior to be disabled.
-	if not _auto_join_host_player_enabled:
-		_auto_join_host_player_enabled = true
-		_save_settings()
-		_publish_settings_meta()
-		_notify_slot_manager_settings_changed()
-
-
 func get_local_input_device_mode() -> String:
 	return _local_input_device_mode
 
@@ -176,6 +167,41 @@ func get_local_input_joypad_id() -> int:
 
 func get_local_input_joypad_name() -> String:
 	return _local_input_joypad_name
+
+
+func get_room_name() -> String:
+	var custom_name = _sanitize_room_name(_custom_room_name)
+	if custom_name != "":
+		return custom_name
+	return _get_default_room_name()
+
+
+func set_room_name(text: String) -> void:
+	var normalized = _sanitize_room_name(text)
+	var default_name = _get_default_room_name()
+	if normalized == default_name:
+		normalized = ""
+	if _custom_room_name == normalized:
+		return
+	_custom_room_name = normalized
+	_save_settings()
+
+
+func _get_default_room_name() -> String:
+	if Engine.has_singleton("Steam"):
+		var steam = Engine.get_singleton("Steam")
+		if steam != null and steam.has_method("getPersonaName"):
+			var persona_name = _sanitize_room_name(str(steam.getPersonaName()))
+			if persona_name != "":
+				return persona_name
+	return DEFAULT_ROOM_NAME
+
+
+func _sanitize_room_name(text: String) -> String:
+	var normalized = text.replace("\r", " ").replace("\n", " ").strip_edges()
+	if normalized.length() > ROOM_NAME_MAX_LENGTH:
+		normalized = normalized.substr(0, ROOM_NAME_MAX_LENGTH)
+	return normalized
 
 
 func get_disable_custom_quick_chat_enabled() -> bool:
@@ -276,9 +302,6 @@ func _load_settings() -> void:
 			KEY_LOCAL_CHARACTER_OUTLINE,
 			DEFAULT_LOCAL_CHARACTER_OUTLINE
 		))
-		# This option used to be configurable. It is now always enabled so an old
-		# config containing false cannot leave the host without Player 1.
-		_auto_join_host_player_enabled = true
 		_local_input_device_mode = str(config.get_value(
 			SETTINGS_SECTION,
 			KEY_LOCAL_INPUT_DEVICE_MODE,
@@ -294,6 +317,11 @@ func _load_settings() -> void:
 			KEY_LOCAL_INPUT_JOYPAD_NAME,
 			""
 		))
+		_custom_room_name = _sanitize_room_name(str(config.get_value(
+			SETTINGS_SECTION,
+			KEY_CUSTOM_ROOM_NAME,
+			""
+		)))
 		_disable_custom_quick_chat_enabled = bool(config.get_value(
 			SETTINGS_SECTION,
 			KEY_DISABLE_CUSTOM_QUICK_CHAT,
@@ -312,10 +340,10 @@ func _load_settings() -> void:
 			_local_input_device_mode = INPUT_DEVICE_MODE_AUTO
 	else:
 		_local_character_outline_enabled = DEFAULT_LOCAL_CHARACTER_OUTLINE
-		_auto_join_host_player_enabled = DEFAULT_AUTO_JOIN_HOST_PLAYER
 		_local_input_device_mode = DEFAULT_LOCAL_INPUT_DEVICE_MODE
 		_local_input_joypad_id = -1
 		_local_input_joypad_name = ""
+		_custom_room_name = ""
 		_disable_custom_quick_chat_enabled = DEFAULT_DISABLE_CUSTOM_QUICK_CHAT
 		_custom_quick_chat_texts.clear()
 
@@ -324,10 +352,10 @@ func _save_settings() -> void:
 	var config = ConfigFile.new()
 	var _load_err = config.load(SETTINGS_FILE_PATH)
 	config.set_value(SETTINGS_SECTION, KEY_LOCAL_CHARACTER_OUTLINE, _local_character_outline_enabled)
-	config.set_value(SETTINGS_SECTION, KEY_AUTO_JOIN_HOST_PLAYER, _auto_join_host_player_enabled)
 	config.set_value(SETTINGS_SECTION, KEY_LOCAL_INPUT_DEVICE_MODE, _local_input_device_mode)
 	config.set_value(SETTINGS_SECTION, KEY_LOCAL_INPUT_JOYPAD_ID, _local_input_joypad_id)
 	config.set_value(SETTINGS_SECTION, KEY_LOCAL_INPUT_JOYPAD_NAME, _local_input_joypad_name)
+	config.set_value(SETTINGS_SECTION, KEY_CUSTOM_ROOM_NAME, _custom_room_name)
 	config.set_value(SETTINGS_SECTION, KEY_DISABLE_CUSTOM_QUICK_CHAT, _disable_custom_quick_chat_enabled)
 	for option_id in QUICK_CHAT_OPTION_IDS:
 		config.set_value(
@@ -343,16 +371,9 @@ func _publish_settings_meta() -> void:
 	if tree == null or tree.root == null:
 		return
 	tree.root.set_meta("brotato_online_local_character_outline", _local_character_outline_enabled)
-	tree.root.set_meta(META_AUTO_JOIN_HOST_PLAYER, true)
 	tree.root.set_meta(META_LOCAL_INPUT_DEVICE_MODE, _local_input_device_mode)
 	tree.root.set_meta(META_LOCAL_INPUT_JOYPAD_ID, _local_input_joypad_id)
 	tree.root.set_meta(META_LOCAL_INPUT_JOYPAD_NAME, _local_input_joypad_name)
-
-
-func _notify_slot_manager_settings_changed() -> void:
-	var slot_manager = _get_slot_manager()
-	if slot_manager != null and slot_manager.has_method("on_online_settings_changed"):
-		slot_manager.call("on_online_settings_changed")
 
 
 func _refresh_settings_button_text_only() -> void:
@@ -377,6 +398,9 @@ func _try_inject_title_screen_settings_button() -> void:
 		_input_device_description_label = null
 		_input_device_option_values.clear()
 		_last_input_device_list_key = ""
+		_room_name_label = null
+		_room_name_editor = null
+		_room_name_description_label = null
 		_disable_custom_quick_chat_button = null
 		_quick_chat_customize_toggle = null
 		_quick_chat_customize_description_label = null
@@ -478,6 +502,11 @@ func _ensure_settings_overlay(title_screen: Node) -> void:
 		_input_device_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/InputDeviceLabel")
 		_input_device_option_button = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/InputDeviceOptionButton")
 		_input_device_description_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/InputDeviceDescriptionLabel")
+		_room_name_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/RoomNameLabel")
+		_room_name_editor = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/RoomNameEditor")
+		_room_name_description_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/RoomNameDescriptionLabel")
+		if _room_name_editor != null and is_instance_valid(_room_name_editor):
+			_configure_room_name_editor(_room_name_editor)
 		_disable_custom_quick_chat_button = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/DisableCustomQuickChatButton")
 		_quick_chat_customize_toggle = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/QuickChatCustomizeToggle")
 		_quick_chat_customize_description_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/QuickChatCustomizeDescriptionLabel")
@@ -526,7 +555,7 @@ func _ensure_settings_overlay(title_screen: Node) -> void:
 
 	var panel = PanelContainer.new()
 	panel.name = "PanelContainer"
-	panel.rect_min_size = Vector2(900, 560)
+	panel.rect_min_size = Vector2(900, 650)
 	center.add_child(panel)
 	_settings_panel = panel
 
@@ -552,6 +581,33 @@ func _ensure_settings_overlay(title_screen: Node) -> void:
 		title.add_font_override("font", title_font)
 	vbox.add_child(title)
 	_title_label = title
+
+	var room_name_label = Label.new()
+	room_name_label.name = "RoomNameLabel"
+	room_name_label.text = _txt("BROTATO_ONLINE_ROOM_NAME")
+	room_name_label.align = Label.ALIGN_LEFT
+	room_name_label.add_color_override("font_color", Color(0.82, 0.82, 0.82, 1.0))
+	var room_name_label_font = load("res://resources/fonts/actual/base/font_26_outline.tres")
+	if room_name_label_font != null:
+		room_name_label.add_font_override("font", room_name_label_font)
+	vbox.add_child(room_name_label)
+	_room_name_label = room_name_label
+
+	var room_name_editor = LineEdit.new()
+	room_name_editor.name = "RoomNameEditor"
+	room_name_editor.text = get_room_name()
+	room_name_editor.rect_min_size = Vector2(0, 52)
+	room_name_editor.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	vbox.add_child(room_name_editor)
+	_configure_room_name_editor(room_name_editor)
+	_room_name_editor = room_name_editor
+
+	var room_name_description = _create_settings_description_label("RoomNameDescriptionLabel", "BROTATO_ONLINE_ROOM_NAME_DESC")
+	vbox.add_child(room_name_description)
+	_room_name_description_label = room_name_description
+
+	var room_name_separator = _create_settings_separator("RoomNameSeparator")
+	vbox.add_child(room_name_separator)
 
 	var input_device_label = Label.new()
 	input_device_label.name = "InputDeviceLabel"
@@ -893,6 +949,27 @@ func _input_device_option_matches_setting(option_data: Dictionary) -> bool:
 	return option_id == _local_input_joypad_id and (_local_input_joypad_name == "" or option_name == _local_input_joypad_name)
 
 
+func _configure_room_name_editor(editor) -> void:
+	if editor == null or not is_instance_valid(editor):
+		return
+	# Match the quick-chat IME handling: do not let LineEdit enforce the limit
+	# during composition. Normalize only after the current IME event completes.
+	editor.max_length = 0
+	editor.placeholder_text = _get_default_room_name()
+	editor.focus_mode = Control.FOCUS_CLICK
+	editor.mouse_filter = Control.MOUSE_FILTER_STOP
+	if editor.is_connected("mouse_entered", self, "_on_runtime_focusable_mouse_entered"):
+		editor.disconnect("mouse_entered", self, "_on_runtime_focusable_mouse_entered")
+	if editor.is_connected("mouse_exited", self, "_on_runtime_focusable_mouse_exited"):
+		editor.disconnect("mouse_exited", self, "_on_runtime_focusable_mouse_exited")
+	if not editor.is_connected("text_changed", self, "_on_room_name_text_changed"):
+		var _room_name_err = editor.connect("text_changed", self, "_on_room_name_text_changed")
+	if not editor.is_connected("focus_entered", self, "_on_room_name_editor_focus_entered"):
+		var _room_name_focus_in_err = editor.connect("focus_entered", self, "_on_room_name_editor_focus_entered")
+	if not editor.is_connected("focus_exited", self, "_on_room_name_editor_focus_exited"):
+		var _room_name_focus_out_err = editor.connect("focus_exited", self, "_on_room_name_editor_focus_exited")
+
+
 func _configure_quick_chat_editor(editor, option_id: String) -> void:
 	if editor == null or not is_instance_valid(editor):
 		return
@@ -954,6 +1031,12 @@ func _refresh_localized_texts() -> void:
 		_local_outline_description_label.text = _txt("BROTATO_ONLINE_LOCAL_CHARACTER_OUTLINE_DESC")
 	elif _description_label != null and is_instance_valid(_description_label):
 		_description_label.text = _txt("BROTATO_ONLINE_LOCAL_CHARACTER_OUTLINE_DESC")
+	if _room_name_label != null and is_instance_valid(_room_name_label):
+		_room_name_label.text = _txt("BROTATO_ONLINE_ROOM_NAME")
+	if _room_name_description_label != null and is_instance_valid(_room_name_description_label):
+		_room_name_description_label.text = _txt("BROTATO_ONLINE_ROOM_NAME_DESC")
+	if _room_name_editor != null and is_instance_valid(_room_name_editor):
+		_room_name_editor.placeholder_text = _get_default_room_name()
 	if _input_device_label != null and is_instance_valid(_input_device_label):
 		_input_device_label.text = _txt("BROTATO_ONLINE_INPUT_DEVICE")
 	if _input_device_description_label != null and is_instance_valid(_input_device_description_label):
@@ -978,6 +1061,39 @@ func _quick_chat_original_text(option_id: String) -> String:
 	return _txt(key) if key != "" else ""
 
 
+func _on_room_name_text_changed(_text: String) -> void:
+	if _room_name_editor_normalizing:
+		return
+	# Use the same deferred normalization strategy as quick chat so Windows IME
+	# composition is never rewritten in the middle of a Pinyin event.
+	call_deferred("_normalize_room_name_editor")
+
+
+func _normalize_room_name_editor() -> void:
+	if _room_name_editor == null or not is_instance_valid(_room_name_editor):
+		return
+	var normalized = _sanitize_room_name(str(_room_name_editor.text))
+	if str(_room_name_editor.text) != normalized:
+		_room_name_editor_normalizing = true
+		_room_name_editor.text = normalized
+		_room_name_editor_normalizing = false
+	set_room_name(normalized)
+
+
+func _on_room_name_editor_focus_entered() -> void:
+	if _room_name_editor == null or not is_instance_valid(_room_name_editor):
+		return
+	_begin_quick_chat_text_edit_session(_room_name_editor)
+
+
+func _on_room_name_editor_focus_exited() -> void:
+	if _room_name_editor == null or not is_instance_valid(_room_name_editor):
+		return
+	if _room_name_editor != _active_quick_chat_editor or _text_edit_session_ending:
+		return
+	call_deferred("_ensure_active_quick_chat_editor_focus")
+
+
 func _on_disable_custom_quick_chat_toggled(button_pressed: bool) -> void:
 	set_disable_custom_quick_chat_enabled(button_pressed)
 
@@ -988,7 +1104,7 @@ func _on_quick_chat_customize_toggled(button_pressed: bool) -> void:
 	if _quick_chat_customize_container != null and is_instance_valid(_quick_chat_customize_container):
 		_quick_chat_customize_container.visible = button_pressed
 	if _settings_panel != null and is_instance_valid(_settings_panel):
-		_settings_panel.rect_min_size = Vector2(900, 700 if button_pressed else 560)
+		_settings_panel.rect_min_size = Vector2(900, 790 if button_pressed else 650)
 	_refresh_localized_texts()
 
 
@@ -1168,6 +1284,8 @@ func _open_settings_overlay() -> void:
 		_last_focus_owner = _settings_button
 
 	_refresh_input_device_options(true)
+	if _room_name_editor != null and is_instance_valid(_room_name_editor):
+		_room_name_editor.text = get_room_name()
 	if _local_outline_button != null and is_instance_valid(_local_outline_button):
 		_local_outline_button.set_pressed_no_signal(_local_character_outline_enabled)
 	if _disable_custom_quick_chat_button != null and is_instance_valid(_disable_custom_quick_chat_button):
@@ -1184,7 +1302,7 @@ func _open_settings_overlay() -> void:
 	if _quick_chat_customize_container != null and is_instance_valid(_quick_chat_customize_container):
 		_quick_chat_customize_container.visible = quick_chat_expanded
 	if _settings_panel != null and is_instance_valid(_settings_panel):
-		_settings_panel.rect_min_size = Vector2(900, 700 if quick_chat_expanded else 560)
+		_settings_panel.rect_min_size = Vector2(900, 790 if quick_chat_expanded else 650)
 
 	_refresh_localized_texts()
 	_settings_overlay.show()

@@ -9063,12 +9063,6 @@ func _build_data_object_id_state_array(pool) -> Array:
 	return result
 
 
-func _build_data_object_sync_state_array(pool) -> Array:
-	# Backward-compatible wrapper for any older call sites. New hello packets use
-	# _build_data_object_id_state_array() directly.
-	return _build_data_object_id_state_array(pool)
-
-
 func _invalidate_host_character_catalog_cache() -> void:
 	_invalidate_selection_element_cache()
 	_host_built_catalog_by_screen.erase(SCREEN_CHARACTER_SELECTION)

@@ -1,6 +1,9 @@
 extends Node
 
 
+signal host_local_topology_changed(local_player_indices)
+
+
 const MAX_REMOTE_PLAYERS = 3
 const RESTORE_CHECK_INTERVAL_MSEC = 500
 # Remote placeholders must use vanilla-mapped device ids.
@@ -10,7 +13,6 @@ const RESTORE_CHECK_INTERVAL_MSEC = 500
 # controllers are always reserved before a placeholder is allocated.
 const REMOTE_PLACEHOLDER_DEVICE_IDS = [1, 2, 3, 4, 5, 0]
 const REMOTE_PLACEHOLDER_PLAYER_TYPE = CoopService.PlayerType.GAMEPAD_XBOX
-const META_AUTO_JOIN_HOST_PLAYER = "brotato_online_auto_join_host_player"
 const META_LOCAL_INPUT_DEVICE_MODE = "brotato_online_local_input_device_mode"
 const META_LOCAL_INPUT_JOYPAD_ID = "brotato_online_local_input_joypad_id"
 const META_LOCAL_INPUT_JOYPAD_NAME = "brotato_online_local_input_joypad_name"
@@ -50,6 +52,7 @@ var _mirrored_connected_players = []
 var _last_mirror_restore_log_msec = 0
 var _bo_resume_emit_scene_id = 0
 var _bo_resume_last_emitted_count = -1
+var _last_observed_local_layout_key = ""
 
 
 
@@ -170,6 +173,33 @@ func _bo_slot_diag_periodic(reason: String) -> void:
 
 func _ready() -> void:
 	set_process(true)
+	_last_observed_local_layout_key = _build_local_layout_key()
+	if CoopService != null and CoopService.has_signal("connected_players_updated") and not CoopService.is_connected("connected_players_updated", self, "_on_connected_players_updated"):
+		var _players_signal_err = CoopService.connect("connected_players_updated", self, "_on_connected_players_updated")
+	if not Input.is_connected("joy_connection_changed", self, "_on_joy_connection_changed"):
+		var _joy_signal_err = Input.connect("joy_connection_changed", self, "_on_joy_connection_changed")
+
+
+func _on_connected_players_updated(_players = null) -> void:
+	# Vanilla owns local join input. Observe its finished topology instead of
+	# intercepting join buttons, then let SessionManager rebroadcast the new layout.
+	var local_layout_key = _build_local_layout_key()
+	if local_layout_key == _last_observed_local_layout_key:
+		return
+	_last_observed_local_layout_key = local_layout_key
+	if not _is_online_session_active() or _is_slot_mutation_locked():
+		return
+	_sync_run_data_player_count()
+	emit_signal("host_local_topology_changed", get_local_player_indices())
+
+
+func _on_joy_connection_changed(unmapped_device: int, connected: bool) -> void:
+	if not connected or not _is_online_session_active() or _is_slot_mutation_locked():
+		return
+	var entry = _get_local_gamepad_entry_for_joypad(unmapped_device)
+	if entry.empty():
+		return
+	_migrate_remote_placeholder_for_local_device(int(entry[0]), "joy_connected")
 
 
 func _is_in_official_coop_resume_scene() -> bool:
@@ -212,26 +242,6 @@ func _is_online_session_active() -> bool:
 	if tree == null or tree.root == null:
 		return false
 	return bool(tree.root.get_meta("brotato_online_session_active", false))
-
-
-func _get_auto_join_host_player_enabled() -> bool:
-	var tree = get_tree()
-	if tree == null or tree.root == null:
-		return true
-	return bool(tree.root.get_meta(META_AUTO_JOIN_HOST_PLAYER, true))
-
-
-func on_online_settings_changed() -> void:
-	if not _is_online_session_active():
-		return
-	if not _get_auto_join_host_player_enabled():
-		return
-	if _is_slot_mutation_locked():
-		return
-	_ensure_host_player_joined()
-	_sync_run_data_player_count()
-	_refresh_current_character_selection_layout()
-	dump_slots()
 
 
 func _process(_delta: float) -> void:
@@ -289,25 +299,10 @@ func online_sync_remote_steam_ids(remote_steam_ids: Array) -> void:
 		if not normalized_ids.has(str(existing_id)):
 			_remove_remote_steam_id(str(existing_id))
 
-	# Default path: keep Host P0 present before any remote placeholder is inserted.
-	# If the user disables this compatibility switch, do not auto-create P0; in that
-	# mode the host must manually join/confirm Player 1 with the intended input
-	# device before remote players enter. This keeps the old manual fallback without
-	# making it the default.
-	var auto_join_host_player = _get_auto_join_host_player_enabled()
-	if auto_join_host_player:
-		_ensure_host_player_joined()
+	# Keep Host P0 present before any remote placeholder is inserted.
+	_ensure_host_player_joined()
 
 	if normalized_ids.empty():
-		_sync_run_data_player_count()
-		_refresh_current_character_selection_layout()
-		dump_slots()
-		return
-
-	if not auto_join_host_player and _get_existing_local_player_index() < 0:
-		# Manual mode safety: remote placeholders before Host P0 can reproduce the
-		# stale-character/focus bug. Keep the Steam lobby open, but wait for Host P1
-		# to be inserted by vanilla input before accepting remote slots.
 		_sync_run_data_player_count()
 		_refresh_current_character_selection_layout()
 		dump_slots()
@@ -363,17 +358,27 @@ func online_reset_to_offline(reason: String = "") -> void:
 
 	var restored_selection_to_solo = false
 	if was_tracking_online_slots:
-		CoopService.connected_players.clear()
-		CoopService.listening_for_inputs = false
-		if RunData.has_method("set_player_count"):
-			RunData.set_player_count(1)
-		RunData.play_mode = RunData.PlayMode.SOLO
-		RunData.set_coop_run(false)
-		_bo_emit_connected_players_updated("generic_emit")
-		restored_selection_to_solo = _restore_current_character_selection_to_solo()
+		# Remote placeholders are gone at this point. Preserve a real Host local-COOP
+		# layout created before or while the lobby was open instead of collapsing it
+		# back to SOLO. A lone manager-created/local P0 still returns to normal SOLO.
+		var local_player_count = int(CoopService.connected_players.size())
+		if local_player_count > 1:
+			CoopService.listening_for_inputs = true
+			_sync_run_data_player_count()
+			_bo_emit_connected_players_updated("offline_preserve_local_coop")
+		else:
+			CoopService.connected_players.clear()
+			CoopService.listening_for_inputs = false
+			if RunData.has_method("set_player_count"):
+				RunData.set_player_count(1)
+			RunData.play_mode = RunData.PlayMode.SOLO
+			RunData.set_coop_run(false)
+			_bo_emit_connected_players_updated("generic_emit")
+			restored_selection_to_solo = _restore_current_character_selection_to_solo()
 	else:
 		_sync_run_data_player_count()
 
+	_last_observed_local_layout_key = _build_local_layout_key()
 	if not restored_selection_to_solo:
 		_refresh_current_character_selection_layout()
 	dump_slots()
@@ -806,6 +811,27 @@ func get_local_player_indices() -> Array:
 	return result
 
 
+func get_host_local_player_count() -> int:
+	return get_local_player_indices().size()
+
+
+func get_available_remote_slot_count() -> int:
+	return int(max(0, int(CoopService.get_max_players()) - int(CoopService.connected_players.size())))
+
+
+func _build_local_layout_key() -> String:
+	var parts = []
+	for player_index in get_local_player_indices():
+		var idx = int(player_index)
+		if idx < 0 or idx >= CoopService.connected_players.size():
+			continue
+		var player = CoopService.connected_players[idx]
+		if typeof(player) != TYPE_ARRAY or player.size() < 2:
+			continue
+		parts.append(str(idx) + ":" + str(int(player[0])) + ":" + str(int(player[1])))
+	return "|".join(parts)
+
+
 func _prefers_local_gamepad_input() -> bool:
 	var ui_device_value = null
 	if UIService != null:
@@ -984,6 +1010,11 @@ func _restore_tracked_coop_players_if_needed() -> void:
 
 	if _is_slot_mutation_locked():
 		return
+
+	# A controller can appear after a remote placeholder already owns its remapped
+	# device id. Move only the placeholder device; keep its player_index stable.
+	_migrate_remote_placeholders_away_from_connected_local_devices("periodic_guard")
+
 	# Before the run is locked, retain the latest authoritative client mirror while
 	# character/weapon selection or CoopResume is still assembling the topology.
 	if _local_mirrored_player_index >= 0 and not _mirrored_connected_players.empty():
@@ -1014,6 +1045,50 @@ func _restore_tracked_coop_players_if_needed() -> void:
 	if restored:
 		_sync_run_data_player_count()
 		dump_slots()
+
+
+func _migrate_remote_placeholders_away_from_connected_local_devices(reason: String = "") -> bool:
+	var changed = false
+	for device_value in _get_connected_local_gamepad_remapped_devices():
+		var device = int(device_value)
+		if _remote_steam_id_by_device.has(device):
+			changed = _migrate_remote_placeholder_for_local_device(device, reason) or changed
+	return changed
+
+
+func _migrate_remote_placeholder_for_local_device(local_device: int, reason: String = "") -> bool:
+	if _is_slot_mutation_locked() or not _remote_steam_id_by_device.has(local_device):
+		return false
+	var player_index = _get_player_index_for_device(local_device)
+	if player_index < 0:
+		return false
+	var remote_key = str(_remote_steam_id_by_device.get(local_device, ""))
+	if remote_key == "":
+		return false
+
+	# _get_next_free_remote_device() reserves all currently-connected physical
+	# controllers, including local_device, so the replacement cannot collide with
+	# the controller that just appeared.
+	var replacement_device = _get_next_free_remote_device()
+	if replacement_device < 0 or replacement_device == local_device:
+		_bo_slot_diag_log("REMOTE_DEVICE_MIGRATE_SKIP", "reason=" + reason + " local_device=" + str(local_device) + " remote=" + remote_key + " players=" + _bo_slot_diag_players())
+		return false
+
+	_remote_steam_id_by_device.erase(local_device)
+	_remote_steam_id_by_device[replacement_device] = remote_key
+	_device_by_remote_steam_id[remote_key] = replacement_device
+	_remote_devices.erase(local_device)
+	if not _remote_devices.has(replacement_device):
+		_remote_devices.append(replacement_device)
+
+	CoopService.connected_players[player_index] = [replacement_device, REMOTE_PLACEHOLDER_PLAYER_TYPE]
+	if player_index >= 0 and player_index < _mirrored_connected_players.size():
+		_mirrored_connected_players[player_index] = [replacement_device, REMOTE_PLACEHOLDER_PLAYER_TYPE]
+
+	_bo_slot_diag_log("REMOTE_DEVICE_MIGRATE", "reason=" + reason + " idx=" + str(player_index) + " remote=" + remote_key + " device=" + str(local_device) + "->" + str(replacement_device))
+	_bo_emit_connected_players_updated("remote_device_migrate:" + reason)
+	_refresh_current_character_selection_layout()
+	return true
 
 
 func _remove_unpreferred_local_input_slots(preferred_device: int) -> bool:

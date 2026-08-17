@@ -13,6 +13,16 @@ const SETTINGS_FILE_PATH = "user://brotato_online_settings.cfg"
 const SETTINGS_SECTION = "network"
 const SETTINGS_KEY_PUBLIC_LOBBY = "public_lobby"
 const DEFAULT_PUBLIC_LOBBY_ENABLED = false
+const ROOM_NAME_MAX_LENGTH = 32
+const ROOM_NAME_COLUMN_WIDTH = 420.0
+const ROOM_NAME_ROW_HEIGHT = 60.0
+const ROOM_NAME_SCROLL_MIN_SPEED = 90.0
+const ROOM_NAME_SCROLL_EDGE_PAUSE = 0.35
+# LAN discovery can rebuild the rows repeatedly during the first 2.5 s of each
+# 10 s browser refresh. Finish a full start -> end -> start marquee cycle in at
+# most 6 s so even the last LAN-triggered rebuild still completes in time.
+const ROOM_NAME_SCROLL_CYCLE_TARGET_SEC = 6.0
+const ROOM_NAME_SCROLL_OVERFLOW_EPSILON = 1.0
 
 const MAIN_MENU_BUTTON_NAME = "BrotatoOnlinePublicLobbyBrowserButton"
 const PUBLIC_TOGGLE_NAME = "BrotatoOnlinePublicLobbyToggle"
@@ -77,6 +87,10 @@ var _mods_title_label = null
 var _mods_body_edit = null
 var _mods_close_button = null
 var _mods_return_focus = null
+var _room_name_marquee_by_clip = {}
+# Stable marquee state keyed by lobby entry. Row rebuilds (Steam/LAN results,
+# localization, etc.) may replace the Control nodes, but should not rewind text.
+var _room_name_marquee_state_by_entry_key = {}
 
 func _ready() -> void:
 	pause_mode = Node.PAUSE_MODE_PROCESS
@@ -100,7 +114,7 @@ func _bind_lan_discovery() -> void:
 		_lan_discovery.connect("lobby_found", self, "_on_lan_lobby_found")
 
 
-func _process(_delta: float) -> void:
+func _process(delta: float) -> void:
 	var now = OS.get_ticks_msec()
 	if now - _last_ui_scan_msec >= UI_SCAN_INTERVAL_MSEC:
 		_last_ui_scan_msec = now
@@ -110,6 +124,7 @@ func _process(_delta: float) -> void:
 		_update_public_toggle_state()
 
 	if _overlay_open:
+		_update_room_name_marquees(delta)
 		_poll_browser_ping_packets()
 		_poll_pending_ping_requests(now)
 		_poll_pending_public_join_verification(now)
@@ -610,7 +625,7 @@ func _ensure_browser_overlay(title_screen: Node) -> void:
 	header.name = "Header"
 	header.add_constant_override("separation", 12)
 	vbox.add_child(header)
-	_add_header_label(header, _text("host"), 420)
+	_add_header_label(header, _text("room_name"), int(ROOM_NAME_COLUMN_WIDTH))
 	_add_header_label(header, _text("players"), 115)
 	_add_header_label(header, _text("ping"), 130)
 	_add_header_label(header, _text("state"), 220)
@@ -924,6 +939,8 @@ func _close_browser_overlay() -> void:
 	_pending_public_join_lobby_id = 0
 	_pending_public_join_started_msec = 0
 	_clear_ping_state()
+	_room_name_marquee_by_clip.clear()
+	_room_name_marquee_state_by_entry_key.clear()
 	_hide_direct_connect()
 	_hide_host_mods(false)
 	if _lan_discovery != null and _lan_discovery.has_method("stop_search"):
@@ -1005,6 +1022,13 @@ func _build_lobby_entries(lobby_ids: Array) -> void:
 		_upsert_lobby_entry(entry)
 
 
+func _sanitize_room_name(text: String) -> String:
+	var normalized = text.replace("\r", " ").replace("\n", " ").strip_edges()
+	if normalized.length() > ROOM_NAME_MAX_LENGTH:
+		normalized = normalized.substr(0, ROOM_NAME_MAX_LENGTH)
+	return normalized
+
+
 func _read_lobby_entry(lobby_id: int) -> Dictionary:
 	if _steam == null or not _steam_has_method("getLobbyData"):
 		return {}
@@ -1023,6 +1047,11 @@ func _read_lobby_entry(lobby_id: int) -> Dictionary:
 		host_name = str(_steam.getFriendPersonaName(int(host_id)))
 	if host_name == "":
 		host_name = host_id if host_id != "" else str(lobby_id)
+	var room_name = _sanitize_room_name(str(_steam.getLobbyData(lobby_id, "room_name")))
+	if room_name == "":
+		# Optional metadata for protocol compatibility: old hosts only publish
+		# host_name, so they remain visible with exactly the previous label.
+		room_name = host_name
 
 	# SessionManager publishes total Steam + LAN membership. Steam's native lobby
 	# count intentionally must not override this value in a mixed room.
@@ -1049,6 +1078,7 @@ func _read_lobby_entry(lobby_id: int) -> Dictionary:
 		"endpoint": {"lobby_id": lobby_id},
 		"host_id": host_id,
 		"host_name": host_name,
+		"room_name": room_name,
 		"member_count": member_count,
 		"member_limit": member_limit,
 		"state": state,
@@ -1087,13 +1117,33 @@ func _on_lan_lobby_found(entry: Dictionary) -> void:
 	normalized["host_mods_format"] = str(normalized.get("host_mods_format", ""))
 	normalized["host_mods_payload"] = str(normalized.get("host_mods_payload", ""))
 	normalized["host_mods_too_large"] = bool(normalized.get("host_mods_too_large", false))
+	var room_name = _sanitize_room_name(str(normalized.get("room_name", "")))
+	if room_name == "":
+		room_name = str(normalized.get("host_name", ""))
+	normalized["room_name"] = room_name
 	normalized["compatible"] = str(normalized.get("mod_version", "")) == NETWORK_PROTOCOL_VERSION
 	var member_count = int(normalized.get("member_count", 1))
 	var member_limit = int(normalized.get("member_limit", 4))
 	normalized["full"] = member_count >= member_limit
 	normalized["joinable"] = bool(normalized.get("joinable", true)) and bool(normalized["compatible"]) and not bool(normalized["full"])
+
+	var entry_key = str(normalized.get("entry_key", ""))
+	var previous = _find_entry(entry_key) if entry_key != "" else {}
+	var row_changed = previous.empty() or _lobby_row_data_changed(previous, normalized)
+	# LAN discovery sends several probes during one search. Its reported ping is
+	# measured from search start, so later duplicate replies naturally contain a
+	# larger number. Keep the best reply and update only the ping Label instead of
+	# rebuilding the entire row for every duplicate response.
+	if not previous.empty():
+		var previous_ping = int(previous.get("ping_ms", -1))
+		var incoming_ping = int(normalized.get("ping_ms", -1))
+		if previous_ping >= 0 and incoming_ping >= 0:
+			normalized["ping_ms"] = min(previous_ping, incoming_ping)
 	_upsert_lobby_entry(normalized)
-	_rebuild_lobby_rows()
+	if row_changed:
+		_rebuild_lobby_rows()
+	else:
+		_update_ping_label_for_entry_key(entry_key, int(normalized.get("ping_ms", -1)))
 
 
 func _upsert_lobby_entry(entry: Dictionary) -> void:
@@ -1109,6 +1159,28 @@ func _upsert_lobby_entry(entry: Dictionary) -> void:
 	_lobby_entries.append(entry)
 
 
+func _lobby_row_data_changed(previous: Dictionary, incoming: Dictionary) -> bool:
+	# ping_ms is intentionally excluded: ping has its own in-place Label update.
+	# endpoint/entry ids do not affect the visible row either.
+	for key in [
+		"source", "host_id", "host_name", "room_name",
+		"member_count", "member_limit", "state", "compatible",
+		"joinable", "full", "host_mods_format", "host_mods_payload",
+		"host_mods_too_large"
+	]:
+		if previous.get(key, null) != incoming.get(key, null):
+			return true
+	return false
+
+
+func _update_ping_label_for_entry_key(entry_key: String, ping_ms: int) -> void:
+	if not _ping_label_by_lobby_id.has(entry_key):
+		return
+	var label = _ping_label_by_lobby_id[entry_key]
+	if label != null and is_instance_valid(label):
+		label.text = _format_ping(ping_ms)
+
+
 func _rebuild_lobby_rows() -> void:
 	if _rows_container == null or not is_instance_valid(_rows_container):
 		return
@@ -1116,6 +1188,7 @@ func _rebuild_lobby_rows() -> void:
 		_rows_container.remove_child(child)
 		child.queue_free()
 	_ping_label_by_lobby_id.clear()
+	_room_name_marquee_by_clip.clear()
 
 	if _lobby_entries.empty():
 		_set_status(_text("none"))
@@ -1140,13 +1213,30 @@ func _add_lobby_row(entry: Dictionary) -> void:
 	row.add_constant_override("separation", 12)
 	panel.add_child(row)
 
+	# Keep the room-name column at a fixed width. A Label's own minimum width can
+	# still grow with long text even when clip_text is enabled, which used to push
+	# the player/ping/state columns to the right. The parent Control owns the fixed
+	# column width and clips the wider child Label instead.
+	var host_clip = Control.new()
+	host_clip.rect_min_size = Vector2(ROOM_NAME_COLUMN_WIDTH, ROOM_NAME_ROW_HEIGHT)
+	host_clip.rect_clip_content = true
+	host_clip.mouse_filter = Control.MOUSE_FILTER_PASS
+	host_clip.hint_tooltip = str(entry.get("host_name", ""))
+	row.add_child(host_clip)
+
 	var host = Label.new()
 	var source_prefix = "[LAN] " if str(entry.get("source", "steam")) == "lan" else ""
-	host.text = source_prefix + str(entry.get("host_name", ""))
-	host.rect_min_size = Vector2(420, 60)
+	host.text = source_prefix + str(entry.get("room_name", entry.get("host_name", "")))
+	host.hint_tooltip = str(entry.get("host_name", ""))
+	# Do not give the Label a 420 px minimum before measuring its text. Doing so
+	# makes get_combined_minimum_size() report at least 420 px even for short
+	# names, which previously created a fake ~6 px overflow on every row.
+	host.rect_min_size = Vector2(0, ROOM_NAME_ROW_HEIGHT)
+	host.rect_size = Vector2(ROOM_NAME_COLUMN_WIDTH, ROOM_NAME_ROW_HEIGHT)
 	host.valign = Label.VALIGN_CENTER
-	host.clip_text = true
-	row.add_child(host)
+	host.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	host_clip.add_child(host)
+	_register_room_name_marquee(str(entry.get("entry_key", "")), host_clip, host)
 
 	var players = Label.new()
 	players.text = str(entry.get("member_count", 0)) + "/" + str(entry.get("member_limit", 4))
@@ -1188,6 +1278,123 @@ func _add_lobby_row(entry: Dictionary) -> void:
 	row.add_child(join)
 	view_mods.focus_neighbour_right = view_mods.get_path_to(join)
 	join.focus_neighbour_left = join.get_path_to(view_mods)
+
+
+
+func _register_room_name_marquee(entry_key: String, clip: Control, label: Label) -> void:
+	if clip == null or label == null or not is_instance_valid(clip) or not is_instance_valid(label):
+		return
+
+	# Measure the text itself, not a previously forced column minimum. The parent
+	# owns the fixed-width clipping area; the Label only becomes wider when the
+	# actual rendered text really exceeds it.
+	label.rect_min_size = Vector2(0, ROOM_NAME_ROW_HEIGHT)
+	var natural_width = label.get_combined_minimum_size().x
+	var clip_width = ROOM_NAME_COLUMN_WIDTH
+	if clip.rect_size.x > 1.0:
+		clip_width = clip.rect_size.x
+	var overflows = natural_width > clip_width + ROOM_NAME_SCROLL_OVERFLOW_EPSILON
+	var label_width = clip_width
+	if overflows:
+		# A few pixels of trailing room prevent the final glyph from touching the
+		# clipping boundary, but are added only after real overflow is confirmed.
+		label_width = natural_width + 6.0
+	label.rect_size = Vector2(label_width, ROOM_NAME_ROW_HEIGHT)
+
+	var saved = _room_name_marquee_state_by_entry_key.get(entry_key, {})
+	if typeof(saved) != TYPE_DICTIONARY or str(saved.get("text", "")) != label.text:
+		saved = {}
+	var max_offset = max(0.0, label_width - clip_width) if overflows else 0.0
+	var offset = clamp(float(saved.get("offset", 0.0)), 0.0, max_offset)
+	var direction = float(saved.get("direction", 1.0))
+	if direction == 0.0:
+		direction = 1.0
+	var pause = max(0.0, float(saved.get("pause", ROOM_NAME_SCROLL_EDGE_PAUSE)))
+	if max_offset <= ROOM_NAME_SCROLL_OVERFLOW_EPSILON:
+		offset = 0.0
+		direction = 1.0
+		pause = 0.0
+
+	label.rect_position = Vector2(-offset, label.rect_position.y)
+	var item = {
+		"entry_key": entry_key,
+		"clip": clip,
+		"label": label,
+		"text": label.text,
+		"scrollable": overflows,
+		"offset": offset,
+		"direction": direction,
+		"pause": pause
+	}
+	_room_name_marquee_by_clip[clip.get_instance_id()] = item
+	_store_room_name_marquee_state(item)
+
+
+func _store_room_name_marquee_state(item: Dictionary) -> void:
+	var entry_key = str(item.get("entry_key", ""))
+	if entry_key == "":
+		return
+	_room_name_marquee_state_by_entry_key[entry_key] = {
+		"text": str(item.get("text", "")),
+		"offset": float(item.get("offset", 0.0)),
+		"direction": float(item.get("direction", 1.0)),
+		"pause": float(item.get("pause", 0.0))
+	}
+
+
+func _update_room_name_marquees(delta: float) -> void:
+	if _room_name_marquee_by_clip.empty():
+		return
+	var stale_keys = []
+	for key in _room_name_marquee_by_clip.keys():
+		var item = _room_name_marquee_by_clip[key]
+		var clip = item.get("clip", null)
+		var label = item.get("label", null)
+		if clip == null or label == null or not is_instance_valid(clip) or not is_instance_valid(label):
+			stale_keys.append(key)
+			continue
+
+		var max_offset = max(0.0, label.rect_size.x - clip.rect_size.x)
+		if not bool(item.get("scrollable", false)) or max_offset <= ROOM_NAME_SCROLL_OVERFLOW_EPSILON:
+			item["offset"] = 0.0
+			item["direction"] = 1.0
+			item["pause"] = 0.0
+			label.rect_position = Vector2(0.0, label.rect_position.y)
+			_room_name_marquee_by_clip[key] = item
+			_store_room_name_marquee_state(item)
+			continue
+
+		var pause_left = float(item.get("pause", 0.0))
+		if pause_left > 0.0:
+			item["pause"] = max(0.0, pause_left - delta)
+			_room_name_marquee_by_clip[key] = item
+			_store_room_name_marquee_state(item)
+			continue
+
+		var offset = float(item.get("offset", 0.0))
+		var direction = float(item.get("direction", 1.0))
+		# Dynamically raise the speed for very long names. The target includes
+		# the initial/end-edge pauses and deliberately stays below the 10 s refresh.
+		var pause_budget = ROOM_NAME_SCROLL_EDGE_PAUSE * 2.0
+		var travel_budget = max(1.0, ROOM_NAME_SCROLL_CYCLE_TARGET_SEC - pause_budget)
+		var scroll_speed = max(ROOM_NAME_SCROLL_MIN_SPEED, (max_offset * 2.0) / travel_budget)
+		offset += direction * scroll_speed * delta
+		if offset >= max_offset:
+			offset = max_offset
+			direction = -1.0
+			item["pause"] = ROOM_NAME_SCROLL_EDGE_PAUSE
+		elif offset <= 0.0:
+			offset = 0.0
+			direction = 1.0
+			item["pause"] = ROOM_NAME_SCROLL_EDGE_PAUSE
+		item["offset"] = offset
+		item["direction"] = direction
+		label.rect_position = Vector2(-offset, label.rect_position.y)
+		_room_name_marquee_by_clip[key] = item
+		_store_room_name_marquee_state(item)
+
+	for key in stale_keys:
+		_room_name_marquee_by_clip.erase(key)
 
 
 func _format_lobby_state(entry: Dictionary) -> String:
@@ -1562,11 +1769,7 @@ func _update_entry_ping(lobby_key: String, ping_ms: int) -> void:
 		if str(entry.get("lobby_id", 0)) == lobby_key:
 			entry["ping_ms"] = ping_ms
 			break
-	var entry_key = "steam:" + lobby_key
-	if _ping_label_by_lobby_id.has(entry_key):
-		var label = _ping_label_by_lobby_id[entry_key]
-		if label != null and is_instance_valid(label):
-			label.text = _format_ping(ping_ms)
+	_update_ping_label_for_entry_key("steam:" + lobby_key, ping_ms)
 
 
 func _clear_ping_state() -> void:

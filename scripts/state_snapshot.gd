@@ -1,7 +1,6 @@
 extends Node
 
 const REMOTE_DEAD_DISPLAY_HP = -999
-const BULL_CHARACTER_ID = "character_bull"
 const LOOTER_ENEMY_ID = "looter"
 const LOOTER_SCENE_PATH = "res://entities/units/enemies/looter/looter.tscn"
 
@@ -62,7 +61,6 @@ var _damage_signal_connected_ids = {}
 var _known_projectile_instance_ids = {}
 var _last_entity_pos_by_net_id = {}
 var _last_entity_category_by_net_id = {}
-var _looter_net_ids = {}
 var _last_entity_cursed_by_net_id = {}
 var _structure_curse_data_signature_by_net_id = {}
 var _host_entity_by_net_id = {}
@@ -79,6 +77,7 @@ var _pending_signal_spawn_nodes = []
 var _pending_signal_spawn_instance_ids = {}
 var _connected_spawner_instance_id = ""
 var _last_remote_player_hurtbox_guard_msec = 0
+var _last_client_player_state_time_by_peer = {}
 
 
 func _ready() -> void:
@@ -197,7 +196,6 @@ func build_snapshot() -> Dictionary:
 			_birth_marker_announced_net_ids.erase(removed_id)
 			_last_entity_pos_by_net_id.erase(removed_id)
 			_last_entity_category_by_net_id.erase(removed_id)
-			_looter_net_ids.erase(removed_id)
 			_structure_curse_data_signature_by_net_id.erase(removed_id)
 			_host_entity_by_net_id.erase(removed_id)
 			_host_entity_by_short_id.erase(str(_net_short_id(removed_id)))
@@ -384,8 +382,6 @@ func _touch_dynamic_entity_tracking(entity: Node, net_id: String, category: Stri
 	if update_pos:
 		_last_entity_pos_by_net_id[net_id] = _vec_to_dict(_get_global_pos(entity))
 	_last_entity_category_by_net_id[net_id] = category
-	if category == "enemy" and _is_looter_entity(entity):
-		_looter_net_ids[net_id] = true
 	_host_entity_by_net_id[net_id] = entity
 	_host_entity_by_short_id[str(_net_short_id(net_id))] = entity
 	_ensure_host_damage_event_connection(entity, net_id, category)
@@ -1495,6 +1491,16 @@ func apply_player_state(from_steam_id: String, message: Dictionary) -> void:
 			return
 	if player_index < 0:
 		return
+	# Non-terminal player_state is latest-only/unreliable. Reject older samples so
+	# packet reordering cannot rewind a client-owned player's position/HP on Host.
+	var client_time_msec = int(message.get("client_time_msec", 0))
+	var state_order_key = from_steam_id + ":" + str(player_index)
+	var last_client_time_msec = int(_last_client_player_state_time_by_peer.get(state_order_key, 0))
+	var terminal_state = bool(message.get("terminal", false))
+	if not terminal_state and client_time_msec > 0 and last_client_time_msec > 0 and client_time_msec <= last_client_time_msec:
+		return
+	if client_time_msec > last_client_time_msec:
+		_last_client_player_state_time_by_peer[state_order_key] = client_time_msec
 	var locator = _get_runtime_locator()
 	if locator == null or not locator.has_method("get_players"):
 		return
@@ -1788,31 +1794,8 @@ func _prepare_remote_player_proxy_for_client_authority(player: Node, player_inde
 		return
 	player.set_meta("brotato_online_client_authority_hp", true)
 	player.set_meta("brotato_online_remote_hurtbox_proxy", true)
-	player.set_meta("brotato_online_remote_bull_hurtbox_proxy", _is_bull_player_index(player_index))
 	player.set_meta("brotato_online_hurtbox_disabled_player_index", player_index)
 	player.set_meta("brotato_online_hurtbox_enabled_reason", reason)
-
-
-
-func _is_bull_player_index(player_index: int) -> bool:
-	if player_index < 0:
-		return false
-	if RunData != null and RunData.has_method("get_player_count") and player_index >= int(RunData.get_player_count()):
-		return false
-	if RunData == null:
-		return false
-	var character = null
-	if RunData.has_method("get_player_character"):
-		character = RunData.get_player_character(player_index)
-	elif RunData.get("players_data") != null:
-		var players_data = RunData.get("players_data")
-		if typeof(players_data) == TYPE_ARRAY and player_index < players_data.size():
-			var player_data = players_data[player_index]
-			if player_data != null:
-				character = player_data.get("current_character")
-	if character == null:
-		return false
-	return str(character.get("my_id")) == BULL_CHARACTER_ID
 
 
 
@@ -2226,7 +2209,6 @@ func _ensure_current_game_scene_registered(reason: String, locator: Node, is_hos
 		_known_projectile_instance_ids.clear()
 		_last_entity_pos_by_net_id.clear()
 		_last_entity_category_by_net_id.clear()
-		_looter_net_ids.clear()
 		_last_entity_cursed_by_net_id.clear()
 		_structure_curse_data_signature_by_net_id.clear()
 		_host_entity_by_net_id.clear()
@@ -2242,6 +2224,7 @@ func _ensure_current_game_scene_registered(reason: String, locator: Node, is_hos
 		_pending_signal_spawn_nodes.clear()
 		_pending_signal_spawn_instance_ids.clear()
 		_connected_spawner_instance_id = ""
+		_last_client_player_state_time_by_peer.clear()
 		_last_game_scene_instance_id = current_scene_id
 		_game_scene_enter_msec = OS.get_ticks_msec()
 		var registry = _get_net_id_registry()
@@ -2262,7 +2245,6 @@ func _on_left_game_scene() -> void:
 	_known_projectile_instance_ids.clear()
 	_last_entity_pos_by_net_id.clear()
 	_last_entity_category_by_net_id.clear()
-	_looter_net_ids.clear()
 	_last_entity_cursed_by_net_id.clear()
 	_structure_curse_data_signature_by_net_id.clear()
 	_host_entity_by_net_id.clear()
@@ -2278,6 +2260,7 @@ func _on_left_game_scene() -> void:
 	_pending_signal_spawn_nodes.clear()
 	_pending_signal_spawn_instance_ids.clear()
 	_connected_spawner_instance_id = ""
+	_last_client_player_state_time_by_peer.clear()
 	_last_game_scene_instance_id = 0
 	_game_scene_enter_msec = 0
 	_last_scene_was_game = false

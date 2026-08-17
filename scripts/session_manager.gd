@@ -13,8 +13,9 @@ const LAN_PROTOCOL_VERSION = 1
 const HOST_MODS_FORMAT_VERSION = "1"
 const HOST_MODS_LOBBY_CHUNK_CHARS = 1000
 const HOST_MODS_LOBBY_MAX_PARTS = 24
-const META_AUTO_JOIN_HOST_PLAYER = "brotato_online_auto_join_host_player"
 const META_PUBLIC_LOBBY_ENABLED = "brotato_online_public_lobby_enabled"
+const ROOM_NAME_MAX_LENGTH = 32
+const DEFAULT_ROOM_NAME = "Brotato Online"
 const QUICK_CHAT_CUSTOM_TEXT_LIMIT = 20
 
 # GodotSteam exposes these lobby types as integer enums. Keep explicit fallbacks
@@ -40,8 +41,9 @@ const MENU_PHASE_SELECTION_POLL_INTERVAL_USEC = 125000 # 8 Hz
 const SELECTION_BROADCAST_INTERVAL_MSEC = 250
 const MENU_SCENE_BROADCAST_INTERVAL_MSEC = 250
 const CLIENT_MENU_INPUT_POLL_INTERVAL_MSEC = 50
+const STEAM_NETWORKING_SEND_UNRELIABLE_NO_DELAY = 5
 const STEAM_NETWORKING_SEND_RELIABLE = 8
-const FORCE_ALL_STEAM_MESSAGES_RELIABLE = true
+const FORCE_ALL_STEAM_MESSAGES_RELIABLE = false
 # SteamNetworkingMessages reliable packets can fail around large payload limits.
 # Keep each chunk well below 64KB after the JSON/base64 wrapper is added.
 const P2P_JSON_CHUNK_TRIGGER_BYTES = 400 * 1024
@@ -55,6 +57,9 @@ const P2P_JSON_CHUNK_SENDS_PER_FRAME = 1
 # full, keep the packet at the head of the queue and retry after a few frames.
 const P2P_JSON_CHUNK_RETRY_DELAY_MSEC = 100
 const P2P_JSON_CHUNK_TTL_MSEC = 15000
+# Latest-state packets are useful only while fresh. They normally bypass the application
+# retry queue entirely; this short TTL is a safety net for oversized/chunked state packets.
+const P2P_LATEST_STATE_QUEUE_TTL_MSEC = 750
 # Retry after 2s, then 4s, then cap at one hello every 8s until a valid Host reply arrives.
 const CLIENT_HELLO_RETRY_DELAYS_MSEC = [2000, 4000, 8000]
 const CLIENT_SETUP_DUPLICATE_SUPPRESS_MSEC = 5000
@@ -400,13 +405,6 @@ func _ui_text(key: String) -> String:
 	return translation_key
 
 
-func _get_auto_join_host_player_enabled() -> bool:
-	var tree = get_tree()
-	if tree == null or tree.root == null:
-		return true
-	return bool(tree.root.get_meta(META_AUTO_JOIN_HOST_PLAYER, true))
-
-
 func _disable_custom_button_auto_translation(button: Node) -> void:
 	if button != null and button.has_method("set_message_translation"):
 		button.set_message_translation(false)
@@ -441,7 +439,48 @@ func _bind_transports() -> void:
 		_connect_transport_signal(_lan_transport, "peer_disconnected", "_on_transport_peer_disconnected")
 		_connect_transport_signal(_lan_transport, "packet_received", "_on_transport_packet_received")
 		_connect_transport_signal(_lan_transport, "connection_failed", "_on_transport_connection_failed")
+	_bind_slot_manager_signals()
 	_clear_stale_join_presence_at_boot()
+
+
+func _bind_slot_manager_signals() -> void:
+	var slot_manager = _get_slot_manager()
+	if slot_manager == null:
+		return
+	if slot_manager.has_signal("host_local_topology_changed") and not slot_manager.is_connected("host_local_topology_changed", self, "_on_host_local_topology_changed"):
+		var _slot_signal_err = slot_manager.connect("host_local_topology_changed", self, "_on_host_local_topology_changed")
+
+
+func _on_host_local_topology_changed(_local_player_indices: Array) -> void:
+	if not _session_active or not _is_game_host() or _should_freeze_online_run_slots():
+		return
+	if not _is_host_at_character_selection_for_lobby():
+		return
+
+	# Vanilla has already appended the Host-local slot. Existing remote player_index
+	# values stay untouched; only invalidate menu/setup dedup state and rebroadcast
+	# the authoritative topology.
+	for peer_key_value in _connection_by_peer_key.keys():
+		_refresh_player_connection(str(peer_key_value))
+	_last_broadcast_selection_key = ""
+	_sent_character_setup_key_by_steam_id.clear()
+	_sent_weapon_setup_key_by_steam_id.clear()
+	_sync_host_local_join_listening_state()
+	_publish_session_metadata()
+	_update_character_lobby_status_label_state()
+	_update_continue_lobby_status_label_state()
+	_schedule_prime_and_broadcast_after_remote_join()
+
+
+func _sync_host_local_join_listening_state() -> void:
+	if not _session_active or not _is_game_host() or _should_freeze_online_run_slots():
+		return
+	if not _is_host_at_character_selection_for_lobby():
+		return
+	# Vanilla local join should remain available while the online room still has a
+	# game-player slot. Disable it at 4/4 so a pending/remote-reserved slot cannot
+	# race with a newly-added Host local player.
+	CoopService.listening_for_inputs = get_session_member_count() < MAX_LOBBY_MEMBERS
 
 
 func _connect_steam_transport_signals() -> void:
@@ -661,7 +700,7 @@ func _register_remote_connection(peer_key: String, transport: Node, peer) -> boo
 		_session_remote_peer_keys[slot] = peer_key
 		_rebind_remote_slot(takeover_key, peer_key)
 		_host_known_remote_ids.erase(takeover_key)
-	elif _session_remote_peer_keys.size() >= MAX_LOBBY_MEMBERS - 1:
+	elif get_session_member_count() >= MAX_LOBBY_MEMBERS:
 		_rejected_peer_keys[peer_key] = true
 		if transport != null and transport.has_method("close_peer"):
 			transport.close_peer(peer)
@@ -735,7 +774,27 @@ func broadcast_message(message: Dictionary, except_peer_key: String = "", reliab
 
 
 func get_session_member_count() -> int:
-	return 1 + _connection_by_peer_key.size() if _session_active and _is_game_host() else max(1, _members.size())
+	# Public/lobby capacity is game-player capacity, not machine/Steam-member count.
+	# A Host can own several local players while every remote peer still owns one.
+	if _session_active and _is_game_host():
+		return int(max(1, _get_host_local_player_count_for_capacity())) + int(_session_remote_peer_keys.size())
+	if _session_active:
+		return int(max(max(1, int(CoopService.connected_players.size())), int(_members.size())))
+	return int(max(1, int(_members.size())))
+
+
+func _get_host_local_player_count_for_capacity() -> int:
+	var slot_manager = _get_slot_manager()
+	if slot_manager != null and slot_manager.has_method("get_host_local_player_count"):
+		return int(slot_manager.get_host_local_player_count())
+
+	# Fallback for an unusually early call before OnlinePlayerSlotManager is ready.
+	var remote_count = 0
+	if slot_manager != null and slot_manager.has_method("is_remote_player_index"):
+		for i in range(CoopService.connected_players.size()):
+			if bool(slot_manager.is_remote_player_index(i)):
+				remote_count += 1
+	return int(max(1, int(CoopService.connected_players.size()) - remote_count))
 
 
 func get_lobby_state() -> String:
@@ -851,6 +910,29 @@ func _set_lobby_joinable_if_changed(joinable: bool) -> void:
 		_lobby_joinable_cache_valid = true
 
 
+func _get_room_name_for_lobby() -> String:
+	var parent = get_parent()
+	if parent != null:
+		var settings_manager = parent.get_node_or_null("BrotatoOnlineModSettingsManager")
+		if settings_manager != null and settings_manager.has_method("get_room_name"):
+			var configured_name = _sanitize_lobby_room_name(str(settings_manager.call("get_room_name")))
+			if configured_name != "":
+				return configured_name
+
+	if _steam != null and _steam_has_method("getPersonaName"):
+		var persona_name = _sanitize_lobby_room_name(str(_steam.getPersonaName()))
+		if persona_name != "":
+			return persona_name
+	return DEFAULT_ROOM_NAME
+
+
+func _sanitize_lobby_room_name(text: String) -> String:
+	var normalized = text.replace("\r", " ").replace("\n", " ").strip_edges()
+	if normalized.length() > ROOM_NAME_MAX_LENGTH:
+		normalized = normalized.substr(0, ROOM_NAME_MAX_LENGTH)
+	return normalized
+
+
 func get_lan_discovery_info() -> Dictionary:
 	if not _session_active or not _is_game_host() or _lan_transport == null or not _lan_transport.is_hosting():
 		return {}
@@ -865,6 +947,7 @@ func get_lan_discovery_info() -> Dictionary:
 		host_mods_payload = ""
 	return {
 		"host_name": host_name,
+		"room_name": _get_room_name_for_lobby(),
 		"game_port": _lan_game_port,
 		"member_count": get_session_member_count(),
 		"member_limit": MAX_LOBBY_MEMBERS,
@@ -886,6 +969,7 @@ func _publish_session_metadata() -> void:
 	var state = get_lobby_state()
 	var joinable = count < MAX_LOBBY_MEMBERS and (state == "character_selection")
 	_set_lobby_metadata_if_changed("session_id", _get_wire_session_id())
+	_set_lobby_metadata_if_changed("room_name", _get_room_name_for_lobby())
 	_set_lobby_metadata_if_changed("member_count", str(count))
 	_set_lobby_metadata_if_changed("member_limit", str(MAX_LOBBY_MEMBERS))
 	_set_lobby_metadata_if_changed("state", state)
@@ -993,7 +1077,7 @@ func _process(_delta: float) -> void:
 		_poll_and_send_local_run_page_actions()
 		_bo_net_diag_cost("poll_client_menu_send", t_menu_send)
 
-	# Battle send behavior is intentionally unchanged in this pass.
+	# Realtime battle state is latest-only/unreliable; one-shot battle events remain reliable.
 	var t_battle_send = OS.get_ticks_usec()
 	_poll_and_send_local_client_battle_input()
 	_poll_and_send_host_battle_snapshot()
@@ -1840,7 +1924,7 @@ func _setup_lobby_data() -> void:
 	var lobby_type = _get_steam_const("LOBBY_TYPE_PUBLIC", LOBBY_TYPE_PUBLIC_FALLBACK) if public_lobby else _get_steam_const("LOBBY_TYPE_FRIENDS_ONLY", LOBBY_TYPE_FRIENDS_ONLY_FALLBACK)
 	if _steam_has_method("setLobbyType"):
 		_steam.setLobbyType(_lobby_id, lobby_type)
-	_set_lobby_joinable_if_changed(true)
+	_set_lobby_joinable_if_changed(get_session_member_count() < MAX_LOBBY_MEMBERS)
 
 	if _steam_has_method("setLobbyData"):
 		var host_name = _self_steam_id
@@ -1854,6 +1938,7 @@ func _setup_lobby_data() -> void:
 		_set_lobby_metadata_if_changed("state", "character_selection")
 		_set_lobby_metadata_if_changed("host", _self_steam_id)
 		_set_lobby_metadata_if_changed("host_name", host_name)
+		_set_lobby_metadata_if_changed("room_name", _get_room_name_for_lobby())
 		_set_lobby_metadata_if_changed("session_id", _get_wire_session_id())
 		_set_lobby_metadata_if_changed("member_count", str(get_session_member_count()))
 		_set_lobby_metadata_if_changed("member_limit", str(MAX_LOBBY_MEMBERS))
@@ -1996,6 +2081,7 @@ func _sync_host_coop_slots_from_lobby() -> void:
 
 	var remote_ids = _get_remote_ids_for_host_sync()
 	slot_manager.online_sync_remote_steam_ids(remote_ids)
+	_sync_host_local_join_listening_state()
 	for peer_key_value in _connection_by_peer_key.keys():
 		_refresh_player_connection(str(peer_key_value))
 	_schedule_prime_and_broadcast_after_remote_join()
@@ -2196,7 +2282,7 @@ func _poll_and_send_local_client_battle_input() -> void:
 
 	for msg in messages:
 		if typeof(msg) == TYPE_DICTIONARY and not msg.empty():
-			send_battle_message_to_host(msg, true)
+			send_battle_message_to_host(msg, false)
 
 
 func _notify_menu_sync_game_start_guard(start_id: int, reason: String) -> void:
@@ -5616,7 +5702,7 @@ func _poll_and_send_host_battle_snapshot() -> void:
 		_last_battle_snapshot_sent_tick_by_steam_id[steam_id] = tick
 
 		# experimental; it can reduce remote-player drift at the cost of possible backlog.
-		_send_p2p_json(steam_id, wire_snapshot, true)
+		_send_p2p_json(steam_id, wire_snapshot, false)
 	if reliable_needed and reliable_attempted and reliable_all_ok and snapshot_manager.has_method("mark_battle_reliable_events_sent"):
 		snapshot_manager.mark_battle_reliable_events_sent(reliable_msg)
 
@@ -6057,10 +6143,6 @@ func _handle_battle_snapshot_from_host(message: Dictionary) -> void:
 	var replica_manager = _get_battle_replica_manager()
 	if replica_manager != null and replica_manager.has_method("receive_battle_snapshot_from_host"):
 		replica_manager.receive_battle_snapshot_from_host(expanded)
-	else:
-		var ghost_layer = _get_battle_ghost_layer()
-		if ghost_layer != null and ghost_layer.has_method("receive_battle_snapshot_from_host"):
-			ghost_layer.receive_battle_snapshot_from_host(expanded)
 	_bo_net_diag_cost("apply_battle_snapshot", t_apply, "tick=" + str(tick) + " players=" + str(_safe_array_size(expanded.get("players", []))) + " entities=" + str(_safe_array_size(expanded.get("entities", []))) + " removed=" + str(_safe_array_size(expanded.get("removed", []))))
 
 	var should_log = _client_battle_snapshot_rx_count <= CLIENT_BATTLE_SNAPSHOT_LOG_FIRST_COUNT
@@ -6692,18 +6774,23 @@ func _send_p2p_json(target_steam_id: String, message: Dictionary, reliable: bool
 	var wire_message = _annotate_online_session_message(message)
 	var msg_type = str(wire_message.get("msg_type", ""))
 	var payload = to_json(wire_message).to_utf8()
-	var send_flags = STEAM_NETWORKING_SEND_RELIABLE if (reliable or FORCE_ALL_STEAM_MESSAGES_RELIABLE) else 0
+	var latest_state = _is_latest_state_p2p_message(wire_message)
+	# Continuous state must never join Steam's reliable backlog. Input/snapshot/state
+	# heartbeats replace older samples, so retransmitting stale samples only creates
+	# head-of-line blocking and can make an otherwise-live session stop being realtime.
+	var effective_reliable = reliable or FORCE_ALL_STEAM_MESSAGES_RELIABLE
+	if latest_state:
+		effective_reliable = false
+	var send_flags = STEAM_NETWORKING_SEND_RELIABLE if effective_reliable else (STEAM_NETWORKING_SEND_UNRELIABLE_NO_DELAY if latest_state else 0)
 	var channel = _get_p2p_channel_for_message_type(msg_type)
 	var coalesce_key = _get_p2p_send_queue_coalesce_key(target_steam_id, wire_message, channel)
-	_bo_net_diag_log_large_or_queued_send(target_steam_id, msg_type, payload.size(), channel, reliable or FORCE_ALL_STEAM_MESSAGES_RELIABLE, "large_payload", _pending_p2p_chunk_sends.size())
+	_bo_net_diag_log_large_or_queued_send(target_steam_id, msg_type, payload.size(), channel, effective_reliable, "large_payload", _pending_p2p_chunk_sends.size())
 
-	# SteamNetworkingMessages can carry medium reliable messages directly and only
-	# needs application-level chunking for very large payloads. LAN uses Godot 3.x
+	# SteamNetworkingMessages can carry medium messages directly and only needs
+	# application-level chunking for very large payloads. LAN uses Godot 3.x
 	# NetworkedMultiplayerENet instead. Its put_packet() reports OK after handing the
 	# packet to ENet even when ENet rejects that send internally, so a large direct LAN
-	# packet cannot reliably fall back through the send-failed path below. Pre-chunk
-	# LAN payloads before they reach ENet; the existing chunk queue/reassembly is
-	# transport-agnostic and also preserves ordering for following menu actions.
+	# packet cannot reliably fall back through the send-failed path below.
 	var target_connection = _connection_by_peer_key.get(target_steam_id, {})
 	var target_transport = target_connection.get("transport", null) if typeof(target_connection) == TYPE_DICTIONARY else null
 	var is_lan_target = target_transport != null and target_transport == _lan_transport
@@ -6711,42 +6798,47 @@ func _send_p2p_json(target_steam_id: String, message: Dictionary, reliable: bool
 	if is_lan_target and payload.size() > LAN_P2P_JSON_CHUNK_RAW_BYTES:
 		should_prechunk = true
 	if should_prechunk:
-		var queued_large = _queue_p2p_json_chunks(target_steam_id, payload, msg_type, send_flags, channel, coalesce_key)
-		return queued_large
+		return _queue_p2p_json_chunks(target_steam_id, payload, msg_type, send_flags, channel, coalesce_key, latest_state)
 
-	# If a large message to this peer/channel is still being split across frames,
-	# queue later small messages behind it. Otherwise shop_buy can be chunked while
-	# shop_focus/shop_reroll goes out immediately, making the Host see a higher
-	# action seq first and reject the delayed buy as stale.
-	if _has_pending_p2p_send_for_target_channel(target_steam_id, channel):
-		_bo_net_diag_log_large_or_queued_send(target_steam_id, msg_type, payload.size(), channel, reliable or FORCE_ALL_STEAM_MESSAGES_RELIABLE, "queued_behind_pending", _pending_p2p_chunk_sends.size())
-		var queued_behind = _queue_p2p_json_direct_after_pending(target_steam_id, payload, msg_type, send_flags, channel, coalesce_key)
-		return queued_behind
+	# Reliable commands/events preserve application ordering behind an already queued
+	# packet for this peer/channel. Latest-state traffic intentionally bypasses that
+	# queue: a fresh input/snapshot must not wait behind stale reliable traffic.
+	if not latest_state and _has_pending_p2p_send_for_target_channel(target_steam_id, channel):
+		_bo_net_diag_log_large_or_queued_send(target_steam_id, msg_type, payload.size(), channel, effective_reliable, "queued_behind_pending", _pending_p2p_chunk_sends.size())
+		return _queue_p2p_json_direct_after_pending(target_steam_id, payload, msg_type, send_flags, channel, coalesce_key, false)
 
-	var result = _send_transport_payload(target_steam_id, payload, channel, reliable or FORCE_ALL_STEAM_MESSAGES_RELIABLE)
+	var result = _send_transport_payload(target_steam_id, payload, channel, send_flags)
 	var ok = _steam_networking_send_ok(result)
 	if not ok:
-		_bo_net_diag_log_large_or_queued_send(target_steam_id, msg_type, payload.size(), channel, reliable or FORCE_ALL_STEAM_MESSAGES_RELIABLE, "send_failed", _pending_p2p_chunk_sends.size())
+		_bo_net_diag_log_large_or_queued_send(target_steam_id, msg_type, payload.size(), channel, effective_reliable, "send_failed", _pending_p2p_chunk_sends.size())
 		if payload.size() > P2P_JSON_CHUNK_RAW_BYTES:
-			return _queue_p2p_json_chunks(target_steam_id, payload, msg_type, send_flags, channel, coalesce_key)
-		if coalesce_key != "":
-			return _queue_p2p_json_direct_after_pending(target_steam_id, payload, msg_type, send_flags, channel, coalesce_key)
+			return _queue_p2p_json_chunks(target_steam_id, payload, msg_type, send_flags, channel, coalesce_key, latest_state)
+		# Reliable commands/events are accepted into the application retry queue instead
+		# of being silently lost when Steam reports a full send buffer. Latest-state
+		# packets are deliberately dropped here; the next heartbeat replaces them.
+		if effective_reliable:
+			return _queue_p2p_json_direct_after_pending(target_steam_id, payload, msg_type, send_flags, channel, coalesce_key, false)
 	return ok
 
 
-func _send_transport_payload(target_peer_key: String, payload: PoolByteArray, channel: int, reliable: bool) -> bool:
+func _send_transport_payload(target_peer_key: String, payload: PoolByteArray, channel: int, send_flags: int) -> bool:
+	var reliable = (send_flags & STEAM_NETWORKING_SEND_RELIABLE) != 0
 	var connection = _connection_by_peer_key.get(target_peer_key, {})
 	if typeof(connection) == TYPE_DICTIONARY and not connection.empty():
 		var transport = connection.get("transport", null)
-		if transport != null and transport.has_method("send_packet"):
-			return bool(transport.send_packet(connection.get("peer", target_peer_key), payload, channel, reliable))
+		if transport != null:
+			if transport.has_method("send_packet_with_flags"):
+				return bool(transport.send_packet_with_flags(connection.get("peer", target_peer_key), payload, channel, send_flags))
+			if transport.has_method("send_packet"):
+				return bool(transport.send_packet(connection.get("peer", target_peer_key), payload, channel, reliable))
 	if _session_remote_peer_keys.has(target_peer_key):
 		return false
 	if _steam_transport != null and _steam_transport.is_available():
+		if _steam_transport.has_method("send_packet_with_flags"):
+			return bool(_steam_transport.send_packet_with_flags(target_peer_key, payload, channel, send_flags))
 		return bool(_steam_transport.send_packet(target_peer_key, payload, channel, reliable))
 	if _steam != null and _steam_has_method("sendMessageToUser"):
-		var flags = STEAM_NETWORKING_SEND_RELIABLE if reliable else 0
-		return _steam_networking_send_ok(_steam.sendMessageToUser(int(target_peer_key), payload, flags, channel))
+		return _steam_networking_send_ok(_steam.sendMessageToUser(int(target_peer_key), payload, send_flags, channel))
 	return false
 
 
@@ -6759,13 +6851,29 @@ func _has_pending_p2p_send_for_target_channel(target_steam_id: String, channel: 
 	return false
 
 
+func _is_latest_state_p2p_message(message: Dictionary) -> bool:
+	if typeof(message) != TYPE_DICTIONARY or message.empty():
+		return false
+	var msg_type = str(message.get("msg_type", ""))
+	if msg_type == "battle_input" or msg_type == "battle_snapshot":
+		return true
+	if msg_type == "player_state":
+		return not bool(message.get("terminal", false)) and not bool(message.get("dead", false))
+	return false
+
+
 func _get_p2p_send_queue_coalesce_key(target_steam_id: String, message: Dictionary, channel: int) -> String:
-	# Only coalesce packets that describe a latest UI position/state. Normal sends are
-	# untouched; this key is used only when Steam send buffering forces the packet into
-	# _pending_p2p_chunk_sends.
+	# Coalesce replaceable latest-state/UI packets when they must enter the application
+	# queue. Reliable one-shot commands/events intentionally receive no key.
 	if typeof(message) != TYPE_DICTIONARY or message.empty():
 		return ""
 	var msg_type = str(message.get("msg_type", ""))
+	if msg_type == "battle_snapshot":
+		return target_steam_id + ":" + str(channel) + ":battle_snapshot"
+	if msg_type == "battle_input":
+		return target_steam_id + ":" + str(channel) + ":battle_input:" + str(message.get("player_index", ""))
+	if msg_type == "player_state" and not bool(message.get("terminal", false)) and not bool(message.get("dead", false)):
+		return target_steam_id + ":" + str(channel) + ":player_state:" + str(message.get("player_index", ""))
 	if msg_type == "menu_focus":
 		return target_steam_id + ":" + str(channel) + ":menu_focus:" + str(message.get("screen", "")) + ":" + str(message.get("origin_steam_id", "")) + ":" + str(message.get("player_index", ""))
 	if msg_type != "run_page_action_sync":
@@ -6813,7 +6921,7 @@ func _drop_pending_p2p_sends_for_target(target_peer_key: String) -> void:
 		i -= 1
 
 
-func _queue_p2p_json_direct_after_pending(target_steam_id: String, payload: PoolByteArray, msg_type: String, send_flags: int, channel: int, coalesce_key: String = "") -> bool:
+func _queue_p2p_json_direct_after_pending(target_steam_id: String, payload: PoolByteArray, msg_type: String, send_flags: int, channel: int, coalesce_key: String = "", latest_state: bool = false) -> bool:
 	if payload.size() <= 0:
 		return false
 	# A packet can be below the pre-chunk trigger but still too large for the
@@ -6821,7 +6929,7 @@ func _queue_p2p_json_direct_after_pending(target_steam_id: String, payload: Pool
 	# preserving ordering behind the already-pending sends.
 	var chunk_raw_bytes = _get_p2p_chunk_raw_bytes_for_target(target_steam_id)
 	if payload.size() > chunk_raw_bytes:
-		return _queue_p2p_json_chunks(target_steam_id, payload, msg_type, send_flags, channel, coalesce_key)
+		return _queue_p2p_json_chunks(target_steam_id, payload, msg_type, send_flags, channel, coalesce_key, latest_state)
 	_drop_pending_p2p_coalesced_sends(coalesce_key, target_steam_id, channel)
 	var now = OS.get_ticks_msec()
 	_pending_p2p_chunk_sends.append({
@@ -6838,12 +6946,13 @@ func _queue_p2p_json_direct_after_pending(target_steam_id: String, payload: Pool
 		"next_send_msec": now,
 		"retry_count": 0,
 		"last_retry_log_msec": 0,
-		"coalesce_key": coalesce_key
+		"coalesce_key": coalesce_key,
+		"latest_state": latest_state
 	})
 	return true
 
 
-func _queue_p2p_json_chunks(target_steam_id: String, payload: PoolByteArray, msg_type: String, send_flags: int, channel: int, coalesce_key: String = "") -> bool:
+func _queue_p2p_json_chunks(target_steam_id: String, payload: PoolByteArray, msg_type: String, send_flags: int, channel: int, coalesce_key: String = "", latest_state: bool = false) -> bool:
 	if payload.size() <= 0:
 		return false
 	var chunk_raw_bytes = _get_p2p_chunk_raw_bytes_for_target(target_steam_id)
@@ -6856,7 +6965,7 @@ func _queue_p2p_json_chunks(target_steam_id: String, payload: PoolByteArray, msg
 	if chunk_count <= 1:
 		return false
 	_drop_pending_p2p_coalesced_sends(coalesce_key, target_steam_id, channel)
-	_bo_net_diag_log_large_or_queued_send(target_steam_id, msg_type, payload.size(), channel, true, "chunk_queue", _pending_p2p_chunk_sends.size() + chunk_count)
+	_bo_net_diag_log_large_or_queued_send(target_steam_id, msg_type, payload.size(), channel, (send_flags & STEAM_NETWORKING_SEND_RELIABLE) != 0, "chunk_queue", _pending_p2p_chunk_sends.size() + chunk_count)
 	for chunk_index in range(chunk_count):
 		var start = chunk_index * chunk_raw_bytes
 		var length = min(chunk_raw_bytes, payload.size() - start)
@@ -6885,9 +6994,71 @@ func _queue_p2p_json_chunks(target_steam_id: String, payload: PoolByteArray, msg
 			"next_send_msec": now,
 			"retry_count": 0,
 			"last_retry_log_msec": 0,
-			"coalesce_key": coalesce_key
+			"coalesce_key": coalesce_key,
+			"latest_state": latest_state
 		})
 	return true
+
+
+func _prune_stale_pending_p2p_sends(now: int) -> void:
+	if _pending_p2p_chunk_sends.empty():
+		return
+	var stale_chunk_ids = {}
+	var removed = 0
+	var i = _pending_p2p_chunk_sends.size() - 1
+	while i >= 0:
+		var queued = _pending_p2p_chunk_sends[i]
+		if typeof(queued) != TYPE_DICTIONARY:
+			_pending_p2p_chunk_sends.remove(i)
+			removed += 1
+			i -= 1
+			continue
+		# Only replaceable realtime state is allowed to expire here. Reliable events and
+		# commands stay queued until Steam accepts them; silently expiring those would
+		# trade congestion for lost purchases/births/ready actions.
+		if not bool(queued.get("latest_state", false)):
+			i -= 1
+			continue
+		var queued_msec = int(queued.get("queued_msec", now))
+		if now - queued_msec <= P2P_LATEST_STATE_QUEUE_TTL_MSEC:
+			i -= 1
+			continue
+		var chunk_id = str(queued.get("chunk_id", ""))
+		if chunk_id != "":
+			stale_chunk_ids[chunk_id] = true
+		else:
+			_pending_p2p_chunk_sends.remove(i)
+			removed += 1
+		i -= 1
+	if not stale_chunk_ids.empty():
+		i = _pending_p2p_chunk_sends.size() - 1
+		while i >= 0:
+			var queued = _pending_p2p_chunk_sends[i]
+			if typeof(queued) == TYPE_DICTIONARY and stale_chunk_ids.has(str(queued.get("chunk_id", ""))):
+				_pending_p2p_chunk_sends.remove(i)
+				removed += 1
+			i -= 1
+	if removed > 0:
+		_bo_net_diag_state_change("SEND_QUEUE_PRUNE", str(removed) + ":" + str(_pending_p2p_chunk_sends.size()), "removed=" + str(removed) + " pending=" + str(_pending_p2p_chunk_sends.size()), 1000)
+
+
+func _find_next_ready_pending_p2p_send_index(now: int) -> int:
+	# Preserve FIFO ordering within each peer/channel, but do not let one connection
+	# in retry backoff block queued traffic for every other peer/channel.
+	var seen_peer_channels = {}
+	for i in range(_pending_p2p_chunk_sends.size()):
+		var queued = _pending_p2p_chunk_sends[i]
+		if typeof(queued) != TYPE_DICTIONARY:
+			return i
+		var target_steam_id = str(queued.get("target_steam_id", ""))
+		var channel = int(queued.get("channel", P2P_CHANNEL_MENU))
+		var ordering_key = target_steam_id + ":" + str(channel)
+		if seen_peer_channels.has(ordering_key):
+			continue
+		seen_peer_channels[ordering_key] = true
+		if int(queued.get("next_send_msec", 0)) <= now:
+			return i
+	return -1
 
 
 func _poll_pending_p2p_chunk_sends() -> void:
@@ -6895,23 +7066,28 @@ func _poll_pending_p2p_chunk_sends() -> void:
 		return
 	var poll_start_usec = OS.get_ticks_usec()
 	var now = OS.get_ticks_msec()
+	_prune_stale_pending_p2p_sends(now)
+	if _pending_p2p_chunk_sends.empty():
+		return
 	var sent = 0
+	var attempts = 0
+	var max_attempts = max(4, P2P_JSON_CHUNK_SENDS_PER_FRAME * 4)
 	var head_age = 0
 	if not _pending_p2p_chunk_sends.empty() and typeof(_pending_p2p_chunk_sends[0]) == TYPE_DICTIONARY:
 		head_age = now - int(_pending_p2p_chunk_sends[0].get("queued_msec", now))
 	if _pending_p2p_chunk_sends.size() >= BO_NET_DIAG_PENDING_QUEUE_WARN or head_age >= BO_NET_DIAG_PENDING_AGE_WARN_MSEC:
 		_bo_net_diag_state_change("SEND_QUEUE", str(_pending_p2p_chunk_sends.size()) + ":" + str(head_age), "pending=" + str(_pending_p2p_chunk_sends.size()) + " head_age_ms=" + str(head_age), 1000)
-	while sent < P2P_JSON_CHUNK_SENDS_PER_FRAME and not _pending_p2p_chunk_sends.empty():
-		var queued = _pending_p2p_chunk_sends[0]
-		if typeof(queued) != TYPE_DICTIONARY:
-			_pending_p2p_chunk_sends.pop_front()
-			continue
-		var next_send_msec = int(queued.get("next_send_msec", 0))
-		if next_send_msec > now:
-			# Keep strict ordering for this peer/channel. If the head packet hit
-			# Steam's send-buffer limit, later packets must not jump ahead.
+	while sent < P2P_JSON_CHUNK_SENDS_PER_FRAME and attempts < max_attempts and not _pending_p2p_chunk_sends.empty():
+		var queue_index = _find_next_ready_pending_p2p_send_index(now)
+		if queue_index < 0:
 			break
-		queued = _pending_p2p_chunk_sends.pop_front()
+		attempts += 1
+		var queued = _pending_p2p_chunk_sends[queue_index]
+		if typeof(queued) != TYPE_DICTIONARY:
+			_pending_p2p_chunk_sends.remove(queue_index)
+			continue
+		queued = _pending_p2p_chunk_sends[queue_index]
+		_pending_p2p_chunk_sends.remove(queue_index)
 		var target_steam_id = str(queued.get("target_steam_id", ""))
 		if target_steam_id == "" or target_steam_id == "0":
 			continue
@@ -6921,7 +7097,7 @@ func _poll_pending_p2p_chunk_sends() -> void:
 			continue
 		var send_flags = int(queued.get("send_flags", STEAM_NETWORKING_SEND_RELIABLE))
 		var channel = int(queued.get("channel", P2P_CHANNEL_MENU))
-		var result = _send_transport_payload(target_steam_id, payload, channel, send_flags == STEAM_NETWORKING_SEND_RELIABLE)
+		var result = _send_transport_payload(target_steam_id, payload, channel, send_flags)
 		var ok = _steam_networking_send_ok(result)
 		if not ok:
 			var result_name = _steam_networking_result_name(result)
@@ -6930,10 +7106,12 @@ func _poll_pending_p2p_chunk_sends() -> void:
 			queued["last_result"] = result
 			queued["last_result_name"] = result_name
 			queued["next_send_msec"] = now + P2P_JSON_CHUNK_RETRY_DELAY_MSEC
-			_pending_p2p_chunk_sends.insert(0, queued)
-			break
+			_pending_p2p_chunk_sends.insert(queue_index, queued)
+			# Keep trying another peer/channel this frame instead of turning one
+			# congested connection into a global queue barrier.
+			continue
 		sent += 1
-	_bo_net_diag_cost("poll_pending_chunk_send_loop", poll_start_usec, "sent=" + str(sent) + " pending=" + str(_pending_p2p_chunk_sends.size()) + " head_age_ms=" + str(head_age))
+	_bo_net_diag_cost("poll_pending_chunk_send_loop", poll_start_usec, "sent=" + str(sent) + " attempts=" + str(attempts) + " pending=" + str(_pending_p2p_chunk_sends.size()) + " head_age_ms=" + str(head_age))
 
 func _slice_pool_byte_array(bytes: PoolByteArray, start: int, length: int) -> PoolByteArray:
 	var out = PoolByteArray()
@@ -7351,7 +7529,7 @@ func _host_character_selection_slots_need_resync() -> bool:
 		return false
 
 	var remote_ids = _get_remote_ids_for_host_sync()
-	var target_count = remote_ids.size() + 1
+	var target_count = remote_ids.size() + max(1, _get_host_local_player_count_for_capacity())
 	if RunData.get_player_count() < target_count:
 		return true
 	if CoopService.connected_players.size() < target_count:
@@ -7781,8 +7959,6 @@ func _get_lobby_status_text() -> String:
 	if _session_active:
 		var count = get_session_member_count()
 		var text = _ui_text("status_open") % [count, MAX_LOBBY_MEMBERS]
-		if not _get_auto_join_host_player_enabled():
-			text += "\n" + _ui_text("status_auto_player_one_off")
 		return text
 
 	if _last_lobby_create_failed_result != 0:
@@ -8844,9 +9020,3 @@ func _get_battle_replica_manager() -> Node:
 		return null
 	return parent.get_node_or_null("BrotatoOnlineBattleReplicaManager")
 
-
-func _get_battle_ghost_layer() -> Node:
-	var parent = get_parent()
-	if parent == null:
-		return null
-	return parent.get_node_or_null("BrotatoOnlineBattleGhostLayer")

@@ -2,11 +2,10 @@ extends Node
 
 # Host owns spawn order, boss/elite movement, pet movement, economy/XP/upgrade/box queues and wave timer; pickups are local-only visuals/interactions.
 # Client locally simulates regular enemy movement/combat after Host-authoritative birth positions.
-# Client mirrors Host birth warnings with real EntityBirth visual timing, but does not let the legacy GhostLayer hide entities.
+# Client mirrors Host birth warnings with real EntityBirth visual timing.
 
 
 const PHASE = "B12_delayed_death_sync"
-const BULL_CHARACTER_ID = "character_bull"
 const LOOTER_ENEMY_ID = "looter"
 const LOOTER_SCENE_PATH = "res://entities/units/enemies/looter/looter.tscn"
 const LOCAL_SUPPRESS_INTERVAL_MSEC = 700
@@ -54,6 +53,8 @@ const BULLET_HELL_PHASE_SYNC_INTERVAL_MSEC = 250
 const BULLET_HELL_PHASE_DRIFT_CORRECTION_SEC = 0.20
 const BULLET_HELL_CLEAR_LOCAL_PROJECTILES_ON_FIRST_SYNC = true
 const UNKNOWN_ENTITY_RESYNC_REQUEST_INTERVAL_MSEC = 2000
+const UNKNOWN_ENTITY_RESYNC_BATCH_INTERVAL_MSEC = 120
+const UNKNOWN_ENTITY_RESYNC_BATCH_MAX_IDS = 32
 
 # Client battle teardown is intentionally split into a quiesce barrier and vanilla cleanup.
 # Never free combat objects while callbacks from the same battle can still be queued.
@@ -134,6 +135,8 @@ var _snapshot_gate_scene_instance_id = 0
 var _snapshot_gate_enter_msec = 0
 var _snapshot_gate_seen_running_wave = false
 var _last_entity_resync_request_msec_by_net_id = {}
+var _pending_entity_resync_requests_by_net_id = {}
+var _last_entity_resync_batch_send_msec = 0
 
 func _ready() -> void:
 	pause_mode = Node.PAUSE_MODE_PROCESS
@@ -500,6 +503,7 @@ func _process(delta: float) -> void:
 	_update_host_entity_positions(delta)
 	_update_remote_player_positions(delta)
 	_poll_and_send_player_state(false)
+	_flush_unknown_entity_resync_requests(false)
 	_flush_boss_damage_reports(false)
 	# Pickup claim polling disabled: pickups are local-only; Host corrects economy/XP/box queues.
 	_update_birth_markers()
@@ -935,32 +939,9 @@ func _prepare_remote_player_hurtbox_proxy(player: Node, player_index: int, reaso
 		return
 	player.set_meta("brotato_online_remote_damage_proxy", true)
 	player.set_meta("brotato_online_remote_hurtbox_proxy", true)
-	player.set_meta("brotato_online_remote_bull_hurtbox_proxy", _is_bull_player_index(player_index))
 	player.set_meta("brotato_online_hurtbox_disabled_player_index", player_index)
 	player.set_meta("brotato_online_hurtbox_enabled_reason", reason)
 
-
-
-
-func _is_bull_player_index(player_index: int) -> bool:
-	if player_index < 0:
-		return false
-	if RunData != null and RunData.has_method("get_player_count") and player_index >= int(RunData.get_player_count()):
-		return false
-	if RunData == null:
-		return false
-	var character = null
-	if RunData.has_method("get_player_character"):
-		character = RunData.get_player_character(player_index)
-	elif RunData.get("players_data") != null:
-		var players_data = RunData.get("players_data")
-		if typeof(players_data) == TYPE_ARRAY and player_index < players_data.size():
-			var player_data = players_data[player_index]
-			if player_data != null:
-				character = player_data.get("current_character")
-	if character == null:
-		return false
-	return str(character.get("my_id")) == BULL_CHARACTER_ID
 
 
 
@@ -1062,18 +1043,57 @@ func _request_unknown_entity_resync(net_id: String, category: String, reason: St
 	if now - last < UNKNOWN_ENTITY_RESYNC_REQUEST_INTERVAL_MSEC:
 		return
 	_last_entity_resync_request_msec_by_net_id[net_id] = now
+	# Missing births often arrive in clusters after a short network stall. Queue the IDs
+	# and send one reliable batch instead of one reliable packet per entity, otherwise
+	# the recovery path itself can become a traffic amplifier.
+	_pending_entity_resync_requests_by_net_id[net_id] = {
+		"category": category,
+		"reason": reason
+	}
+
+
+func _flush_unknown_entity_resync_requests(force: bool) -> void:
+	if _pending_entity_resync_requests_by_net_id.empty():
+		return
+	if _is_game_host() or not _is_online_session_active():
+		_pending_entity_resync_requests_by_net_id.clear()
+		return
+	var now = OS.get_ticks_msec()
+	if not force and now - _last_entity_resync_batch_send_msec < UNKNOWN_ENTITY_RESYNC_BATCH_INTERVAL_MSEC:
+		return
+	var net_ids = []
+	for id_value in _pending_entity_resync_requests_by_net_id.keys():
+		var id = str(id_value)
+		if id == "":
+			continue
+		net_ids.append(id)
+		if net_ids.size() >= UNKNOWN_ENTITY_RESYNC_BATCH_MAX_IDS:
+			break
+	if net_ids.empty():
+		_pending_entity_resync_requests_by_net_id.clear()
+		return
+	var first_id = str(net_ids[0])
+	var first_meta = _pending_entity_resync_requests_by_net_id.get(first_id, {})
 	var steam = _get_session_manager()
 	if steam == null or not steam.has_method("send_battle_message_to_host"):
 		return
-	steam.send_battle_message_to_host({
+	var sent = steam.send_battle_message_to_host({
 		"msg_type": "battle_entity_resync_request",
 		"phase": PHASE,
 		"player_index": _get_owned_player_index(),
-		"net_id": net_id,
-		"category": category,
-		"reason": reason,
+		# Keep net_id/category/reason for compatibility with hosts that only inspect the
+		# older single-entity fields; current hosts consume the full net_ids batch.
+		"net_id": first_id,
+		"net_ids": net_ids,
+		"category": str(first_meta.get("category", "")) if typeof(first_meta) == TYPE_DICTIONARY else "",
+		"reason": "batched:" + (str(first_meta.get("reason", "unknown_entity")) if typeof(first_meta) == TYPE_DICTIONARY else "unknown_entity"),
 		"client_time_msec": now
 	}, true)
+	if not sent:
+		return
+	_last_entity_resync_batch_send_msec = now
+	for id in net_ids:
+		_pending_entity_resync_requests_by_net_id.erase(str(id))
 
 
 func _get_snapshot_entities(snapshot: Dictionary) -> Array:
@@ -1255,8 +1275,6 @@ func _infer_pet_data_path(scene_path: String) -> String:
 			return "res://items/all/catling_gun/catling_gun_effect_0.tres"
 		"res://entities/units/pet/doc_moth/doc_moth.tscn":
 			return "res://items/all/doc_moth/doc_moth_effect_0.tres"
-		"res://entities/units/pet/jellyshield/jellyshield.tscn":
-			return "res://items/all/jellyshield/jellyshield_effect_1.tres"
 		"res://entities/units/pet/lootworm/lootworm.tscn":
 			return "res://items/all/lootworm/lootworm_effect_0.tres"
 		"res://entities/units/pet/ratzilla/ratzilla.tscn":
@@ -2238,8 +2256,9 @@ func _send_owned_player_state_packet(player: Node, force_dead: bool, reason: Str
 		return false
 	var sent = false
 	var count = max(1, repeat_count)
+	var packet_reliable = force_dead or local_dead
 	for _i in range(count):
-		if steam.send_battle_message_to_host(msg, true):
+		if steam.send_battle_message_to_host(msg, packet_reliable):
 			sent = true
 	if sent and local_dead and not _last_sent_player_dead_state:
 		pass
@@ -2276,7 +2295,7 @@ func _apply_reliable_birth_marker_state(birth_state: Dictionary, server_time_mse
 		return
 	if typeof(birth_state) != TYPE_DICTIONARY or birth_state.empty():
 		return
-	var id = str(birth_state.get("net_id", ""))	
+	var id = str(birth_state.get("net_id", ""))
 	if id == "":
 		return
 	var state_copy = birth_state.duplicate(true)
@@ -2428,7 +2447,7 @@ func _configure_birth_display_node(node: Node, birth_state: Dictionary) -> void:
 	var pos = _dict_to_vec2(birth_state.get("pos", {}))
 	var packed_scene = _load_packed_scene(str(birth_state.get("scene_path", "")))
 
-	# Use Brotato's real EntityBirth visual timing/flicker instead of a GhostLayer
+	# Use Brotato's real EntityBirth visual timing/flicker.
 	# overlay. The Host also sends a reserved entity_net_id in the warning packet,
 	# so the client can create the matching entity as soon as the marker expires.
 	if node.has_signal("birth_timeout") and not node.is_connected("birth_timeout", self, "_on_replica_birth_marker_timeout"):
@@ -3558,6 +3577,8 @@ func _clear_all(reason: String) -> void:
 	_sent_kill_claim_ids.clear()
 	_spawned_from_birth_marker_entity_ids.clear()
 	_last_entity_resync_request_msec_by_net_id.clear()
+	_pending_entity_resync_requests_by_net_id.clear()
+	_last_entity_resync_batch_send_msec = 0
 	_last_progression_apply_key_by_player.clear()
 	_last_progression_queue_key_by_player.clear()
 	_host_entity_samples.clear()

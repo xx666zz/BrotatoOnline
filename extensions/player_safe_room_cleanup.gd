@@ -209,10 +209,7 @@ func _brotato_online_restore_remote_proxy_hp(preferred_hp: int = -1) -> void:
 func _brotato_online_is_remote_hurtbox_proxy() -> bool:
 	if not _brotato_online_is_online_session_active():
 		return false
-	if has_meta("brotato_online_remote_hurtbox_proxy") and bool(get_meta("brotato_online_remote_hurtbox_proxy")):
-		return true
-	# Compatibility with scenes prepared by an older manager instance during hot reload.
-	return has_meta("brotato_online_remote_bull_hurtbox_proxy") and bool(get_meta("brotato_online_remote_bull_hurtbox_proxy"))
+	return has_meta("brotato_online_remote_hurtbox_proxy") and bool(get_meta("brotato_online_remote_hurtbox_proxy"))
 
 
 func take_damage(value: int, args: TakeDamageArgs) -> Array:

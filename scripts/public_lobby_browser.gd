@@ -139,9 +139,9 @@ func _input(event: InputEvent) -> void:
 	if not _overlay_open:
 		return
 	if event.is_action_released("ui_cancel"):
-		if _mods_panel != null and _mods_panel.visible:
+		if _mods_panel != null and is_instance_valid(_mods_panel) and _mods_panel.visible:
 			_hide_host_mods()
-		elif _direct_panel != null and _direct_panel.visible:
+		elif _direct_panel != null and is_instance_valid(_direct_panel) and _direct_panel.visible:
 			_hide_direct_connect()
 		else:
 			_close_browser_overlay()
@@ -310,6 +310,32 @@ func _clear_main_menu_button_ref() -> void:
 	_main_menu_button_parent = null
 	if _overlay_open:
 		_close_browser_overlay()
+	# The browser UI is parented to the title scene. When that scene is replaced,
+	# Godot 3 leaves member variables pointing at already-freed Objects. A null check
+	# is not enough for those references, so drop the complete UI cache once its
+	# owning scene has gone away.
+	if _overlay_parent != null and not is_instance_valid(_overlay_parent):
+		_clear_browser_overlay_refs()
+
+
+func _clear_browser_overlay_refs() -> void:
+	_overlay = null
+	_overlay_parent = null
+	_title_label = null
+	_status_label = null
+	_rows_container = null
+	_refresh_button = null
+	_direct_connect_button = null
+	_back_button = null
+	_direct_panel = null
+	_direct_address_edit = null
+	_direct_port_edit = null
+	_mods_panel = null
+	_mods_title_label = null
+	_mods_body_edit = null
+	_mods_close_button = null
+	_mods_return_focus = null
+	_last_focus_owner = null
 
 
 func _ensure_main_menu_browser_button(left_buttons: Node, create_lobby_button: Node) -> void:
@@ -900,23 +926,27 @@ func _focus_browser_refresh() -> void:
 
 
 func _show_direct_connect() -> void:
-	if _direct_panel == null:
+	if _direct_panel == null or not is_instance_valid(_direct_panel):
 		return
 	_direct_panel.show()
-	if _direct_address_edit != null:
+	if _direct_address_edit != null and is_instance_valid(_direct_address_edit):
 		_direct_address_edit.grab_focus()
 
 
 func _hide_direct_connect() -> void:
-	if _direct_panel != null:
+	if _direct_panel != null and is_instance_valid(_direct_panel):
 		_direct_panel.hide()
-	if _direct_connect_button != null:
+	if _direct_connect_button != null and is_instance_valid(_direct_connect_button):
 		_direct_connect_button.grab_focus()
 
 
 func _confirm_direct_connect() -> void:
-	var address = str(_direct_address_edit.text if _direct_address_edit != null else "").strip_edges()
-	var port = int(str(_direct_port_edit.text if _direct_port_edit != null else DEFAULT_LAN_PORT))
+	var address = ""
+	if _direct_address_edit != null and is_instance_valid(_direct_address_edit):
+		address = str(_direct_address_edit.text).strip_edges()
+	var port = DEFAULT_LAN_PORT
+	if _direct_port_edit != null and is_instance_valid(_direct_port_edit):
+		port = int(str(_direct_port_edit.text))
 	if address.find(":") != -1:
 		var parts = address.split(":", false, 1)
 		address = str(parts[0]).strip_edges()
@@ -943,7 +973,7 @@ func _close_browser_overlay() -> void:
 	_room_name_marquee_state_by_entry_key.clear()
 	_hide_direct_connect()
 	_hide_host_mods(false)
-	if _lan_discovery != null and _lan_discovery.has_method("stop_search"):
+	if _lan_discovery != null and is_instance_valid(_lan_discovery) and _lan_discovery.has_method("stop_search"):
 		_lan_discovery.stop_search()
 	if _overlay != null and is_instance_valid(_overlay):
 		_overlay.hide()

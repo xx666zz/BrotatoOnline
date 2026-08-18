@@ -17,6 +17,7 @@ const SHOP_HELD_ITEMS_SYNC_INCREMENTAL_ONLY = "incremental_only"
 const ENDLESS_INCREMENTAL_ITEMS_ONLY_START_WAVE = 21
 const SHOP_ITEMS_RESYNC_REQUEST_COOLDOWN_MSEC = 1500
 const SHOP_CUSTOM_POPUP_BUTTON_ACTION = "shop_custom_popup_button"
+const FOCUS_EMULATOR_MODAL_SUSPEND_META = "bo_player_list_modal_input_suspended"
 
 # Routine polls, focus changes and screen changes stay silent. Log only a single
 # expensive call, repeated medium-cost calls, input storms or queue backlogs.
@@ -6641,8 +6642,11 @@ func _ensure_local_progression_focus(container: Node, player_index: int, reason:
 	if focus_emulator is CanvasItem:
 		focus_emulator.show()
 	focus_emulator.set_process(true)
-	# Keep the vanilla FocusEmulator active for the local progression page.
-	focus_emulator.set_process_input(true)
+	# PlayerListOverlay temporarily owns modal input. Do not undo its suspension:
+	# vanilla FocusEmulator consumes unrelated mouse events in _input(), which would
+	# make the profile buttons unclickable while an upgrade/item page is visible.
+	if not (focus_emulator.has_meta(FOCUS_EMULATOR_MODAL_SUSPEND_META) and bool(focus_emulator.get_meta(FOCUS_EMULATOR_MODAL_SUSPEND_META))):
+		focus_emulator.set_process_input(true)
 
 	var current = _safe_get(focus_emulator, "focused_control", null)
 	if _is_live_ref(current) and current is Control and current.is_visible_in_tree() and _safe_node_is_parent_of(container, current):
@@ -8022,7 +8026,8 @@ func _configure_online_focus_emulator_input_owners(owner_player_indices: Array, 
 		var focus_emulator = Utils.get_focus_emulator(player_index)
 		if not _is_live_ref(focus_emulator):
 			continue
-		var should_process = bool(owner_lookup.get(player_index, false))
+		var modal_suspended = focus_emulator.has_meta(FOCUS_EMULATOR_MODAL_SUSPEND_META) and bool(focus_emulator.get_meta(FOCUS_EMULATOR_MODAL_SUSPEND_META))
+		var should_process = bool(owner_lookup.get(player_index, false)) and not modal_suspended
 		var was_processing = focus_emulator.is_processing_input()
 		if was_processing != should_process:
 			_bo_ui_diag_log("FOCUS_OWNER_SET", "reason=" + reason + " owners=" + str(owner_player_indices) + " player=" + str(player_index) + " from=" + str(was_processing) + " to=" + str(should_process) + " fe=" + _bo_ui_diag_node_desc(focus_emulator))

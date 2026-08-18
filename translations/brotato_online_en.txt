@@ -2,6 +2,7 @@ key,text
 MENU_BACK,Back
 BROTATO_ONLINE_MENU_SETTINGS,Online Settings
 BROTATO_ONLINE_SETTINGS_TITLE,Brotato Online Settings
+BROTATO_ONLINE_SETTINGS_CONTROLS_HELP,Controls: Quick chat Ctrl + Left Click / LT + Right Stick; Player list Tab / L3
 BROTATO_ONLINE_ROOM_NAME,Lobby name
 BROTATO_ONLINE_ROOM_NAME_DESC,"Defaults to your Steam name. Leave blank to restore the default. Up to 32 characters. Windowed mode is recommended for Chinese input; otherwise the IME candidate window may not appear."
 BROTATO_ONLINE_INPUT_DEVICE,Local online input device
@@ -114,3 +115,12 @@ BROTATO_ONLINE_STEAM_STATUS_FAILED_STEAM_NOT_READY,Failed to create lobby: Steam
 BROTATO_ONLINE_STEAM_STATUS_FAILED_API_UNAVAILABLE,Failed to create lobby: Steam API unavailable
 BROTATO_ONLINE_STEAM_STATUS_FAILED_CODE,"Failed to create lobby, code %d"
 BROTATO_ONLINE_STEAM_STATUS_CLOSED,Lobby closed
+BROTATO_ONLINE_PLAYER_LIST_TITLE,Players
+BROTATO_ONLINE_PLAYER_LIST_PLAYER_HEADER,Player
+BROTATO_ONLINE_PLAYER_LIST_PING_HEADER,Latency
+BROTATO_ONLINE_PLAYER_LIST_PROFILE,Steam Profile
+BROTATO_ONLINE_PLAYER_LIST_HINT,Hold Tab to show. Gamepad: press L3 to open/close, Up/Down to select, A to open Steam profile, B to close.
+BROTATO_ONLINE_PLAYER_LIST_PLAYER,Player %d
+BROTATO_ONLINE_PLAYER_LIST_LOCAL_PLAYER,Local Player %d
+BROTATO_ONLINE_PLAYER_LIST_CLIENT_UNSUPPORTED,Client unsupported
+BROTATO_ONLINE_PLAYER_LIST_HOST_UNSUPPORTED,Host unsupported

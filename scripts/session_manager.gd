@@ -17,6 +17,7 @@ const META_PUBLIC_LOBBY_ENABLED = "brotato_online_public_lobby_enabled"
 const ROOM_NAME_MAX_LENGTH = 32
 const DEFAULT_ROOM_NAME = "Brotato Online"
 const QUICK_CHAT_CUSTOM_TEXT_LIMIT = 20
+const FEATURE_PLAYER_LIST_KEY = "player_list_enabled"
 
 # GodotSteam exposes these lobby types as integer enums. Keep explicit fallbacks
 # because the Brotato build used by the mod does not expose constants uniformly.
@@ -192,6 +193,7 @@ var _pending_p2p_chunk_sends = []
 var _incoming_p2p_chunks = {}
 var _p2p_chunk_seq = 0
 var _seen_client_hello_by_steam_id = {}
+var _player_list_enabled_by_peer_key = {}
 var _client_seen_host_setup_key_by_sender = {}
 var _client_seen_host_setup_msec_by_sender = {}
 var _last_selection_request_reply_msec_by_steam_id = {}
@@ -1421,6 +1423,7 @@ func leave_lobby() -> void:
 	_pending_p2p_chunk_sends.clear()
 	_incoming_p2p_chunks.clear()
 	_seen_client_hello_by_steam_id.clear()
+	_player_list_enabled_by_peer_key.clear()
 	_client_seen_host_setup_key_by_sender.clear()
 	_client_seen_host_setup_msec_by_sender.clear()
 	_last_selection_request_reply_msec_by_steam_id.clear()
@@ -1562,6 +1565,29 @@ func get_game_host_steam_id() -> String:
 	return _get_game_host_steam_id()
 
 
+func is_player_list_enabled_for_peer(peer_key: String) -> bool:
+	if peer_key == "" or peer_key == "0":
+		return false
+	if peer_key == _self_steam_id:
+		return true
+	return bool(_player_list_enabled_by_peer_key.get(peer_key, false))
+
+
+func is_game_host_player_list_enabled() -> bool:
+	if _is_game_host():
+		return true
+	return is_player_list_enabled_for_peer(_get_game_host_steam_id())
+
+
+func is_peer_steam_connection(peer_key: String) -> bool:
+	if peer_key == "" or peer_key == "0":
+		return false
+	if peer_key == _self_steam_id:
+		return _lobby_id != 0 and not peer_key.begins_with("lan:")
+	var connection = _connection_by_peer_key.get(peer_key, {})
+	return typeof(connection) == TYPE_DICTIONARY and connection.get("transport", null) == _steam_transport
+
+
 func are_online_run_slots_locked() -> bool:
 	return _online_run_slots_locked
 
@@ -1682,6 +1708,7 @@ func _on_lobby_created(connect_result = 0, lobby_id = 0) -> void:
 	_online_flow_left_since_msec = 0
 	_pending_join_lobby_id = 0
 	_seen_client_hello_by_steam_id.clear()
+	_player_list_enabled_by_peer_key.clear()
 	_client_seen_host_setup_key_by_sender.clear()
 	_client_seen_host_setup_msec_by_sender.clear()
 	_last_selection_request_reply_msec_by_steam_id.clear()
@@ -2533,6 +2560,7 @@ func _reset_transient_online_state_for_new_session(reason: String = "") -> void:
 	_pending_received_menu_focus_by_sender.clear()
 	_pending_received_menu_focus_order.clear()
 	_seen_client_hello_by_steam_id.clear()
+	_player_list_enabled_by_peer_key.clear()
 	_client_seen_host_setup_key_by_sender.clear()
 	_client_seen_host_setup_msec_by_sender.clear()
 	_last_selection_request_reply_msec_by_steam_id.clear()
@@ -2936,6 +2964,7 @@ func _send_client_hello_to_host() -> void:
 		"steam_id": _self_steam_id,
 		"mod": "six666-BrotatoOnline",
 		"mod_version": NETWORK_PROTOCOL_VERSION,
+		"player_list_enabled": true,
 		"content_capability": _build_client_content_capability_for_hello()
 	}, true)
 
@@ -3349,6 +3378,11 @@ func _update_client_members_from_selection_state(message: Dictionary) -> void:
 
 func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 	var msg_type = str(message.get("msg_type", ""))
+	# Client capability is authoritative only in hello (handled below). On clients,
+	# accept the symmetric Host capability only from the current game host so another
+	# peer cannot spoof feature support with an unrelated packet.
+	if not _is_game_host() and from_steam_id == _get_game_host_steam_id() and message.has(FEATURE_PLAYER_LIST_KEY):
+		_player_list_enabled_by_peer_key[from_steam_id] = bool(message.get(FEATURE_PLAYER_LIST_KEY, false))
 
 	# Safety fallback: some SteamNetworkingMessages receive paths may dispatch directly
 	# into _handle_p2p_message without passing through _handle_raw_p2p_packet's
@@ -3385,6 +3419,9 @@ func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 		var broadcast_usec = 0
 		var first_hello = not _seen_client_hello_by_steam_id.has(from_steam_id)
 		_seen_client_hello_by_steam_id[from_steam_id] = true
+		# Old clients do not carry this field. Treat absence as an explicit lack of
+		# player-list protocol support so Host UI can distinguish it from ping timeout.
+		_player_list_enabled_by_peer_key[from_steam_id] = bool(message.get(FEATURE_PLAYER_LIST_KEY, false))
 		var client_content_changed = false
 		var menu_sync_for_capability = _get_menu_sync_manager()
 		var stage_start_usec = OS.get_ticks_usec()
@@ -6443,6 +6480,7 @@ func _send_host_character_setup_to_client(steam_id: String, force: bool = false)
 		return
 
 	var state = menu_sync.build_host_character_setup_state(steam_id, _self_steam_id)
+	state[FEATURE_PLAYER_LIST_KEY] = true
 	var current_scene = get_tree().current_scene
 	state["host_scene_instance_id"] = current_scene.get_instance_id() if current_scene != null else 0
 	_augment_host_zone_sync_payload(state)
@@ -6466,6 +6504,7 @@ func _send_host_weapon_setup_to_client(steam_id: String, force: bool = false) ->
 		return
 
 	var state = menu_sync.build_host_weapon_setup_state(steam_id, _self_steam_id)
+	state[FEATURE_PLAYER_LIST_KEY] = true
 	var current_scene = get_tree().current_scene
 	state["host_scene_instance_id"] = current_scene.get_instance_id() if current_scene != null else 0
 	_augment_host_zone_sync_payload(state)
@@ -6558,6 +6597,7 @@ func _send_host_scene_transition_to_client(steam_id: String, force: bool = false
 
 	var force_full_item_list = _should_force_full_item_list_for_scene_sync_to_client(steam_id)
 	var state = menu_sync.build_menu_scene_state(false, false, force_full_item_list)
+	state[FEATURE_PLAYER_LIST_KEY] = true
 	_augment_host_zone_sync_payload(state)
 	var screen = str(state.get("screen", ""))
 	if screen == "" or screen == "none" or screen == "character_selection" or screen == "weapon_selection":
@@ -6592,6 +6632,7 @@ func _send_host_scene_transition_to_client(steam_id: String, force: bool = false
 		loaded_from_payload_cache = true
 	else:
 		state = menu_sync.build_menu_scene_state(screen == "shop", true, force_full_item_list)
+		state[FEATURE_PLAYER_LIST_KEY] = true
 		_augment_host_zone_sync_payload(state)
 		if state.has("run_config") and typeof(state.get("run_config", {})) == TYPE_DICTIONARY:
 			var send_run_config = state.get("run_config", {}).duplicate(true)
@@ -6671,6 +6712,7 @@ func _send_selection_state_to_client(steam_id: String, _force: bool = false) -> 
 			return
 
 	var state = menu_sync.build_selection_state()
+	state[FEATURE_PLAYER_LIST_KEY] = true
 	_augment_host_zone_sync_payload(state)
 	_add_target_client_slot_to_selection_state(state, steam_id)
 	if str(state.get("screen", "")) == "none":
@@ -6712,6 +6754,7 @@ func _broadcast_selection_state(force: bool = false) -> void:
 			return
 
 	var state = menu_sync.build_selection_state()
+	state[FEATURE_PLAYER_LIST_KEY] = true
 	_augment_host_zone_sync_payload(state)
 	if str(state.get("screen", "")) == "none":
 		return

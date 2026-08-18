@@ -82,6 +82,7 @@ var _suppressed_focus_controls = []
 var _suspended_focus_emulators = []
 var _settings_panel = null
 var _title_label = null
+var _controls_help_label = null
 var _description_label = null
 var _back_button = null
 var _last_focus_owner = null
@@ -408,6 +409,7 @@ func _try_inject_title_screen_settings_button() -> void:
 		_quick_chat_editors.clear()
 		_settings_panel = null
 		_title_label = null
+		_controls_help_label = null
 		_description_label = null
 		_back_button = null
 		return
@@ -497,6 +499,7 @@ func _ensure_settings_overlay(title_screen: Node) -> void:
 		_settings_overlay = existing_overlay
 		_settings_panel = existing_overlay.get_node_or_null("CenterContainer/PanelContainer")
 		_title_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/TitleLabel")
+		_controls_help_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/ControlsHelpLabel")
 		_local_outline_button = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/LocalCharacterOutlineButton")
 		_local_outline_description_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/LocalCharacterOutlineDescriptionLabel")
 		_input_device_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/InputDeviceLabel")
@@ -581,6 +584,11 @@ func _ensure_settings_overlay(title_screen: Node) -> void:
 		title.add_font_override("font", title_font)
 	vbox.add_child(title)
 	_title_label = title
+
+	var controls_help = _create_settings_description_label("ControlsHelpLabel", "BROTATO_ONLINE_SETTINGS_CONTROLS_HELP")
+	controls_help.align = Label.ALIGN_CENTER
+	vbox.add_child(controls_help)
+	_controls_help_label = controls_help
 
 	var room_name_label = Label.new()
 	room_name_label.name = "RoomNameLabel"
@@ -1025,6 +1033,8 @@ func _refresh_localized_texts() -> void:
 		_settings_button.text = _txt("BROTATO_ONLINE_MENU_SETTINGS")
 	if _title_label != null and is_instance_valid(_title_label):
 		_title_label.text = _txt("BROTATO_ONLINE_SETTINGS_TITLE")
+	if _controls_help_label != null and is_instance_valid(_controls_help_label):
+		_controls_help_label.text = _txt("BROTATO_ONLINE_SETTINGS_CONTROLS_HELP")
 	if _local_outline_button != null and is_instance_valid(_local_outline_button):
 		_local_outline_button.text = _txt("BROTATO_ONLINE_LOCAL_CHARACTER_OUTLINE")
 	if _local_outline_description_label != null and is_instance_valid(_local_outline_description_label):

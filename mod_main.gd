@@ -130,6 +130,7 @@ func _ready() -> void:
 	_add_state_snapshot()
 	_add_battle_replica_manager()
 	_add_brotato_online_api()
+	_add_player_list_overlay_manager()
 	_add_pause_focus_alias_manager()
 
 
@@ -278,6 +279,14 @@ func _add_brotato_online_api() -> void:
 		"scripts/brotato_online_api.gd",
 		true
 	)
+
+func _add_player_list_overlay_manager() -> void:
+	_add_script_node(
+		"BrotatoOnlinePlayerListOverlay",
+		"scripts/player_list_overlay.gd",
+		false
+	)
+
 
 func _add_pause_focus_alias_manager() -> void:
 	# Minimal compatibility shim only for battle pause/options.

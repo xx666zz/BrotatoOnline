@@ -37,6 +37,8 @@ const PUBLIC_JOIN_VERIFY_TIMEOUT_MSEC = 6000
 const UI_SCAN_INTERVAL_MSEC = 300
 const HOST_MODS_FORMAT_VERSION = "1"
 const HOST_MODS_LOBBY_MAX_PARTS = 24
+const BLOCKLIST_FORMAT_VERSION = "1"
+const BLOCKLIST_LOBBY_MAX_PARTS = 24
 
 # A dedicated SteamNetworkingMessages channel is used for a tiny request/response
 # probe. It measures the route that the mod will actually use without joining the
@@ -259,6 +261,56 @@ func _get_session_manager() -> Node:
 	if tree == null or tree.root == null:
 		return null
 	return _find_node_named(tree.root, "BrotatoOnlineSessionManager", 0)
+
+
+func _get_mod_settings_manager():
+	var parent = get_parent()
+	if parent != null:
+		var direct = parent.get_node_or_null("BrotatoOnlineModSettingsManager")
+		if direct != null and is_instance_valid(direct):
+			return direct
+	return null
+
+
+func _get_self_steam_id() -> String:
+	var manager = _get_session_manager()
+	if manager != null and manager.has_method("get_self_steam_id"):
+		var session_id = str(manager.call("get_self_steam_id"))
+		if session_id.is_valid_integer() and int(session_id) > 0:
+			return session_id
+	if _steam != null and _steam_has_method("getSteamID"):
+		var steam_id = str(_steam.getSteamID())
+		if steam_id.is_valid_integer() and int(steam_id) > 0:
+			return steam_id
+	return ""
+
+
+func _is_steam_lobby_hidden_by_blocklist(lobby_id: int, host_id: String) -> bool:
+	if host_id == "" or host_id == "0" or not host_id.is_valid_integer():
+		return false
+	var settings_manager = _get_mod_settings_manager()
+	if settings_manager != null and settings_manager.has_method("is_steam_user_blocked"):
+		if bool(settings_manager.call("is_steam_user_blocked", host_id)):
+			return true
+	var self_id = _get_self_steam_id()
+	if self_id == "" or self_id == host_id or settings_manager == null or not settings_manager.has_method("make_public_block_token"):
+		return false
+	if _steam == null or not _steam_has_method("getLobbyData"):
+		return false
+	if str(_steam.getLobbyData(lobby_id, "blocklist_format")) != BLOCKLIST_FORMAT_VERSION:
+		return false
+	var part_count = int(str(_steam.getLobbyData(lobby_id, "blocklist_parts")))
+	if part_count <= 0 or part_count > BLOCKLIST_LOBBY_MAX_PARTS:
+		return false
+	var payload = ""
+	for i in range(part_count):
+		payload += str(_steam.getLobbyData(lobby_id, "blocklist_" + str(i)))
+	if payload == "":
+		return false
+	var self_token = str(settings_manager.call("make_public_block_token", host_id, self_id))
+	if self_token == "":
+		return false
+	return payload.split(",", false).has(self_token)
 
 
 func _find_node_named(node: Node, target_name: String, depth: int) -> Node:
@@ -1072,6 +1124,8 @@ func _read_lobby_entry(lobby_id: int) -> Dictionary:
 	if state == "":
 		state = "unknown"
 	var host_id = str(_steam.getLobbyData(lobby_id, "host"))
+	if _is_steam_lobby_hidden_by_blocklist(lobby_id, host_id):
+		return {}
 	var host_name = str(_steam.getLobbyData(lobby_id, "host_name"))
 	if host_name == "" and host_id != "" and host_id != "0" and _steam_has_method("getFriendPersonaName"):
 		host_name = str(_steam.getFriendPersonaName(int(host_id)))

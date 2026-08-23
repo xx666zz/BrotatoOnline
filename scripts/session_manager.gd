@@ -13,6 +13,9 @@ const LAN_PROTOCOL_VERSION = 1
 const HOST_MODS_FORMAT_VERSION = "1"
 const HOST_MODS_LOBBY_CHUNK_CHARS = 1000
 const HOST_MODS_LOBBY_MAX_PARTS = 24
+const BLOCKLIST_FORMAT_VERSION = "1"
+const BLOCKLIST_LOBBY_CHUNK_CHARS = 1000
+const BLOCKLIST_LOBBY_MAX_PARTS = 24
 const META_PUBLIC_LOBBY_ENABLED = "brotato_online_public_lobby_enabled"
 const ROOM_NAME_MAX_LENGTH = 32
 const DEFAULT_ROOM_NAME = "Brotato Online"
@@ -873,6 +876,47 @@ func _publish_host_mod_lobby_data() -> void:
 		var offset = i * HOST_MODS_LOBBY_CHUNK_CHARS
 		var chunk = payload.substr(offset, HOST_MODS_LOBBY_CHUNK_CHARS)
 		_set_lobby_metadata_if_changed("host_mods_" + str(i), chunk)
+
+
+func refresh_public_blocklist_metadata() -> void:
+	# Changing the list never touches live connections. It only refreshes optional
+	# lobby metadata used by future public-lobby browser results.
+	if not _is_game_host():
+		return
+	_publish_public_blocklist_lobby_data()
+
+
+func _get_mod_settings_manager():
+	var parent = get_parent()
+	if parent == null:
+		return null
+	return parent.get_node_or_null("BrotatoOnlineModSettingsManager")
+
+
+func _publish_public_blocklist_lobby_data() -> void:
+	if _steam == null or _lobby_id == 0 or not _steam_has_method("setLobbyData"):
+		return
+	var settings_manager = _get_mod_settings_manager()
+	var tokens = []
+	if settings_manager != null and settings_manager.has_method("get_blocked_steam_ids") and settings_manager.has_method("make_public_block_token"):
+		for blocked_id in settings_manager.call("get_blocked_steam_ids"):
+			var token = str(settings_manager.call("make_public_block_token", _self_steam_id, str(blocked_id)))
+			if token != "":
+				tokens.append(token)
+	var payload = ",".join(tokens)
+	var part_count = 0
+	if payload != "":
+		part_count = int(ceil(float(payload.length()) / float(BLOCKLIST_LOBBY_CHUNK_CHARS)))
+	_set_lobby_metadata_if_changed("blocklist_format", BLOCKLIST_FORMAT_VERSION)
+	if part_count > BLOCKLIST_LOBBY_MAX_PARTS:
+		# The settings manager caps the list below this in normal use. If metadata
+		# still overflows, publish no reciprocal filter rather than truncated data.
+		_set_lobby_metadata_if_changed("blocklist_parts", "0")
+		return
+	_set_lobby_metadata_if_changed("blocklist_parts", str(part_count))
+	for i in range(part_count):
+		var offset = i * BLOCKLIST_LOBBY_CHUNK_CHARS
+		_set_lobby_metadata_if_changed("blocklist_" + str(i), payload.substr(offset, BLOCKLIST_LOBBY_CHUNK_CHARS))
 
 
 func _reset_lobby_metadata_cache() -> void:
@@ -1972,6 +2016,7 @@ func _setup_lobby_data() -> void:
 		_set_lobby_metadata_if_changed("visibility", "public" if public_lobby else "friends")
 		_set_lobby_metadata_if_changed("connect", _make_lobby_connect_string(_lobby_id))
 		_publish_host_mod_lobby_data()
+		_publish_public_blocklist_lobby_data()
 
 
 func _setup_join_presence() -> void:

@@ -34,6 +34,7 @@ const FONT_PATHS = [
 var _api = null
 var _session = null
 var _slot_manager = null
+var _settings_manager = null
 var _steam = null
 
 var _overlay_layer = null
@@ -42,6 +43,7 @@ var _panel = null
 var _rows_container = null
 var _row_panels = []
 var _row_profile_buttons = []
+var _row_block_buttons = []
 var _visible_rows = []
 var _selected_row = 0
 var _overlay_open = false
@@ -698,11 +700,12 @@ func _rebuild_rows() -> void:
 		child.queue_free()
 	_row_panels.clear()
 	_row_profile_buttons.clear()
+	_row_block_buttons.clear()
 
 	for row_index in range(_visible_rows.size()):
 		var row_data = _visible_rows[row_index]
 		var panel = PanelContainer.new()
-		panel.rect_min_size = Vector2(705, 58)
+		panel.rect_min_size = Vector2(835, 58)
 		panel.mouse_filter = Control.MOUSE_FILTER_PASS
 		_rows_container.add_child(panel)
 		_row_panels.append(panel)
@@ -721,7 +724,7 @@ func _rebuild_rows() -> void:
 
 		var name_label = Label.new()
 		name_label.text = "P" + str(int(row_data.get("player_index", row_index)) + 1) + "  " + str(row_data.get("name", ""))
-		name_label.rect_min_size = Vector2(385, 42)
+		name_label.rect_min_size = Vector2(375, 42)
 		name_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		name_label.valign = Label.VALIGN_CENTER
 		_apply_font(name_label)
@@ -748,6 +751,22 @@ func _rebuild_rows() -> void:
 			profile_button.connect("button_down", self, "_on_profile_button_pressed", [steam_id])
 		hbox.add_child(profile_button)
 		_row_profile_buttons.append(profile_button)
+
+		var block_button = Button.new()
+		block_button.rect_min_size = Vector2(130, 42)
+		block_button.focus_mode = Control.FOCUS_NONE
+		_apply_font(block_button)
+		var self_id = _get_self_peer_key()
+		var can_block = can_profile and steam_id != self_id
+		var blocked = can_block and _is_steam_user_blocked(steam_id)
+		block_button.text = _txt("BROTATO_ONLINE_PLAYER_LIST_UNBLOCK") if blocked else _txt("BROTATO_ONLINE_PLAYER_LIST_BLOCK")
+		block_button.hint_tooltip = _txt("BROTATO_ONLINE_PLAYER_LIST_BLOCK_HINT")
+		block_button.visible = can_block
+		block_button.disabled = not can_block
+		if can_block:
+			block_button.connect("button_down", self, "_on_block_button_pressed", [steam_id])
+		hbox.add_child(block_button)
+		_row_block_buttons.append(block_button)
 
 	_refresh_row_selection_styles()
 
@@ -776,6 +795,29 @@ func _activate_selected_profile() -> void:
 	if not bool(row.get("steam_connection", false)):
 		return
 	_open_steam_profile(str(row.get("steam_id", "")))
+
+
+func _on_block_button_pressed(steam_id: String) -> void:
+	if not _is_numeric_steam_id(steam_id) or steam_id == _get_self_peer_key():
+		return
+	if _settings_manager == null or not is_instance_valid(_settings_manager):
+		_resolve_dependencies()
+	if _settings_manager == null or not _settings_manager.has_method("set_steam_user_blocked"):
+		return
+	var blocked = _is_steam_user_blocked(steam_id)
+	if bool(_settings_manager.call("set_steam_user_blocked", steam_id, not blocked)):
+		# Current session is intentionally untouched. Only the persisted browser
+		# filter and host lobby metadata change.
+		_last_render_key = ""
+		_refresh_visible_rows(true)
+
+
+func _is_steam_user_blocked(steam_id: String) -> bool:
+	if _settings_manager == null or not is_instance_valid(_settings_manager):
+		return false
+	if not _settings_manager.has_method("is_steam_user_blocked"):
+		return false
+	return bool(_settings_manager.call("is_steam_user_blocked", steam_id))
 
 
 func _on_profile_button_pressed(steam_id: String) -> void:
@@ -837,7 +879,7 @@ func _ensure_overlay() -> void:
 	_overlay_root.add_child(center)
 
 	_panel = PanelContainer.new()
-	_panel.rect_min_size = Vector2(780, 0)
+	_panel.rect_min_size = Vector2(920, 0)
 	_panel.mouse_filter = Control.MOUSE_FILTER_STOP
 	_panel.add_stylebox_override("panel", _make_panel_style(Color(0.035, 0.035, 0.035, 0.97), Color(1, 1, 1, 0.22), 12))
 	center.add_child(_panel)
@@ -864,10 +906,11 @@ func _ensure_overlay() -> void:
 	var header = HBoxContainer.new()
 	header.add_constant_override("separation", 12)
 	vbox.add_child(header)
-	var player_header = _make_header_label(_txt("BROTATO_ONLINE_PLAYER_LIST_PLAYER_HEADER"), 385, Label.ALIGN_LEFT)
+	var player_header = _make_header_label(_txt("BROTATO_ONLINE_PLAYER_LIST_PLAYER_HEADER"), 375, Label.ALIGN_LEFT)
 	player_header.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	header.add_child(player_header)
 	header.add_child(_make_header_label(_txt("BROTATO_ONLINE_PLAYER_LIST_PING_HEADER"), PING_COLUMN_WIDTH, Label.ALIGN_CENTER))
+	header.add_child(_make_header_label("", 130, Label.ALIGN_CENTER))
 	header.add_child(_make_header_label("", 130, Label.ALIGN_CENTER))
 
 	_rows_container = VBoxContainer.new()
@@ -880,7 +923,7 @@ func _ensure_overlay() -> void:
 	hint.text = _txt("BROTATO_ONLINE_PLAYER_LIST_HINT")
 	hint.align = Label.ALIGN_CENTER
 	hint.autowrap = true
-	hint.rect_min_size = Vector2(705, 36)
+	hint.rect_min_size = Vector2(835, 36)
 	_apply_font(hint)
 	vbox.add_child(hint)
 
@@ -1064,6 +1107,8 @@ func _resolve_dependencies() -> void:
 		_session = parent.get_node_or_null("BrotatoOnlineSessionManager")
 	if _slot_manager == null or not is_instance_valid(_slot_manager):
 		_slot_manager = parent.get_node_or_null("BrotatoOnlineOnlinePlayerSlotManager")
+	if _settings_manager == null or not is_instance_valid(_settings_manager):
+		_settings_manager = parent.get_node_or_null("BrotatoOnlineModSettingsManager")
 	_resolve_steam()
 
 
@@ -1098,6 +1143,7 @@ func _on_language_changed() -> void:
 	_rows_container = null
 	_row_panels.clear()
 	_row_profile_buttons.clear()
+	_row_block_buttons.clear()
 	if _overlay_open:
 		_ensure_overlay()
 		_overlay_root.show()

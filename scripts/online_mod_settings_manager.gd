@@ -2,6 +2,9 @@ extends Node
 
 const SETTINGS_FILE_PATH = "user://brotato_online_settings.cfg"
 const SETTINGS_SECTION = "display"
+const PRIVACY_SETTINGS_SECTION = "privacy"
+const KEY_BLOCKED_STEAM_IDS = "blocked_steam_ids"
+const MAX_BLOCKED_STEAM_USERS = 768
 const KEY_LOCAL_CHARACTER_OUTLINE = "local_character_outline"
 const DEFAULT_LOCAL_CHARACTER_OUTLINE = false
 const KEY_LOCAL_INPUT_DEVICE_MODE = "local_input_device_mode"
@@ -56,6 +59,7 @@ var _local_input_joypad_name = ""
 var _custom_room_name = ""
 var _disable_custom_quick_chat_enabled = DEFAULT_DISABLE_CUSTOM_QUICK_CHAT
 var _custom_quick_chat_texts = {}
+var _blocked_steam_ids = {}
 var _last_scan_msec = 0
 var _settings_button = null
 var _settings_overlay = null
@@ -186,6 +190,67 @@ func set_room_name(text: String) -> void:
 		return
 	_custom_room_name = normalized
 	_save_settings()
+
+
+func get_blocked_steam_ids() -> Array:
+	var result = _blocked_steam_ids.keys()
+	result.sort()
+	return result
+
+
+func is_steam_user_blocked(steam_id: String) -> bool:
+	var normalized = _normalize_steam_id(steam_id)
+	return normalized != "" and _blocked_steam_ids.has(normalized)
+
+
+func set_steam_user_blocked(steam_id: String, blocked: bool) -> bool:
+	var normalized = _normalize_steam_id(steam_id)
+	if normalized == "":
+		return false
+	if blocked:
+		if _blocked_steam_ids.has(normalized):
+			return true
+		if _blocked_steam_ids.size() >= MAX_BLOCKED_STEAM_USERS:
+			return false
+		_blocked_steam_ids[normalized] = true
+	else:
+		if not _blocked_steam_ids.has(normalized):
+			return true
+		_blocked_steam_ids.erase(normalized)
+	_save_settings()
+	_notify_session_blocklist_changed()
+	return true
+
+
+func make_public_block_token(host_steam_id: String, target_steam_id: String) -> String:
+	var host_id = _normalize_steam_id(host_steam_id)
+	var target_id = _normalize_steam_id(target_steam_id)
+	if host_id == "" or target_id == "":
+		return ""
+	# Two independent deterministic hashes keep lobby metadata compact while not
+	# publishing the blocked Steam IDs themselves. The browser only computes the
+	# token for its own Steam ID against the advertised host ID.
+	var a = hash("bo_block_v1_a|" + host_id + "|" + target_id)
+	var b = hash("bo_block_v1_b|" + host_id + "|" + target_id)
+	return str(a) + ":" + str(b)
+
+
+func _normalize_steam_id(value: String) -> String:
+	var normalized = value.strip_edges()
+	if normalized == "" or normalized == "0" or normalized.begins_with("lan:"):
+		return ""
+	if not normalized.is_valid_integer() or int(normalized) <= 0:
+		return ""
+	return normalized
+
+
+func _notify_session_blocklist_changed() -> void:
+	var parent = get_parent()
+	if parent == null:
+		return
+	var session = parent.get_node_or_null("BrotatoOnlineSessionManager")
+	if session != null and session.has_method("refresh_public_blocklist_metadata"):
+		session.call("refresh_public_blocklist_metadata")
 
 
 func _get_default_room_name() -> String:
@@ -337,6 +402,18 @@ func _load_settings() -> void:
 			)))
 			if custom_text != "":
 				_custom_quick_chat_texts[str(option_id)] = custom_text
+		_blocked_steam_ids.clear()
+		var blocked_values = config.get_value(PRIVACY_SETTINGS_SECTION, KEY_BLOCKED_STEAM_IDS, [])
+		if typeof(blocked_values) == TYPE_ARRAY:
+			for value in blocked_values:
+				var steam_id = _normalize_steam_id(str(value))
+				if steam_id != "" and _blocked_steam_ids.size() < MAX_BLOCKED_STEAM_USERS:
+					_blocked_steam_ids[steam_id] = true
+		elif typeof(blocked_values) == TYPE_STRING:
+			for value in str(blocked_values).split(",", false):
+				var steam_id = _normalize_steam_id(str(value))
+				if steam_id != "" and _blocked_steam_ids.size() < MAX_BLOCKED_STEAM_USERS:
+					_blocked_steam_ids[steam_id] = true
 		if _local_input_device_mode != INPUT_DEVICE_MODE_KEYBOARD and _local_input_device_mode != INPUT_DEVICE_MODE_JOYPAD:
 			_local_input_device_mode = INPUT_DEVICE_MODE_AUTO
 	else:
@@ -347,6 +424,7 @@ func _load_settings() -> void:
 		_custom_room_name = ""
 		_disable_custom_quick_chat_enabled = DEFAULT_DISABLE_CUSTOM_QUICK_CHAT
 		_custom_quick_chat_texts.clear()
+		_blocked_steam_ids.clear()
 
 
 func _save_settings() -> void:
@@ -364,6 +442,7 @@ func _save_settings() -> void:
 			KEY_CUSTOM_QUICK_CHAT_PREFIX + str(option_id),
 			str(_custom_quick_chat_texts.get(option_id, ""))
 		)
+	config.set_value(PRIVACY_SETTINGS_SECTION, KEY_BLOCKED_STEAM_IDS, get_blocked_steam_ids())
 	var _save_err = config.save(SETTINGS_FILE_PATH)
 
 

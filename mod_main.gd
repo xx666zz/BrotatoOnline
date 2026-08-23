@@ -117,6 +117,7 @@ func _ready() -> void:
 	_add_session_manager()
 	_add_steam_transport()
 	_add_lan_transport()
+	_add_network_heartbeat_manager()
 	_add_lan_discovery()
 	_add_lobby_browser()
 	_add_online_player_slot_manager()
@@ -194,6 +195,14 @@ func _add_lan_transport() -> void:
 	_add_script_node(
 		"BrotatoOnlineLanTransport",
 		"scripts/lan_transport.gd",
+		true
+	)
+
+
+func _add_network_heartbeat_manager() -> void:
+	_add_script_node(
+		"BrotatoOnlineNetworkHeartbeat",
+		"scripts/network_heartbeat.gd",
 		true
 	)
 

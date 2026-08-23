@@ -1662,30 +1662,55 @@ func _steam_has_signal(signal_name: String) -> bool:
 
 
 func _setup_steam() -> void:
-	if Engine.has_singleton("Steam"):
-		_steam = Engine.get_singleton("Steam")
-	else:
+	_steam_ready = false
+	_steam = null
+	if not Engine.has_singleton("Steam"):
 		return
 
-	_try_init_steam()
+	var steam = Engine.get_singleton("Steam")
+	if steam == null:
+		return
+	if steam.has_method("isSteamRunning"):
+		var steam_running = steam.isSteamRunning()
+		if typeof(steam_running) == TYPE_BOOL and not bool(steam_running):
+			return
+
+	_steam = steam
+	if not _try_init_steam():
+		_steam = null
+		return
 	_update_self_steam_id()
 	_steam_ready = _self_steam_id != "" and _self_steam_id != "0"
+	if not _steam_ready:
+		_steam = null
 
 
-func _try_init_steam() -> void:
+func _try_init_steam() -> bool:
 	if _steam == null:
-		return
+		return false
 
 	# Do not call Steam.loggedOn() here. Some Brotato/GodotSteam builds expose the
 	# method name but fail at runtime with "User class not found when calling loggedOn".
 	# steamInitEx/steamInit plus getSteamID() is enough for this mod stage.
+	var init_result = null
 	if _steam_has_method("steamInitEx"):
-		var init_result = _steam.steamInitEx(BROTATO_APP_ID, true)
+		init_result = _steam.steamInitEx(BROTATO_APP_ID, true)
 	elif _steam_has_method("steamInit"):
-		var init_result2 = _steam.steamInit()
+		init_result = _steam.steamInit()
+	else:
+		return false
+
+	if typeof(init_result) == TYPE_BOOL and not bool(init_result):
+		return false
+	if typeof(init_result) == TYPE_DICTIONARY:
+		if init_result.has("status") and int(init_result["status"]) != 0:
+			return false
+		if init_result.has("success") and not bool(init_result["success"]):
+			return false
 
 	if _steam_has_method("initRelayNetworkAccess"):
 		_steam.initRelayNetworkAccess()
+	return true
 
 
 func _connect_steam_signals() -> void:
@@ -2286,7 +2311,15 @@ func _update_self_steam_id() -> void:
 
 
 func _ensure_steam_ready() -> bool:
-	if _steam == null:
+	# When the Steam transport exists, it is the single owner of Steam initialization.
+	# If it already determined that Steam is unavailable, do not fall back to a second
+	# steamInitEx() attempt from SessionManager; just keep the session LAN-only.
+	if _steam_transport != null and is_instance_valid(_steam_transport):
+		_steam = _steam_transport.get_steam()
+		_steam_ready = bool(_steam_transport.is_available())
+		if not _steam_ready or _steam == null:
+			return false
+	elif _steam == null:
 		_setup_steam()
 		_connect_steam_signals()
 

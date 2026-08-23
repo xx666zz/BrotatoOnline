@@ -120,17 +120,51 @@ func receive_packets(channel: int, limit: int) -> Array:
 
 
 func _setup_steam() -> void:
+	_ready = false
+	_steam = null
 	if not Engine.has_singleton("Steam"):
 		return
-	_steam = Engine.get_singleton("Steam")
-	if _steam.has_method("steamInitEx"):
-		_steam.steamInitEx(BROTATO_APP_ID, true)
-	elif _steam.has_method("steamInit"):
-		_steam.steamInit()
+
+	var steam = Engine.get_singleton("Steam")
+	if steam == null:
+		return
+
+	# Epic/non-Steam builds can still expose the GodotSteam singleton. In that case
+	# do not enter Steam initialization at all when the Steam client/API is unavailable;
+	# LAN remains fully usable and startup does not wait on Steam lobby initialization.
+	if steam.has_method("isSteamRunning"):
+		var steam_running = steam.isSteamRunning()
+		if typeof(steam_running) == TYPE_BOOL and not bool(steam_running):
+			return
+
+	var init_ok = true
+	if steam.has_method("steamInitEx"):
+		init_ok = _steam_init_succeeded(steam.steamInitEx(BROTATO_APP_ID, true))
+	elif steam.has_method("steamInit"):
+		init_ok = _steam_init_succeeded(steam.steamInit())
+	else:
+		return
+	if not init_ok:
+		return
+
+	_steam = steam
 	var self_id = ""
 	if _steam.has_method("getSteamID"):
 		self_id = str(_steam.getSteamID())
 	_ready = self_id != "" and self_id != "0"
+	if not _ready:
+		_steam = null
+
+
+func _steam_init_succeeded(result) -> bool:
+	if typeof(result) == TYPE_BOOL:
+		return bool(result)
+	if typeof(result) == TYPE_DICTIONARY:
+		if result.has("status"):
+			return int(result["status"]) == 0
+		if result.has("success"):
+			return bool(result["success"])
+	return true
 
 
 func _connect_callbacks() -> void:

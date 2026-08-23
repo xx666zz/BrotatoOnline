@@ -176,8 +176,24 @@ func _steam_has_signal(signal_name: String) -> bool:
 
 
 func _setup_steam() -> void:
-	if Engine.has_singleton("Steam"):
-		_steam = Engine.get_singleton("Steam")
+	_steam = null
+	var parent = get_parent()
+	if parent != null:
+		var steam_transport = parent.get_node_or_null("BrotatoOnlineSteamTransport")
+		if steam_transport != null and is_instance_valid(steam_transport):
+			if steam_transport.has_method("is_available") and bool(steam_transport.call("is_available")):
+				_steam = steam_transport.call("get_steam")
+			return
+
+	# Compatibility fallback for unusual setups where the transport node is absent.
+	if not Engine.has_singleton("Steam"):
+		return
+	var steam = Engine.get_singleton("Steam")
+	if steam != null and steam.has_method("isSteamRunning"):
+		var steam_running = steam.isSteamRunning()
+		if typeof(steam_running) == TYPE_BOOL and not bool(steam_running):
+			return
+	_steam = steam
 
 
 func _connect_steam_signals() -> void:

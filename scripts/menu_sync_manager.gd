@@ -8669,6 +8669,9 @@ func _apply_run_config_before_client_scene_change(config: Dictionary, target_scr
 	if not applied_full_run_data:
 		_rebuild_run_data_from_selection_states(players, player_count, target_screen)
 
+	if applied_full_run_data and target_screen == SCREEN_GAME and str(config.get("run_config_source", "")) == "shop_start":
+		_apply_client_shop_start_hourglass()
+
 	# Remote clients can enter CoopShop directly from Host scene synchronization and
 	# therefore do not always pass through RunData.reset(), which normally initializes
 	# ItemService._tiers_data. BaseShop generates its local placeholder items in _ready()
@@ -8682,6 +8685,21 @@ func _apply_run_config_before_client_scene_change(config: Dictionary, target_scr
 		if difficulty_start_key == "" or difficulty_start_key != _last_applied_difficulty_start_key:
 			_apply_difficulty_start_for_client(config)
 			_last_applied_difficulty_start_key = difficulty_start_key
+
+
+func _apply_client_shop_start_hourglass() -> void:
+	if _is_game_host():
+		return
+	# shop_start carries pre-Go PlayerRunData, but current_wave is already the
+	# Host's final wave. Replay only vanilla's item removal/replacement here.
+	# Reconnect/retry snapshots are post-Go and must not consume items again.
+	for player_index in range(RunData.get_player_count()):
+		var effects = RunData.get_player_effects(player_index)
+		if int(effects.get(Keys.item_hourglass_hash, 0)) <= 0:
+			continue
+		var hourglass = RunData.get_player_item(Keys.item_hourglass_hash, player_index)
+		if hourglass != null:
+			RunData.remove_item(hourglass, player_index)
 
 
 func _ensure_item_service_tiers_ready_for_client_shop() -> void:

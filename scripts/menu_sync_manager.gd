@@ -6582,7 +6582,7 @@ func _install_client_progression_press_intercept(container: Node, player_index: 
 			reroll_button.connect("pressed", self, "_on_client_upgrade_reroll_pressed", [player_index])
 
 	# Item-box pages use the same UpgradesUIPlayerContainer as level-up pages.
-	# On clients, do not let Take/Recycle/Ban mutate local RunData; send intent to Host.
+	# On clients, keep authoritative item-box mutations on the Host.
 	var take_button = _safe_get(container, "_take_button", null)
 	if _is_live_ref(take_button):
 		if take_button.is_connected("pressed", container, "_on_TakeButton_pressed"):
@@ -6597,12 +6597,23 @@ func _install_client_progression_press_intercept(container: Node, player_index: 
 		if not discard_button.is_connected("pressed", self, "_on_client_item_box_discard_pressed"):
 			discard_button.connect("pressed", self, "_on_client_item_box_discard_pressed", [player_index])
 
+	# Ban is different from Take/Recycle: the vanilla gamepad ui_ban path calls
+	# UpgradesUIPlayerContainer._on_BanButton_pressed() directly instead of pressing
+	# BanButton. Intercept the container's final signal so mouse and gamepad share
+	# the same authoritative client request, just like ShopItem.ban_item_pressed.
+	var progression_ui = _find_progression_ui()
+	if _is_live_ref(progression_ui):
+		if container.is_connected("item_ban_button_pressed", progression_ui, "_on_ban_button_pressed"):
+			container.disconnect("item_ban_button_pressed", progression_ui, "_on_ban_button_pressed")
+	if not container.is_connected("item_ban_button_pressed", self, "_on_client_item_box_ban_signal"):
+		container.connect("item_ban_button_pressed", self, "_on_client_item_box_ban_signal", [player_index])
+
+	# Keep the vanilla BanButton -> container handler intact. This preserves the
+	# hold-to-ban animation and also makes button activation reach the same signal.
 	var ban_button = _safe_get(container, "_ban_button", null)
 	if _is_live_ref(ban_button):
-		if ban_button.is_connected("pressed", container, "_on_BanButton_pressed"):
-			ban_button.disconnect("pressed", container, "_on_BanButton_pressed")
-		if not ban_button.is_connected("pressed", self, "_on_client_item_box_ban_pressed"):
-			ban_button.connect("pressed", self, "_on_client_item_box_ban_pressed", [player_index])
+		if container.has_method("_on_BanButton_pressed") and not ban_button.is_connected("pressed", container, "_on_BanButton_pressed"):
+			ban_button.connect("pressed", container, "_on_BanButton_pressed")
 
 
 # Public repair entry used by both menu-state and battle-snapshot progression paths.
@@ -6751,14 +6762,7 @@ func _on_client_item_box_discard_pressed(player_index: int) -> void:
 	_queue_client_item_box_action("item_box_discard", player_index)
 
 
-func _on_client_item_box_ban_pressed(player_index: int) -> void:
-	_queue_client_item_box_action("item_box_ban", player_index)
-
-
-# Public bridge for the vanilla gamepad ui_ban path. The base container calls its ban
-# handler directly instead of emitting BanButton.pressed, so script extensions use this
-# entry to reach the same authoritative client request as mouse/button activation.
-func request_client_item_box_ban_from_shortcut(player_index: int) -> void:
+func _on_client_item_box_ban_signal(_item_data, player_index: int) -> void:
 	_queue_client_item_box_action("item_box_ban", player_index)
 
 

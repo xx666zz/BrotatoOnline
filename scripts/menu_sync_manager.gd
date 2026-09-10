@@ -6755,6 +6755,13 @@ func _on_client_item_box_ban_pressed(player_index: int) -> void:
 	_queue_client_item_box_action("item_box_ban", player_index)
 
 
+# Public bridge for the vanilla gamepad ui_ban path. The base container calls its ban
+# handler directly instead of emitting BanButton.pressed, so script extensions use this
+# entry to reach the same authoritative client request as mouse/button activation.
+func request_client_item_box_ban_from_shortcut(player_index: int) -> void:
+	_queue_client_item_box_action("item_box_ban", player_index)
+
+
 func _queue_client_item_box_action(action_type: String, player_index: int) -> void:
 	if _applying_remote_run_page_action:
 		return

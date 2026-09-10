@@ -17,6 +17,7 @@ func _init() -> void:
 	_install_stats_manager_safe_queues_extension()
 	_install_focus_emulator_safe_disconnect_extension()
 	_install_shop_item_lock_event_extension()
+	_install_upgrades_ui_player_container_online_ban_extension()
 	_install_pause_menu_focus_safe_extension()
 
 
@@ -91,6 +92,14 @@ func _install_shop_item_lock_event_extension() -> void:
 		ModLoaderMod.install_script_extension(extension_path)
 	else:
 		pass
+
+
+func _install_upgrades_ui_player_container_online_ban_extension() -> void:
+	var extension_path = mod_dir_path.plus_file("extensions/upgrades_ui_player_container_online_ban.gd")
+	var file = File.new()
+	if file.file_exists(extension_path):
+		ModLoaderMod.install_script_extension(extension_path)
+
 
 
 func _install_pause_menu_focus_safe_extension() -> void:

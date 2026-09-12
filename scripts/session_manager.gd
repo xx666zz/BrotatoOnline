@@ -9021,9 +9021,14 @@ func _consume_pending_join_if_ready() -> void:
 
 func _parse_lobby_id_from_args(args: Array) -> int:
 	for i in range(args.size()):
-		var arg = str(args[i])
+		var arg = str(args[i]).strip_edges()
 		if arg == "+connect_lobby" and i + 1 < args.size():
 			return _normalize_lobby_id(args[i + 1])
+
+		# Only explicit lobby arguments may trigger a launch join. Other launchers
+		# pass unrelated parameters containing digits that Godot int() also accepts.
+		if not arg.begins_with(LOBBY_CONNECT_PREFIX) and not arg.begins_with("connect_lobby:") and not arg.begins_with("lobby:"):
+			continue
 
 		var parsed_from_arg = _parse_lobby_id_from_connect_string(arg)
 		if parsed_from_arg != 0:

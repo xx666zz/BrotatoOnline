@@ -87,6 +87,8 @@ BROTATO_ONLINE_STEAM_RETURN_TO_LOBBY,Return to Lobby
 BROTATO_ONLINE_STEAM_HOST_DISCONNECTED_TITLE,Connection Lost
 BROTATO_ONLINE_STEAM_HOST_DISCONNECTED_MESSAGE,Connection to the host was lost. Returned to the main menu.
 BROTATO_ONLINE_STEAM_JOIN_FAILED_TITLE,Failed to Join Lobby
+BROTATO_ONLINE_STEAM_CREATE_FAILED_TITLE,Failed to Create Steam Lobby
+BROTATO_ONLINE_STEAM_CREATE_FAILED_ACCESS_DENIED,Steam denied lobby creation (error 15: access denied).\nYour account may lack a valid Steam license for this game.\nFake library activation does not grant Steam multiplayer access.\nPlease use an account with a valid game license.
 BROTATO_ONLINE_STEAM_JOIN_FAILED_INVALID,The lobby information is invalid.
 BROTATO_ONLINE_STEAM_JOIN_FAILED_STEAM_UNAVAILABLE,The Steam lobby service is unavailable.
 BROTATO_ONLINE_STEAM_JOIN_FAILED_LAN_UNAVAILABLE,Could not connect to the LAN host.

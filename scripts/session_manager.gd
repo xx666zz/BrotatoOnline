@@ -1757,6 +1757,8 @@ func _on_lobby_created(connect_result = 0, lobby_id = 0) -> void:
 		_update_continue_invite_button_state()
 		_update_character_lobby_status_label_state()
 		_update_continue_lobby_status_label_state()
+		if _last_lobby_create_failed_result == 15: # k_EResultAccessDenied
+			call_deferred("_show_join_failure_deferred", _ui_text("create_failed_access_denied"), "create_failed_title")
 		return
 
 	var was_active_host = _session_active and _online_role == "host"
@@ -1922,7 +1924,7 @@ func _show_join_failure(message: String) -> void:
 	call_deferred("_show_join_failure_deferred", message)
 
 
-func _show_join_failure_deferred(message: String) -> void:
+func _show_join_failure_deferred(message: String, title_key: String = "join_failed_title") -> void:
 	var tree = get_tree()
 	if tree == null or tree.root == null:
 		return
@@ -1932,14 +1934,14 @@ func _show_join_failure_deferred(message: String) -> void:
 
 	if _join_failure_dialog != null and is_instance_valid(_join_failure_dialog):
 		_join_failure_dialog.dialog_text = message
-		_join_failure_dialog.window_title = _ui_text("join_failed_title")
+		_join_failure_dialog.window_title = _ui_text(title_key)
 		_join_failure_dialog.popup_centered(Vector2(520, 220))
 		return
 
 	var dialog = AcceptDialog.new()
 	dialog.name = "BrotatoOnlineJoinFailureDialog"
 	dialog.pause_mode = Node.PAUSE_MODE_PROCESS
-	dialog.window_title = _ui_text("join_failed_title")
+	dialog.window_title = _ui_text(title_key)
 	dialog.dialog_text = message
 	dialog.rect_min_size = Vector2(520, 220)
 	parent.add_child(dialog)

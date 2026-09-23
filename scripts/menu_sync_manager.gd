@@ -5981,8 +5981,27 @@ func _apply_one_serialized_player_run_data(player_index: int, run_data_state, pr
 	if preserve_local_health and player_index < RunData.players_data.size() and RunData.players_data[player_index] != null:
 		preserved_current_health = int(RunData.players_data[player_index].current_health)
 
+	# Item appearance visibility is a local preference. If this machine hides item
+	# appearances, keep its current visual state instead of accepting the Host's
+	# serialized appearances. Character appearance is already part of that local state.
+	var keep_local_appearances = bool(ProgressData.settings.no_item_appearance)
+	var preserved_local_appearances = []
+	if keep_local_appearances and player_index < RunData.players_data.size() and RunData.players_data[player_index] != null:
+		preserved_local_appearances = RunData.players_data[player_index].appearances.duplicate()
+
 	var player_data = PlayerRunData.new()
 	player_data.deserialize(run_data_state)
+	if keep_local_appearances:
+		if not preserved_local_appearances.empty():
+			player_data.appearances = preserved_local_appearances
+		else:
+			# Initial sync can happen before there is local visual state to preserve.
+			# In that case keep only character appearances and discard item appearances.
+			var character_appearances = []
+			for appearance in player_data.appearances:
+				if appearance != null and bool(_safe_get(appearance, "is_character_appearance", false)):
+					character_appearances.append(appearance)
+			player_data.appearances = character_appearances
 	_repair_player_run_data_weapon_subclass_effect_fields(player_data, "serialized_player_run_data")
 	if player_data.current_character == null and run_data_state.has("current_character") and run_data_state.current_character != null:
 		var character_state = {"id": str(run_data_state.current_character), "log": str(run_data_state.current_character)}

@@ -1552,6 +1552,26 @@ func get_session_id() -> String:
 	return _get_wire_session_id()
 
 
+func get_heartbeat_peer_keys() -> Array:
+	if not _session_active:
+		return []
+	if _is_game_host():
+		# Keep disconnected in-run slots monitored until they reconnect or we leave.
+		return _get_remote_ids_for_host_sync()
+	var host_id = _get_game_host_steam_id()
+	return [host_id] if host_id != "" and host_id != "0" else []
+
+
+func get_peer_display_name(peer_key: String) -> String:
+	if _steam == null:
+		return ""
+	if peer_key == _self_steam_id and _steam_has_method("getPersonaName"):
+		return str(_steam.getPersonaName())
+	if peer_key.is_valid_integer() and int(peer_key) > 0 and _steam_has_method("getFriendPersonaName"):
+		return str(_steam.getFriendPersonaName(int(peer_key)))
+	return ""
+
+
 func _get_wire_session_id() -> String:
 	# A Steam-backed session keeps the legacy lobby-id envelope so 4.0.0 peers
 	# accept its packets. Pure LAN sessions fall back to their generated id.
@@ -2621,6 +2641,9 @@ func _clear_focus_input_transition_guards() -> void:
 func _bump_online_session_generation(reason: String = "") -> void:
 	_online_session_generation += 1
 	_clear_focus_input_transition_guards()
+	var heartbeat = get_parent().get_node_or_null("BrotatoOnlineNetworkHeartbeat")
+	if heartbeat != null:
+		heartbeat.reset_online_session_state()
 
 
 func _reset_transient_online_state_for_new_session(reason: String = "") -> void:
@@ -2804,6 +2827,8 @@ func _get_message_lobby_id(message: Dictionary) -> String:
 
 
 func _is_known_online_message_type(msg_type: String) -> bool:
+	if msg_type == "heartbeat":
+		return true
 	return msg_type == "hello" or msg_type == "request_selection_state" or msg_type == "menu_focus" or msg_type == "select_character" or msg_type == "select_weapon" or msg_type == "select_difficulty" or msg_type == "select_zone" or msg_type == "host_character_setup" or msg_type == "host_weapon_setup" or msg_type == "game_start_prepare" or msg_type == "game_start_time_ack" or msg_type == "client_game_scene_ready" or msg_type == "game_start_commit" or msg_type == "retry_wave_confirm" or msg_type == "retry_wave_decline" or msg_type == "retry_wave_state" or msg_type == "retry_wave_end" or msg_type == "menu_scene_state" or msg_type == "run_page_action_sync" or msg_type == "quick_chat" or msg_type == "battle_reliable_events" or msg_type == "battle_snapshot" or msg_type == "battle_terminal_state" or msg_type == "selection_state" or msg_type == "battle_input" or msg_type == "damage_claim_batch" or msg_type == "player_hp_state" or msg_type == "player_state" or msg_type == "entity_kill_claim" or msg_type == "boss_damage_report" or msg_type == "pickup_claim" or msg_type == "battle_entity_resync_request" or msg_type == "bo_mod_message"
 
 
@@ -3465,6 +3490,14 @@ func _update_client_members_from_selection_state(message: Dictionary) -> void:
 
 func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 	var msg_type = str(message.get("msg_type", ""))
+	if msg_type == "heartbeat":
+		# Validate here too for callers that bypass _handle_raw_p2p_packet.
+		if _should_drop_p2p_message_for_session(from_steam_id, message):
+			return
+		var heartbeat = get_parent().get_node_or_null("BrotatoOnlineNetworkHeartbeat")
+		if heartbeat != null:
+			heartbeat.receive_heartbeat(from_steam_id, message)
+		return
 	# Client capability is authoritative only in hello (handled below). On clients,
 	# accept the symmetric Host capability only from the current game host so another
 	# peer cannot spoof feature support with an unrelated packet.
@@ -6985,7 +7018,7 @@ func _is_latest_state_p2p_message(message: Dictionary) -> bool:
 	if typeof(message) != TYPE_DICTIONARY or message.empty():
 		return false
 	var msg_type = str(message.get("msg_type", ""))
-	if msg_type == "battle_input" or msg_type == "battle_snapshot":
+	if msg_type == "battle_input" or msg_type == "battle_snapshot" or msg_type == "heartbeat":
 		return true
 	if msg_type == "player_state":
 		return not bool(message.get("terminal", false)) and not bool(message.get("dead", false))

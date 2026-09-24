@@ -131,3 +131,5 @@ BROTATO_ONLINE_PLAYER_LIST_PLAYER,Player %d
 BROTATO_ONLINE_PLAYER_LIST_LOCAL_PLAYER,Local Player %d
 BROTATO_ONLINE_PLAYER_LIST_CLIENT_UNSUPPORTED,Client unsupported
 BROTATO_ONLINE_PLAYER_LIST_HOST_UNSUPPORTED,Host unsupported
+BROTATO_ONLINE_HEARTBEAT_DISCONNECTED,%s has disconnected.
+BROTATO_ONLINE_HEARTBEAT_RECOVERY,All players: return to the main menu. The host should select Continue; everyone else should rejoin in the original order.

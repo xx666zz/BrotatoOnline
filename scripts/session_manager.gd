@@ -7,6 +7,7 @@ const MAX_LOBBY_MEMBERS = 4
 # release version lives in manifest.json and may advance independently.
 const NETWORK_PROTOCOL_VERSION = "4.0.0"
 const DEFAULT_LAN_PORT = 27462
+const LAN_DISCOVERY_PORT = 27463
 const LAN_PROTOCOL_VERSION = 1
 # Optional pre-join host mod metadata. This is deliberately independent from
 # NETWORK_PROTOCOL_VERSION/LAN_PROTOCOL_VERSION so older clients keep working.
@@ -1180,11 +1181,17 @@ func create_session(open_steam_overlay: bool = false) -> void:
 	_online_flow_left_since_msec = 0
 	_unlock_online_run_slots()
 
+	var requested_lan_port = DEFAULT_LAN_PORT
+	var settings_manager = _get_mod_settings_manager()
+	if settings_manager != null and settings_manager.has_method("get_lan_host_port"):
+		requested_lan_port = int(settings_manager.call("get_lan_host_port"))
+	if requested_lan_port <= 0 or requested_lan_port > 65535 or requested_lan_port == LAN_DISCOVERY_PORT:
+		requested_lan_port = DEFAULT_LAN_PORT
 	var lan_ok = false
 	if _lan_transport != null and _lan_transport.has_method("start_host"):
-		lan_ok = int(_lan_transport.start_host(DEFAULT_LAN_PORT)) == OK
+		lan_ok = int(_lan_transport.start_host(requested_lan_port)) == OK
 	if lan_ok:
-		_lan_game_port = DEFAULT_LAN_PORT
+		_lan_game_port = requested_lan_port
 		if _lan_discovery != null and _lan_discovery.has_method("start_host_responder"):
 			_lan_discovery.start_host_responder()
 
@@ -9147,4 +9154,3 @@ func _get_battle_replica_manager() -> Node:
 	if parent == null:
 		return null
 	return parent.get_node_or_null("BrotatoOnlineBattleReplicaManager")
-

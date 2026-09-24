@@ -21,6 +21,9 @@ const META_LOCAL_INPUT_JOYPAD_NAME = "brotato_online_local_input_joypad_name"
 const ROOM_NAME_MAX_LENGTH = 32
 const KEY_CUSTOM_ROOM_NAME = "custom_room_name"
 const DEFAULT_ROOM_NAME = "Brotato Online"
+const KEY_LAN_HOST_PORT = "lan_host_port"
+const DEFAULT_LAN_HOST_PORT = 27462
+const LAN_DISCOVERY_PORT = 27463
 
 const CUSTOM_QUICK_CHAT_MAX_LENGTH = 20
 const KEY_DISABLE_CUSTOM_QUICK_CHAT = "disable_custom_quick_chat"
@@ -57,6 +60,7 @@ var _local_input_device_mode = DEFAULT_LOCAL_INPUT_DEVICE_MODE
 var _local_input_joypad_id = -1
 var _local_input_joypad_name = ""
 var _custom_room_name = ""
+var _lan_host_port = DEFAULT_LAN_HOST_PORT
 var _disable_custom_quick_chat_enabled = DEFAULT_DISABLE_CUSTOM_QUICK_CHAT
 var _custom_quick_chat_texts = {}
 var _blocked_steam_ids = {}
@@ -74,6 +78,9 @@ var _room_name_label = null
 var _room_name_editor = null
 var _room_name_description_label = null
 var _room_name_editor_normalizing = false
+var _host_port_label = null
+var _host_port_editor = null
+var _host_port_description_label = null
 var _disable_custom_quick_chat_button = null
 var _quick_chat_customize_toggle = null
 var _quick_chat_customize_description_label = null
@@ -189,6 +196,17 @@ func set_room_name(text: String) -> void:
 	if _custom_room_name == normalized:
 		return
 	_custom_room_name = normalized
+	_save_settings()
+
+
+func get_lan_host_port() -> int:
+	return _lan_host_port
+
+
+func set_lan_host_port(port: int) -> void:
+	if port <= 0 or port > 65535 or port == LAN_DISCOVERY_PORT or port == _lan_host_port:
+		return
+	_lan_host_port = port
 	_save_settings()
 
 
@@ -388,6 +406,9 @@ func _load_settings() -> void:
 			KEY_CUSTOM_ROOM_NAME,
 			""
 		)))
+		_lan_host_port = int(config.get_value(SETTINGS_SECTION, KEY_LAN_HOST_PORT, DEFAULT_LAN_HOST_PORT))
+		if _lan_host_port <= 0 or _lan_host_port > 65535 or _lan_host_port == LAN_DISCOVERY_PORT:
+			_lan_host_port = DEFAULT_LAN_HOST_PORT
 		_disable_custom_quick_chat_enabled = bool(config.get_value(
 			SETTINGS_SECTION,
 			KEY_DISABLE_CUSTOM_QUICK_CHAT,
@@ -422,6 +443,7 @@ func _load_settings() -> void:
 		_local_input_joypad_id = -1
 		_local_input_joypad_name = ""
 		_custom_room_name = ""
+		_lan_host_port = DEFAULT_LAN_HOST_PORT
 		_disable_custom_quick_chat_enabled = DEFAULT_DISABLE_CUSTOM_QUICK_CHAT
 		_custom_quick_chat_texts.clear()
 		_blocked_steam_ids.clear()
@@ -435,6 +457,7 @@ func _save_settings() -> void:
 	config.set_value(SETTINGS_SECTION, KEY_LOCAL_INPUT_JOYPAD_ID, _local_input_joypad_id)
 	config.set_value(SETTINGS_SECTION, KEY_LOCAL_INPUT_JOYPAD_NAME, _local_input_joypad_name)
 	config.set_value(SETTINGS_SECTION, KEY_CUSTOM_ROOM_NAME, _custom_room_name)
+	config.set_value(SETTINGS_SECTION, KEY_LAN_HOST_PORT, _lan_host_port)
 	config.set_value(SETTINGS_SECTION, KEY_DISABLE_CUSTOM_QUICK_CHAT, _disable_custom_quick_chat_enabled)
 	for option_id in QUICK_CHAT_OPTION_IDS:
 		config.set_value(
@@ -585,10 +608,15 @@ func _ensure_settings_overlay(title_screen: Node) -> void:
 		_input_device_option_button = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/InputDeviceOptionButton")
 		_input_device_description_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/InputDeviceDescriptionLabel")
 		_room_name_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/RoomNameLabel")
-		_room_name_editor = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/RoomNameEditor")
+		_room_name_editor = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/RoomNameAndPortRow/RoomNameEditor")
+		_host_port_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/RoomNameAndPortRow/HostPortLabel")
+		_host_port_editor = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/RoomNameAndPortRow/HostPortEditor")
 		_room_name_description_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/RoomNameDescriptionLabel")
+		_host_port_description_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/HostPortDescriptionLabel")
 		if _room_name_editor != null and is_instance_valid(_room_name_editor):
 			_configure_room_name_editor(_room_name_editor)
+		if _host_port_editor != null and is_instance_valid(_host_port_editor):
+			_configure_host_port_editor(_host_port_editor)
 		_disable_custom_quick_chat_button = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/DisableCustomQuickChatButton")
 		_quick_chat_customize_toggle = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/QuickChatCustomizeToggle")
 		_quick_chat_customize_description_label = existing_overlay.get_node_or_null("CenterContainer/PanelContainer/MarginContainer/VBoxContainer/QuickChatCustomizeDescriptionLabel")
@@ -680,18 +708,44 @@ func _ensure_settings_overlay(title_screen: Node) -> void:
 	vbox.add_child(room_name_label)
 	_room_name_label = room_name_label
 
+	var room_name_and_port_row = HBoxContainer.new()
+	room_name_and_port_row.name = "RoomNameAndPortRow"
+	room_name_and_port_row.add_constant_override("separation", 12)
+	vbox.add_child(room_name_and_port_row)
+
 	var room_name_editor = LineEdit.new()
 	room_name_editor.name = "RoomNameEditor"
 	room_name_editor.text = get_room_name()
 	room_name_editor.rect_min_size = Vector2(0, 52)
 	room_name_editor.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	vbox.add_child(room_name_editor)
+	room_name_and_port_row.add_child(room_name_editor)
 	_configure_room_name_editor(room_name_editor)
 	_room_name_editor = room_name_editor
+
+	var host_port_label = Label.new()
+	host_port_label.name = "HostPortLabel"
+	host_port_label.text = _txt("BROTATO_ONLINE_LAN_HOST_PORT")
+	host_port_label.valign = Label.VALIGN_CENTER
+	host_port_label.add_color_override("font_color", Color(0.82, 0.82, 0.82, 1.0))
+	if room_name_label_font != null:
+		host_port_label.add_font_override("font", room_name_label_font)
+	room_name_and_port_row.add_child(host_port_label)
+	_host_port_label = host_port_label
+
+	var host_port_editor = LineEdit.new()
+	host_port_editor.name = "HostPortEditor"
+	host_port_editor.text = str(get_lan_host_port())
+	host_port_editor.rect_min_size = Vector2(145, 52)
+	room_name_and_port_row.add_child(host_port_editor)
+	_configure_host_port_editor(host_port_editor)
+	_host_port_editor = host_port_editor
 
 	var room_name_description = _create_settings_description_label("RoomNameDescriptionLabel", "BROTATO_ONLINE_ROOM_NAME_DESC")
 	vbox.add_child(room_name_description)
 	_room_name_description_label = room_name_description
+	var host_port_description = _create_settings_description_label("HostPortDescriptionLabel", "BROTATO_ONLINE_LAN_HOST_PORT_DESC")
+	vbox.add_child(host_port_description)
+	_host_port_description_label = host_port_description
 
 	var room_name_separator = _create_settings_separator("RoomNameSeparator")
 	vbox.add_child(room_name_separator)
@@ -1057,6 +1111,20 @@ func _configure_room_name_editor(editor) -> void:
 		var _room_name_focus_out_err = editor.connect("focus_exited", self, "_on_room_name_editor_focus_exited")
 
 
+func _configure_host_port_editor(editor) -> void:
+	if editor == null or not is_instance_valid(editor):
+		return
+	editor.max_length = 5
+	editor.focus_mode = Control.FOCUS_CLICK
+	editor.mouse_filter = Control.MOUSE_FILTER_STOP
+	if not editor.is_connected("focus_entered", self, "_on_host_port_editor_focus_entered"):
+		var _port_focus_in_err = editor.connect("focus_entered", self, "_on_host_port_editor_focus_entered")
+	if not editor.is_connected("focus_exited", self, "_on_host_port_editor_focus_exited"):
+		var _port_focus_out_err = editor.connect("focus_exited", self, "_on_host_port_editor_focus_exited")
+	if not editor.is_connected("text_entered", self, "_on_host_port_text_entered"):
+		var _port_enter_err = editor.connect("text_entered", self, "_on_host_port_text_entered")
+
+
 func _configure_quick_chat_editor(editor, option_id: String) -> void:
 	if editor == null or not is_instance_valid(editor):
 		return
@@ -1126,6 +1194,10 @@ func _refresh_localized_texts() -> void:
 		_room_name_description_label.text = _txt("BROTATO_ONLINE_ROOM_NAME_DESC")
 	if _room_name_editor != null and is_instance_valid(_room_name_editor):
 		_room_name_editor.placeholder_text = _get_default_room_name()
+	if _host_port_label != null and is_instance_valid(_host_port_label):
+		_host_port_label.text = _txt("BROTATO_ONLINE_LAN_HOST_PORT")
+	if _host_port_description_label != null and is_instance_valid(_host_port_description_label):
+		_host_port_description_label.text = _txt("BROTATO_ONLINE_LAN_HOST_PORT_DESC")
 	if _input_device_label != null and is_instance_valid(_input_device_label):
 		_input_device_label.text = _txt("BROTATO_ONLINE_INPUT_DEVICE")
 	if _input_device_description_label != null and is_instance_valid(_input_device_description_label):
@@ -1181,6 +1253,33 @@ func _on_room_name_editor_focus_exited() -> void:
 	if _room_name_editor != _active_quick_chat_editor or _text_edit_session_ending:
 		return
 	call_deferred("_ensure_active_quick_chat_editor_focus")
+
+
+func _on_host_port_editor_focus_entered() -> void:
+	if _host_port_editor != null and is_instance_valid(_host_port_editor):
+		_begin_quick_chat_text_edit_session(_host_port_editor)
+
+
+func _on_host_port_editor_focus_exited() -> void:
+	if _host_port_editor != _active_quick_chat_editor or _text_edit_session_ending:
+		return
+	call_deferred("_ensure_active_quick_chat_editor_focus")
+
+
+func _on_host_port_text_entered(_text: String) -> void:
+	_commit_host_port_editor()
+
+
+func _commit_host_port_editor() -> void:
+	if _host_port_editor == null or not is_instance_valid(_host_port_editor):
+		return
+	var value = str(_host_port_editor.text).strip_edges()
+	if value == "":
+		set_lan_host_port(DEFAULT_LAN_HOST_PORT)
+	elif value.is_valid_integer():
+		set_lan_host_port(int(value))
+	# Revert invalid or reserved ports rather than saving an unusable setting.
+	_host_port_editor.text = str(get_lan_host_port())
 
 
 func _on_disable_custom_quick_chat_toggled(button_pressed: bool) -> void:
@@ -1261,6 +1360,8 @@ func _begin_quick_chat_text_edit_session(editor) -> void:
 
 func _end_quick_chat_text_edit_session() -> void:
 	_text_edit_session_ending = true
+	if _active_quick_chat_editor == _host_port_editor:
+		_commit_host_port_editor()
 	_active_quick_chat_editor = null
 	_restore_suppressed_focus_controls()
 	_restore_suspended_focus_emulators()
@@ -1375,6 +1476,8 @@ func _open_settings_overlay() -> void:
 	_refresh_input_device_options(true)
 	if _room_name_editor != null and is_instance_valid(_room_name_editor):
 		_room_name_editor.text = get_room_name()
+	if _host_port_editor != null and is_instance_valid(_host_port_editor):
+		_host_port_editor.text = str(get_lan_host_port())
 	if _local_outline_button != null and is_instance_valid(_local_outline_button):
 		_local_outline_button.set_pressed_no_signal(_local_character_outline_enabled)
 	if _disable_custom_quick_chat_button != null and is_instance_valid(_disable_custom_quick_chat_button):

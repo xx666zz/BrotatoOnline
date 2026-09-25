@@ -132,4 +132,11 @@ BROTATO_ONLINE_PLAYER_LIST_LOCAL_PLAYER,Local Player %d
 BROTATO_ONLINE_PLAYER_LIST_CLIENT_UNSUPPORTED,Client unsupported
 BROTATO_ONLINE_PLAYER_LIST_HOST_UNSUPPORTED,Host unsupported
 BROTATO_ONLINE_HEARTBEAT_DISCONNECTED,%s has disconnected.
+BROTATO_ONLINE_HEARTBEAT_KICK_HINT,The host can kick disconnected players from the player list and continue the run.
 BROTATO_ONLINE_HEARTBEAT_RECOVERY,All players: return to the main menu. The host should select Continue; everyone else should rejoin in the original order.
+BROTATO_ONLINE_PLAYER_LIST_KICK,Kick
+BROTATO_ONLINE_PLAYER_LIST_KICK_TITLE,Remove player?
+BROTATO_ONLINE_PLAYER_LIST_KICK_CONFIRM,Kick %s?\nThis player's character, equipment and progress in this run will be permanently deleted and cannot be restored. The remaining players can continue.
+BROTATO_ONLINE_PLAYER_LIST_KICK_CANCEL,Cancel
+BROTATO_ONLINE_PLAYER_LIST_KICK_HINT,Kick is shown only above 500 ms latency or after disconnect. Host controller: X/Square to kick. In the dialog: Up/Down to select, A/Cross to confirm, B/Circle to cancel.
+BROTATO_ONLINE_PLAYER_KICKED_NOTICE,You were kicked by the host.

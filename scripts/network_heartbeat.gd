@@ -193,6 +193,10 @@ func reset_online_session_state() -> void:
 		_notice_panel.hide()
 
 
+func is_peer_disconnected(peer_key: String) -> bool:
+	return _disconnected_peers.has(peer_key) or _host_reported_disconnected.has(peer_key)
+
+
 func _refresh_notice() -> void:
 	var disconnected = _host_reported_disconnected.duplicate()
 	for peer_key in _disconnected_peers.keys():
@@ -207,6 +211,7 @@ func _refresh_notice() -> void:
 	keys.sort()
 	for peer_key in keys:
 		lines.append(_txt("BROTATO_ONLINE_HEARTBEAT_DISCONNECTED") % [str(disconnected[peer_key])])
+	lines.append(_txt("BROTATO_ONLINE_HEARTBEAT_KICK_HINT"))
 	lines.append(_txt("BROTATO_ONLINE_HEARTBEAT_RECOVERY"))
 	_notice_label.text = lines.join("\n")
 	var viewport_size = get_viewport().get_visible_rect().size

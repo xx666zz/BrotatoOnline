@@ -435,9 +435,9 @@ func rebind_remote_peer_key(old_peer_key: String, new_peer_key: String) -> int:
 	return _get_player_index_for_device(device)
 
 
-func apply_host_selection_layout(selection_state: Dictionary, self_steam_id: String, host_steam_id: String = "") -> void:
+func apply_host_selection_layout(selection_state: Dictionary, self_steam_id: String, host_steam_id: String = "", roster_change: bool = false) -> void:
 	var t_apply_layout = OS.get_ticks_usec()
-	if _is_slot_mutation_locked():
+	if _is_slot_mutation_locked() and not (roster_change and get_tree().current_scene == null):
 		_bo_slot_diag_log("APPLY_HOST_LAYOUT_SKIP", "reason=locked_run_topology self=" + self_steam_id + " host=" + host_steam_id + " players=" + _bo_slot_diag_players() + " maps=" + _bo_slot_diag_maps())
 		return
 	# Client 侧使用：根据 Host 广播的 selection_state 重建本地 COOP 槽位布局。
@@ -1275,3 +1275,40 @@ func _get_script_path(node: Node) -> String:
 		return ""
 
 	return str(script_res.resource_path)
+
+
+# Called only between scenes after PlayerRunData has been compacted by the Host.
+func remove_online_player_slots(removed_indices: Array) -> void:
+	if get_tree().current_scene != null:
+		return
+	var descending = removed_indices.duplicate()
+	descending.sort()
+	descending.invert()
+	for value in descending:
+		var index = int(value)
+		if index < 0 or index >= CoopService.connected_players.size():
+			continue
+		var device = int(CoopService.connected_players[index][0])
+		var peer_key = str(_remote_steam_id_by_device.get(device, ""))
+		_device_by_remote_steam_id.erase(peer_key)
+		_remote_steam_id_by_device.erase(device)
+		_remote_devices.erase(device)
+		CoopService.connected_players.remove(index)
+		if _local_mirrored_player_index > index:
+			_local_mirrored_player_index -= 1
+	_online_run_connected_players_snapshot = _duplicate_connected_players(CoopService.connected_players) if _online_run_slots_locked else []
+	if not _mirrored_connected_players.empty():
+		_mirrored_connected_players = _duplicate_connected_players(CoopService.connected_players)
+	# RunData was compacted separately; a Continue page may still have saved
+	# players waiting to reconnect, so connected device count must not truncate it.
+	_bo_emit_connected_players_updated("player_removed")
+
+
+func apply_authoritative_roster(players: Array, self_peer_key: String, host_peer_key: String, lock_run: bool) -> void:
+	if get_tree().current_scene != null:
+		return
+	_online_run_connected_players_snapshot.clear()
+	apply_host_selection_layout({"players": players}, self_peer_key, host_peer_key, true)
+	_online_run_slots_locked = lock_run
+	if lock_run:
+		_online_run_connected_players_snapshot = _duplicate_connected_players(CoopService.connected_players)

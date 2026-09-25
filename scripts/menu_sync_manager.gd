@@ -8693,7 +8693,7 @@ func _apply_run_config_before_client_scene_change(config: Dictionary, target_scr
 	var applied_full_run_data = false
 	var should_apply_full_run_data = _run_config_has_serialized_player_run_data(players) or target_screen == SCREEN_SHOP or target_screen == "shop" or bool(config.get("full_player_run_data_authoritative", false))
 	if should_apply_full_run_data:
-		var preserve_local_runtime_state = str(config.get("run_config_source", "")) != "retry_wave"
+		var preserve_local_runtime_state = not str(config.get("run_config_source", "")) in ["retry_wave", "player_removed"]
 		applied_full_run_data = _apply_serialized_players_run_data(players, preserve_local_runtime_state)
 
 	if not applied_full_run_data:
@@ -11376,3 +11376,33 @@ func _input(event: InputEvent) -> void:
 	# still on an item and submit a false lock
 	# action, which then disabled/locked that entry on Host and Client.
 	_bo_ui_diag_log_cost("input_handler", t_input)
+
+
+func reset_after_player_roster_change() -> void:
+	_reset_run_page_runtime_state_for_game_start(true)
+	_reset_shop_state_diff_cache()
+	_last_state_from_host = {}
+	_pending_state_from_host = {}
+	_last_menu_scene_state_from_host = {}
+	_pending_menu_scene_state_from_host = {}
+	_last_applied_run_config_key = ""
+	_last_state_key = ""
+	_last_client_scene_apply_key = ""
+	_last_sent_local_focus_key = ""
+	_last_sent_local_select_key = ""
+	_last_local_selection_instance_id = 0
+	_client_intercept_selection_instance_id = 0
+	_selection_apply_context_key = ""
+	_last_applied_selection_focus_key_by_player.clear()
+	_last_applied_selection_selected_key_by_player.clear()
+	_host_built_catalog_by_screen.clear()
+	_host_built_catalog_build_key_by_screen.clear()
+	_queued_local_client_menu_messages.clear()
+	_queued_local_run_page_action_messages.clear()
+	_processed_run_page_action_ids.clear()
+	_last_run_page_action_seq_by_origin.clear()
+	_client_scene_change_in_flight_screen = ""
+	_client_scene_change_in_flight_path = ""
+	_client_scene_change_in_flight_until_msec = 0
+	_end_game_start_guard("player_removed")
+	_invalidate_selection_element_cache()

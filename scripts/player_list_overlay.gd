@@ -10,6 +10,7 @@ const KEYBOARD_KEY = KEY_TAB
 const GAMEPAD_TOGGLE_BUTTON = 8 # L3 / left-stick click
 const GAMEPAD_CANCEL_BUTTON = 1
 const GAMEPAD_CONFIRM_BUTTON = 0
+const GAMEPAD_KICK_BUTTON = 2 # X / Square: open the selected remote player's confirmation
 const GAMEPAD_DPAD_UP_BUTTON = 12
 const GAMEPAD_DPAD_DOWN_BUTTON = 13
 const GAMEPAD_LEFT_STICK_Y_AXIS = 1
@@ -18,6 +19,7 @@ const GAMEPAD_STICK_THRESHOLD = 0.58
 const PING_INTERVAL_MSEC = 1500
 const SNAPSHOT_INTERVAL_MSEC = 1000
 const PING_TIMEOUT_MSEC = 5000
+const KICK_LATENCY_THRESHOLD_MSEC = 500
 const SNAPSHOT_REQUEST_MIN_INTERVAL_MSEC = 900
 const WATCHER_TTL_MSEC = 3000
 const DISPLAY_NAME_LIMIT = 48
@@ -44,6 +46,11 @@ var _rows_container = null
 var _row_panels = []
 var _row_profile_buttons = []
 var _row_block_buttons = []
+var _kick_dialog = null
+var _pending_kick_peer = ""
+var _pending_kick_index = -1
+var _gamepad_kick_was_pressed = false
+var _kick_confirm_selected = false
 var _visible_rows = []
 var _selected_row = 0
 var _overlay_open = false
@@ -93,6 +100,10 @@ func _ready() -> void:
 func _input(event: InputEvent) -> void:
 	if not _is_online():
 		return
+	if _is_kick_confirmation_open():
+		if event is InputEventJoypadButton or event is InputEventJoypadMotion or (event is InputEventKey and event.scancode == KEYBOARD_KEY):
+			get_tree().set_input_as_handled()
+			return
 
 	# Keyboard Tab can still be handled immediately when it reaches us, but the
 	# _process() polling path below is the authoritative fallback for menu scenes
@@ -138,6 +149,8 @@ func _process(_delta: float) -> void:
 
 
 func _poll_overlay_open_controls() -> void:
+	if _is_kick_confirmation_open():
+		return
 	# Tab remains hold-to-show. It has priority while the overlay is closed.
 	if _overlay_open and not _opened_by_gamepad:
 		_poll_gamepad_toggle_edges(false)
@@ -192,6 +205,24 @@ func _poll_gamepad_overlay_controls() -> void:
 	var confirm_pressed = Input.is_joy_button_pressed(_gamepad_device, GAMEPAD_CONFIRM_BUTTON)
 	var cancel_pressed = Input.is_joy_button_pressed(_gamepad_device, GAMEPAD_CANCEL_BUTTON)
 
+	var kick_pressed = Input.is_joy_button_pressed(_gamepad_device, GAMEPAD_KICK_BUTTON)
+	if _is_kick_confirmation_open():
+		if (up_pressed and not _gamepad_up_was_pressed) or (down_pressed and not _gamepad_down_was_pressed):
+			_kick_confirm_selected = not _kick_confirm_selected
+			(_kick_dialog.get_ok() if _kick_confirm_selected else _kick_dialog.get_cancel()).grab_focus()
+		if cancel_pressed and not _gamepad_cancel_was_pressed:
+			_kick_dialog.hide()
+		elif confirm_pressed and not _gamepad_confirm_was_pressed:
+			if _kick_confirm_selected:
+				_on_kick_confirmed()
+			_kick_dialog.hide()
+		_gamepad_up_was_pressed = up_pressed
+		_gamepad_down_was_pressed = down_pressed
+		_gamepad_confirm_was_pressed = confirm_pressed
+		_gamepad_cancel_was_pressed = cancel_pressed
+		_gamepad_kick_was_pressed = kick_pressed
+		return
+
 	var moved = false
 	if up_pressed and not _gamepad_up_was_pressed:
 		_move_selection(-1)
@@ -209,7 +240,9 @@ func _poll_gamepad_overlay_controls() -> void:
 		_left_stick_y_latched = true
 		_move_selection(1 if axis_value > 0.0 else -1)
 
-	if confirm_pressed and not _gamepad_confirm_was_pressed:
+	if kick_pressed and not _gamepad_kick_was_pressed:
+		_request_selected_kick()
+	elif confirm_pressed and not _gamepad_confirm_was_pressed:
 		_activate_selected_profile()
 	if cancel_pressed and not _gamepad_cancel_was_pressed:
 		_close_overlay()
@@ -218,9 +251,11 @@ func _poll_gamepad_overlay_controls() -> void:
 	_gamepad_down_was_pressed = down_pressed
 	_gamepad_confirm_was_pressed = confirm_pressed
 	_gamepad_cancel_was_pressed = cancel_pressed
+	_gamepad_kick_was_pressed = kick_pressed
 
 
 func _reset_gamepad_poll_state() -> void:
+	_gamepad_kick_was_pressed = false
 	_left_stick_y_latched = false
 	_gamepad_up_was_pressed = false
 	_gamepad_down_was_pressed = false
@@ -229,6 +264,8 @@ func _reset_gamepad_poll_state() -> void:
 
 
 func _open_overlay(by_gamepad: bool, device: int) -> void:
+	if _is_kick_confirmation_open():
+		return
 	if not _is_online():
 		return
 	_ensure_overlay()
@@ -255,6 +292,9 @@ func _close_overlay() -> void:
 	if not _overlay_open:
 		return
 	_overlay_open = false
+	if _is_kick_confirmation_open():
+		_kick_dialog.hide()
+	_pending_kick_peer = ""
 	_opened_by_gamepad = false
 	_gamepad_device = -1
 	_reset_gamepad_poll_state()
@@ -615,7 +655,14 @@ func _build_host_rows() -> Array:
 			if display_name == "":
 				display_name = _txt("BROTATO_ONLINE_PLAYER_LIST_PLAYER") % [player_index + 1]
 
+		if _removal_manager() != null and _removal_manager().is_player_removed(player_index):
+			continue
+		var can_kick = false
+		if not is_local:
+			can_kick = _can_kick_peer_now(peer_key, ping_ms)
 		rows.append({
+			"peer_key": peer_key,
+			"can_kick": can_kick,
 			"player_index": player_index,
 			"name": display_name,
 			"ping_ms": ping_ms,
@@ -634,6 +681,8 @@ func _refresh_visible_rows(force: bool) -> void:
 	var rows = _build_host_rows() if _is_host() else _latest_snapshot_rows.duplicate(true)
 	if rows.empty():
 		rows = _build_fallback_rows()
+	if _is_kick_confirmation_open():
+		return
 	var render_key = to_json(rows)
 	if not force and render_key == _last_render_key:
 		_refresh_row_selection_styles()
@@ -705,7 +754,7 @@ func _rebuild_rows() -> void:
 	for row_index in range(_visible_rows.size()):
 		var row_data = _visible_rows[row_index]
 		var panel = PanelContainer.new()
-		panel.rect_min_size = Vector2(835, 58)
+		panel.rect_min_size = Vector2(955 if _is_host() else 835, 58)
 		panel.mouse_filter = Control.MOUSE_FILTER_PASS
 		_rows_container.add_child(panel)
 		_row_panels.append(panel)
@@ -725,6 +774,7 @@ func _rebuild_rows() -> void:
 		var name_label = Label.new()
 		name_label.text = "P" + str(int(row_data.get("player_index", row_index)) + 1) + "  " + str(row_data.get("name", ""))
 		name_label.rect_min_size = Vector2(375, 42)
+		name_label.clip_text = true
 		name_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		name_label.valign = Label.VALIGN_CENTER
 		_apply_font(name_label)
@@ -767,6 +817,17 @@ func _rebuild_rows() -> void:
 			block_button.connect("button_down", self, "_on_block_button_pressed", [steam_id])
 		hbox.add_child(block_button)
 		_row_block_buttons.append(block_button)
+
+		if _is_host() and not bool(row_data.get("local", false)) and bool(row_data.get("can_kick", false)):
+			var kick_button = Button.new()
+			kick_button.text = _txt("BROTATO_ONLINE_PLAYER_LIST_KICK")
+			kick_button.rect_min_size = Vector2(100, 42)
+			kick_button.focus_mode = Control.FOCUS_NONE
+			_apply_font(kick_button)
+			var peer_key = str(row_data.get("peer_key", ""))
+			kick_button.disabled = false
+			kick_button.connect("button_down", self, "_on_kick_button_pressed", [peer_key, str(row_data.get("name", ""))])
+			hbox.add_child(kick_button)
 
 	_refresh_row_selection_styles()
 
@@ -879,7 +940,7 @@ func _ensure_overlay() -> void:
 	_overlay_root.add_child(center)
 
 	_panel = PanelContainer.new()
-	_panel.rect_min_size = Vector2(920, 0)
+	_panel.rect_min_size = Vector2(1040 if _is_host() else 920, 0)
 	_panel.mouse_filter = Control.MOUSE_FILTER_STOP
 	_panel.add_stylebox_override("panel", _make_panel_style(Color(0.035, 0.035, 0.035, 0.97), Color(1, 1, 1, 0.22), 12))
 	center.add_child(_panel)
@@ -912,6 +973,8 @@ func _ensure_overlay() -> void:
 	header.add_child(_make_header_label(_txt("BROTATO_ONLINE_PLAYER_LIST_PING_HEADER"), PING_COLUMN_WIDTH, Label.ALIGN_CENTER))
 	header.add_child(_make_header_label("", 130, Label.ALIGN_CENTER))
 	header.add_child(_make_header_label("", 130, Label.ALIGN_CENTER))
+	if _is_host():
+		header.add_child(_make_header_label("", 100, Label.ALIGN_CENTER))
 
 	_rows_container = VBoxContainer.new()
 	_rows_container.name = "Rows"
@@ -920,7 +983,7 @@ func _ensure_overlay() -> void:
 
 	var hint = Label.new()
 	hint.name = "Hint"
-	hint.text = _txt("BROTATO_ONLINE_PLAYER_LIST_HINT")
+	hint.text = _txt("BROTATO_ONLINE_PLAYER_LIST_HINT") + ("\n" + _txt("BROTATO_ONLINE_PLAYER_LIST_KICK_HINT") if _is_host() else "")
 	hint.align = Label.ALIGN_CENTER
 	hint.autowrap = true
 	hint.rect_min_size = Vector2(835, 36)
@@ -1157,3 +1220,100 @@ func _txt(key: String) -> String:
 		if i18n != null and i18n.has_method("get_text"):
 			return str(i18n.get_text(key))
 	return key
+
+
+func _removal_manager() -> Node:
+	return get_parent().get_node_or_null("BrotatoOnlinePlayerRemovalManager")
+
+
+func _heartbeat_manager() -> Node:
+	return get_parent().get_node_or_null("BrotatoOnlineNetworkHeartbeat")
+
+
+func _can_kick_peer_now(peer_key: String, ping_ms: int) -> bool:
+	if not _is_host() or peer_key == "":
+		return false
+	var removal = _removal_manager()
+	if removal == null or not removal.can_kick_peer(peer_key):
+		return false
+	if ping_ms > KICK_LATENCY_THRESHOLD_MSEC:
+		return true
+	var heartbeat = _heartbeat_manager()
+	return heartbeat != null and heartbeat.has_method("is_peer_disconnected") and bool(heartbeat.is_peer_disconnected(peer_key))
+
+
+func _is_kick_confirmation_open() -> bool:
+	return _kick_dialog != null and is_instance_valid(_kick_dialog) and _kick_dialog.visible
+
+
+func _request_selected_kick() -> void:
+	if not _is_host() or _selected_row < 0 or _selected_row >= _visible_rows.size():
+		return
+	var row = _visible_rows[_selected_row]
+	if not bool(row.get("can_kick", false)):
+		return
+	_on_kick_button_pressed(str(row.get("peer_key", "")), str(row.get("name", "")))
+
+
+func _on_kick_button_pressed(peer_key: String, display_name: String) -> void:
+	var player_index = int(_slot_manager.get_player_index_for_steam_id(peer_key)) if _slot_manager != null else -1
+	var ping_ms = int(_ping_ms_by_player_index.get(player_index, -1)) if player_index >= 0 else -1
+	if not _can_kick_peer_now(peer_key, ping_ms):
+		return
+	_pending_kick_peer = peer_key
+	_pending_kick_index = player_index
+	if _kick_dialog == null or not is_instance_valid(_kick_dialog):
+		_kick_dialog = ConfirmationDialog.new()
+		_kick_dialog.name = "KickPlayerConfirmation"
+		_kick_dialog.pause_mode = Node.PAUSE_MODE_PROCESS
+		_kick_dialog.popup_exclusive = true
+		_overlay_root.add_child(_kick_dialog)
+		_apply_font(_kick_dialog.get_label())
+		_apply_font(_kick_dialog.get_ok())
+		_apply_font(_kick_dialog.get_cancel())
+		_kick_dialog.get_label().autowrap = true
+		_kick_dialog.get_label().rect_min_size = Vector2(680, 140)
+		_kick_dialog.connect("confirmed", self, "_on_kick_confirmed")
+		_kick_dialog.connect("popup_hide", self, "_on_kick_confirmation_closed")
+	_kick_dialog.window_title = _txt("BROTATO_ONLINE_PLAYER_LIST_KICK_TITLE")
+	_kick_dialog.dialog_text = _txt("BROTATO_ONLINE_PLAYER_LIST_KICK_CONFIRM") % [display_name]
+	_kick_dialog.get_ok().text = _txt("BROTATO_ONLINE_PLAYER_LIST_KICK")
+	_kick_dialog.get_cancel().text = _txt("BROTATO_ONLINE_PLAYER_LIST_KICK_CANCEL")
+	_kick_confirm_selected = false
+	_kick_dialog.popup_centered(Vector2(740, 260))
+	_kick_dialog.get_cancel().grab_focus()
+
+
+func _on_kick_confirmed() -> void:
+	var peer_key = _pending_kick_peer
+	# Revalidate identity as well as index: a disconnected slot may have been taken
+	# over while the confirmation was open. Never kick its new occupant by accident.
+	if _removal_manager() != null and _slot_manager != null and int(_slot_manager.get_player_index_for_steam_id(peer_key)) == _pending_kick_index:
+		_removal_manager().kick_peer(peer_key)
+	_pending_kick_peer = ""
+	call_deferred("_close_overlay")
+
+
+func _on_kick_confirmation_closed() -> void:
+	# AcceptDialog hides before emitting confirmed in Godot 3. Keep the identity
+	# until that signal has been delivered.
+	call_deferred("_clear_closed_kick_confirmation")
+	if _overlay_open and not _opened_by_gamepad and not Input.is_key_pressed(KEYBOARD_KEY):
+		call_deferred("_close_overlay")
+
+
+func reset_roster_cache() -> void:
+	_latest_snapshot_rows.clear()
+	_remote_display_name_by_player_index.clear()
+	_ping_ms_by_player_index.clear()
+	_pending_ping_by_player_index.clear()
+	_watcher_until_msec_by_player_index.clear()
+	_last_render_key = ""
+	_last_snapshot_send_msec = 0
+	_refresh_visible_rows(true)
+
+
+func _clear_closed_kick_confirmation() -> void:
+	if not _is_kick_confirmation_open():
+		_pending_kick_peer = ""
+		_pending_kick_index = -1

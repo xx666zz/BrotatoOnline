@@ -126,6 +126,7 @@ var _connection_by_peer_key = {}
 var _peer_key_by_connection = {}
 var _connections = {} # player_index -> {transport, peer, peer_key}
 var _session_remote_peer_keys = [] # Includes disconnected in-run slots.
+var _kicked_departing_peer_keys = {} # Only the current lobby membership; cleared on leave/rejoin.
 var _rejected_peer_keys = {}
 var _pending_lan_join = false
 var _lan_game_port = DEFAULT_LAN_PORT
@@ -686,6 +687,8 @@ func _broadcast_transport_session_id() -> void:
 
 
 func _register_remote_connection(peer_key: String, transport: Node, peer) -> bool:
+	if _kicked_departing_peer_keys.has(peer_key):
+		return false
 	if peer_key == "" or peer_key == _self_steam_id:
 		return false
 	_rejected_peer_keys.erase(peer_key)
@@ -706,7 +709,7 @@ func _register_remote_connection(peer_key: String, transport: Node, peer) -> boo
 		_session_remote_peer_keys[slot] = peer_key
 		_rebind_remote_slot(takeover_key, peer_key)
 		_host_known_remote_ids.erase(takeover_key)
-	elif get_session_member_count() >= MAX_LOBBY_MEMBERS:
+	elif _should_freeze_online_run_slots() or get_session_member_count() >= MAX_LOBBY_MEMBERS:
 		_rejected_peer_keys[peer_key] = true
 		if transport != null and transport.has_method("close_peer"):
 			transport.close_peer(peer)
@@ -1114,6 +1117,10 @@ func _process(_delta: float) -> void:
 	var t_chunks = OS.get_ticks_usec()
 	_poll_pending_p2p_chunk_sends()
 	_bo_net_diag_cost("poll_pending_chunks", t_chunks, "pending_chunks=" + str(_pending_p2p_chunk_sends.size()))
+
+	var removal_guard = _get_player_removal_manager()
+	if removal_guard != null and removal_guard.transitioning:
+		return
 
 	# Menu input/actions remain responsive without scanning their queues every frame.
 	var menu_action_due = _last_menu_action_poll_usec == 0 or now_usec - _last_menu_action_poll_usec >= MENU_ACTION_POLL_INTERVAL_USEC
@@ -2154,6 +2161,9 @@ func _refresh_lobby_members(force_slot_sync: bool = false) -> void:
 			current_member_ids.append(member_id)
 
 	current_member_ids.sort()
+	for departing_key in _kicked_departing_peer_keys.keys():
+		if not current_member_ids.has(str(departing_key)):
+			_kicked_departing_peer_keys.erase(departing_key)
 	if _is_game_host() and _steam_transport != null:
 		for member_id_value in current_member_ids:
 			var current_id = str(member_id_value)
@@ -2227,6 +2237,8 @@ func _prune_host_known_remote_ids_to_current_members(current_remote_ids: Array) 
 
 
 func _is_current_lobby_remote_member(steam_id: String) -> bool:
+	if _kicked_departing_peer_keys.has(steam_id):
+		return false
 	if steam_id == "" or steam_id == "0" or steam_id == _self_steam_id:
 		return false
 	if _rejected_peer_keys.has(steam_id):
@@ -2639,6 +2651,10 @@ func _clear_focus_input_transition_guards() -> void:
 
 
 func _bump_online_session_generation(reason: String = "") -> void:
+	var removal = _get_player_removal_manager()
+	if removal != null:
+		removal.reset_online_session_state()
+	_kicked_departing_peer_keys.clear()
 	_online_session_generation += 1
 	_clear_focus_input_transition_guards()
 	var heartbeat = get_parent().get_node_or_null("BrotatoOnlineNetworkHeartbeat")
@@ -2710,6 +2726,9 @@ func _annotate_online_session_message(message: Dictionary) -> Dictionary:
 		wire["game_host_steam_id"] = host_id
 	if _self_steam_id != "":
 		wire["sender_steam_id"] = _self_steam_id
+	var removal = _get_player_removal_manager()
+	if removal != null:
+		wire["roster_revision"] = removal.revision
 	_annotate_battle_generation_fields(wire)
 	return wire
 
@@ -2827,12 +2846,16 @@ func _get_message_lobby_id(message: Dictionary) -> String:
 
 
 func _is_known_online_message_type(msg_type: String) -> bool:
+	if msg_type in ["player_kicked", "player_removed", "player_roster_commit"]:
+		return true
 	if msg_type == "heartbeat":
 		return true
 	return msg_type == "hello" or msg_type == "request_selection_state" or msg_type == "menu_focus" or msg_type == "select_character" or msg_type == "select_weapon" or msg_type == "select_difficulty" or msg_type == "select_zone" or msg_type == "host_character_setup" or msg_type == "host_weapon_setup" or msg_type == "game_start_prepare" or msg_type == "game_start_time_ack" or msg_type == "client_game_scene_ready" or msg_type == "game_start_commit" or msg_type == "retry_wave_confirm" or msg_type == "retry_wave_decline" or msg_type == "retry_wave_state" or msg_type == "retry_wave_end" or msg_type == "menu_scene_state" or msg_type == "run_page_action_sync" or msg_type == "quick_chat" or msg_type == "battle_reliable_events" or msg_type == "battle_snapshot" or msg_type == "battle_terminal_state" or msg_type == "selection_state" or msg_type == "battle_input" or msg_type == "damage_claim_batch" or msg_type == "player_hp_state" or msg_type == "player_state" or msg_type == "entity_kill_claim" or msg_type == "boss_damage_report" or msg_type == "pickup_claim" or msg_type == "battle_entity_resync_request" or msg_type == "bo_mod_message"
 
 
 func _is_host_authoritative_message_type(msg_type: String) -> bool:
+	if msg_type in ["player_kicked", "player_removed", "player_roster_commit"]:
+		return true
 	return msg_type == "host_character_setup" or msg_type == "host_weapon_setup" or msg_type == "game_start_prepare" or msg_type == "game_start_commit" or msg_type == "retry_wave_state" or msg_type == "retry_wave_end" or msg_type == "menu_scene_state" or msg_type == "run_page_action_sync" or msg_type == "quick_chat" or msg_type == "battle_reliable_events" or msg_type == "battle_snapshot" or msg_type == "battle_terminal_state" or msg_type == "selection_state"
 
 
@@ -3490,6 +3513,12 @@ func _update_client_members_from_selection_state(message: Dictionary) -> void:
 
 func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 	var msg_type = str(message.get("msg_type", ""))
+	var removal = _get_player_removal_manager()
+	if removal != null and msg_type != "p2p_json_chunk":
+		if removal.handle_network_message(from_steam_id, message):
+			return
+		if removal.should_drop_message(from_steam_id, message):
+			return
 	if msg_type == "heartbeat":
 		# Validate here too for callers that bypass _handle_raw_p2p_packet.
 		if _should_drop_p2p_message_for_session(from_steam_id, message):
@@ -4795,6 +4824,9 @@ func _host_retry_snapshot_has_alive_players(snapshot: Dictionary) -> bool:
 		if typeof(p) != TYPE_DICTIONARY:
 			continue
 		checked += 1
+		var removal = _get_player_removal_manager()
+		if removal != null and removal.is_player_removed(int(p.get("player_index", checked - 1))):
+			continue
 		if bool(p.get("dead", false)):
 			return false
 		if int(p.get("health", -1)) <= 0:
@@ -9187,3 +9219,69 @@ func _get_battle_replica_manager() -> Node:
 	if parent == null:
 		return null
 	return parent.get_node_or_null("BrotatoOnlineBattleReplicaManager")
+
+
+func _get_player_removal_manager() -> Node:
+	return get_parent().get_node_or_null("BrotatoOnlinePlayerRemovalManager")
+
+
+func detach_kicked_peer(peer_key: String) -> void:
+	if not _is_game_host() or not _session_remote_peer_keys.has(peer_key):
+		return
+	_drop_pending_p2p_sends_for_target(peer_key)
+	_send_p2p_json(peer_key, {"msg_type": "player_kicked"}, true)
+	var connection = _connection_by_peer_key.get(peer_key, {}).duplicate()
+	_kicked_departing_peer_keys[peer_key] = true
+	_session_remote_peer_keys.erase(peer_key)
+	_host_known_remote_ids.erase(peer_key)
+	_accepted_p2p_sessions.erase(peer_key)
+	_remove_player_connection(peer_key)
+	_pending_received_menu_focus_by_sender.erase(peer_key)
+	_pending_received_menu_focus_order.erase(peer_key)
+	_seen_client_hello_by_steam_id.erase(peer_key)
+	_player_list_enabled_by_peer_key.erase(peer_key)
+	_host_game_start_ack_by_steam_id.erase(peer_key)
+	_host_game_start_ready_by_steam_id.erase(peer_key)
+	_retry_wave_ready_by_steam_id.erase(peer_key)
+	if not _pending_host_game_start.empty():
+		var remotes = _pending_host_game_start.get("remote_ids", [])
+		remotes.erase(peer_key)
+	# Give reliable notice time to flush; never close a newer connection on rejoin.
+	get_tree().create_timer(1.0).connect("timeout", self, "_finish_kicked_peer_disconnect", [peer_key, connection, _online_session_generation], CONNECT_ONESHOT)
+	_publish_session_metadata()
+
+
+func _finish_kicked_peer_disconnect(peer_key: String, connection: Dictionary, generation: int) -> void:
+	if generation != _online_session_generation or not _kicked_departing_peer_keys.has(peer_key):
+		return
+	var current = _connection_by_peer_key.get(peer_key, {})
+	if current.get("transport", null) != connection.get("transport", null) or current.get("peer", null) != connection.get("peer", null):
+		return
+	var transport = connection.get("transport", null)
+	var peer = connection.get("peer", null)
+	if transport != null and is_instance_valid(transport):
+		_connection_by_peer_key.erase(peer_key)
+		_peer_key_by_connection.erase(_connection_lookup_key(transport, peer))
+		_drop_pending_p2p_sends_for_target(peer_key)
+		transport.close_peer(peer)
+		if transport == _lan_transport:
+			_kicked_departing_peer_keys.erase(peer_key)
+
+
+func reset_after_player_roster_change() -> void:
+	_reset_game_start_sync_state()
+	_reset_battle_transient_caches_for_scene_restart("player_removed")
+	_pending_p2p_chunk_sends.clear()
+	_incoming_p2p_chunks.clear()
+	_pending_received_menu_focus_by_sender.clear()
+	_pending_received_menu_focus_order.clear()
+	_last_broadcast_selection_key = ""
+	_sent_character_setup_key_by_steam_id.clear()
+	_sent_weapon_setup_key_by_steam_id.clear()
+	_sent_scene_transition_key_by_steam_id.clear()
+	_host_scene_transition_payload_cache_key = ""
+	_host_scene_transition_payload_cache_state = {}
+	_connections.clear()
+	for peer_key in _session_remote_peer_keys:
+		_refresh_player_connection(str(peer_key))
+		_mark_full_item_list_scene_sync_required(str(peer_key), "player_removed")

@@ -18,6 +18,7 @@ func _init() -> void:
 	_install_focus_emulator_safe_disconnect_extension()
 	_install_shop_item_lock_event_extension()
 	_install_pause_menu_focus_safe_extension()
+	ModLoaderMod.install_script_extension(mod_dir_path.plus_file("extensions/progress_data_removed_players.gd"))
 
 
 
@@ -131,6 +132,7 @@ func _ready() -> void:
 	_add_state_snapshot()
 	_add_battle_replica_manager()
 	_add_brotato_online_api()
+	_add_script_node("BrotatoOnlinePlayerRemovalManager", "scripts/player_removal_manager.gd", true)
 	_add_player_list_overlay_manager()
 	_add_pause_focus_alias_manager()
 

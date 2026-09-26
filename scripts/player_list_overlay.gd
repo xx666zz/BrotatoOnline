@@ -138,6 +138,7 @@ func _process(_delta: float) -> void:
 	_poll_overlay_open_controls()
 
 	if _overlay_open:
+		_keep_focus_emulators_suspended()
 		_force_mouse_visible()
 		if _opened_by_gamepad:
 			_poll_gamepad_overlay_controls()
@@ -277,7 +278,8 @@ func _open_overlay(by_gamepad: bool, device: int) -> void:
 	_reset_gamepad_poll_state()
 	if by_gamepad and device >= 0:
 		_gamepad_toggle_was_pressed_by_device[device] = Input.is_joy_button_pressed(device, GAMEPAD_TOGGLE_BUTTON)
-	_overlay_root.show()
+	if not _overlay_root.visible:
+		_overlay_root.popup()
 	if _overlay_layer != null and _overlay_layer.get_parent() != null:
 		_overlay_layer.get_parent().move_child(_overlay_layer, _overlay_layer.get_parent().get_child_count() - 1)
 	_begin_mouse_interaction()
@@ -419,32 +421,68 @@ func _restore_input_service() -> void:
 
 func _suspend_focus_emulators() -> void:
 	_restore_focus_emulators()
-	if Utils == null:
+	if Utils != null:
+		for player_index in range(8):
+			_suspend_focus_emulator(Utils.get_focus_emulator(player_index))
+	# Upgrades/item boxes and the pause menu own nested FocusEmulators. The
+	# player-index lookup can return a scene-level emulator or the pause alias
+	# instead, leaving the actual _input() consumer running behind the list.
+	_suspend_focus_emulators_in_tree(get_tree().current_scene)
+	if not get_tree().is_connected("node_added", self, "_on_overlay_node_added"):
+		get_tree().connect("node_added", self, "_on_overlay_node_added")
+
+
+func _is_focus_emulator(node) -> bool:
+	return node != null and is_instance_valid(node) and node is Node and node.has_method("_set_focused_control_with_style") and node.has_method("_clear_focused_control")
+
+
+func _suspend_focus_emulators_in_tree(node: Node) -> void:
+	if node == null or not is_instance_valid(node):
 		return
-	for player_index in range(8):
-		var focus_emulator = Utils.get_focus_emulator(player_index)
-		if focus_emulator == null or not is_instance_valid(focus_emulator):
-			continue
-		var already_added = false
-		for state in _suspended_focus_emulators:
-			if typeof(state) == TYPE_DICTIONARY and state.get("node", null) == focus_emulator:
-				already_added = true
-				break
-		if already_added:
-			continue
-		_suspended_focus_emulators.append({
-			"node": focus_emulator,
-			"was_processing_input": focus_emulator.is_processing_input()
-		})
-		# MenuSyncManager continuously repairs FocusEmulator ownership on shop /
-		# progression pages. Mark this as an intentional modal suspension so that
-		# repair code cannot re-enable _input() and consume mouse events before the
-		# player-list Controls receive them.
-		focus_emulator.set_meta(FOCUS_EMULATOR_MODAL_SUSPEND_META, true)
-		focus_emulator.set_process_input(false)
+	_suspend_focus_emulator(node)
+	for child in node.get_children():
+		_suspend_focus_emulators_in_tree(child)
+
+
+func _suspend_focus_emulator(focus_emulator) -> void:
+	if not _is_focus_emulator(focus_emulator) or focus_emulator.is_queued_for_deletion():
+		return
+	for state in _suspended_focus_emulators:
+		if state.get("node", null) == focus_emulator:
+			return
+	_suspended_focus_emulators.append({
+		"node": focus_emulator,
+		"was_processing_input": focus_emulator.is_processing_input()
+	})
+	# MenuSyncManager must also respect this intentional suspension while it
+	# repairs progression input ownership and focus.
+	focus_emulator.set_meta(FOCUS_EMULATOR_MODAL_SUSPEND_META, true)
+	focus_emulator.set_process_input(false)
+
+
+func _on_overlay_node_added(node: Node) -> void:
+	if _overlay_open and _is_focus_emulator(node):
+		# Wait for _ready(), which may enable input on newly created menu nodes.
+		call_deferred("_suspend_new_focus_emulator", weakref(node))
+
+
+func _suspend_new_focus_emulator(node_ref: WeakRef) -> void:
+	if _overlay_open:
+		_suspend_focus_emulator(node_ref.get_ref())
+
+
+func _keep_focus_emulators_suspended() -> void:
+	# Vanilla focus()/page transitions can enable input again. Only revisit the
+	# few captured emulators; never walk the battle scene on every frame.
+	for state in _suspended_focus_emulators:
+		var focus_emulator = state.get("node", null)
+		if focus_emulator != null and is_instance_valid(focus_emulator) and focus_emulator.is_processing_input():
+			focus_emulator.set_process_input(false)
 
 
 func _restore_focus_emulators() -> void:
+	if get_tree().is_connected("node_added", self, "_on_overlay_node_added"):
+		get_tree().disconnect("node_added", self, "_on_overlay_node_added")
 	for state in _suspended_focus_emulators:
 		if typeof(state) != TYPE_DICTIONARY:
 			continue
@@ -807,14 +845,22 @@ func _rebuild_rows() -> void:
 		block_button.focus_mode = Control.FOCUS_NONE
 		_apply_font(block_button)
 		var self_id = _get_self_peer_key()
-		var can_block = can_profile and steam_id != self_id
-		var blocked = can_block and _is_steam_user_blocked(steam_id)
+		# Blocking only needs a known Steam id. Do not tie it to the live
+		# transport/profile state, because a disconnected Steam peer can still
+		# be blocked from the host's player list.
+		var block_steam_id = steam_id
+		if block_steam_id == "":
+			var row_peer_key = str(row_data.get("peer_key", ""))
+			if _is_numeric_steam_id(row_peer_key):
+				block_steam_id = row_peer_key
+		var can_block = _is_numeric_steam_id(block_steam_id) and block_steam_id != self_id
+		var blocked = can_block and _is_steam_user_blocked(block_steam_id)
 		block_button.text = _txt("BROTATO_ONLINE_PLAYER_LIST_UNBLOCK") if blocked else _txt("BROTATO_ONLINE_PLAYER_LIST_BLOCK")
 		block_button.hint_tooltip = _txt("BROTATO_ONLINE_PLAYER_LIST_BLOCK_HINT")
 		block_button.visible = can_block
 		block_button.disabled = not can_block
 		if can_block:
-			block_button.connect("button_down", self, "_on_block_button_pressed", [steam_id])
+			block_button.connect("button_down", self, "_on_block_button_pressed", [block_steam_id])
 		hbox.add_child(block_button)
 		_row_block_buttons.append(block_button)
 
@@ -918,13 +964,17 @@ func _ensure_overlay() -> void:
 	_overlay_layer.pause_mode = Node.PAUSE_MODE_PROCESS
 	add_child(_overlay_layer)
 
-	_overlay_root = Control.new()
+	# A high CanvasLayer only controls drawing order. A real Popup also enters
+	# Godot's modal stack, so an underlying menu popup cannot reject our clicks.
+	_overlay_root = Popup.new()
 	_overlay_root.name = "PlayerListOverlay"
+	_overlay_root.popup_exclusive = true
 	_overlay_root.anchor_right = 1.0
 	_overlay_root.anchor_bottom = 1.0
 	_overlay_root.mouse_filter = Control.MOUSE_FILTER_STOP
 	_overlay_root.pause_mode = Node.PAUSE_MODE_PROCESS
 	_overlay_layer.add_child(_overlay_root)
+	_overlay_root.connect("popup_hide", self, "_close_overlay")
 
 	var dim = ColorRect.new()
 	dim.anchor_right = 1.0
@@ -1199,6 +1249,8 @@ func _connect_language_signal() -> void:
 func _on_language_changed() -> void:
 	_last_render_key = ""
 	if _overlay_layer != null and is_instance_valid(_overlay_layer):
+		if _overlay_root != null and is_instance_valid(_overlay_root):
+			_overlay_root.disconnect("popup_hide", self, "_close_overlay")
 		_overlay_layer.queue_free()
 	_overlay_layer = null
 	_overlay_root = null
@@ -1209,7 +1261,7 @@ func _on_language_changed() -> void:
 	_row_block_buttons.clear()
 	if _overlay_open:
 		_ensure_overlay()
-		_overlay_root.show()
+		_overlay_root.popup()
 		_refresh_visible_rows(true)
 
 
@@ -1256,10 +1308,14 @@ func _request_selected_kick() -> void:
 
 
 func _on_kick_button_pressed(peer_key: String, display_name: String) -> void:
-	var player_index = int(_slot_manager.get_player_index_for_steam_id(peer_key)) if _slot_manager != null else -1
-	var ping_ms = int(_ping_ms_by_player_index.get(player_index, -1)) if player_index >= 0 else -1
-	if not _can_kick_peer_now(peer_key, ping_ms):
+	# Visibility is filtered when rows are built. Once the button is visible, do
+	# not re-check latency/heartbeat here: those values can change between render
+	# and click (especially after a disconnect). Only enforce the authoritative
+	# removal permission before opening the confirmation dialog.
+	var removal = _removal_manager()
+	if removal == null or not removal.can_kick_peer(peer_key):
 		return
+	var player_index = int(_slot_manager.get_player_index_for_steam_id(peer_key)) if _slot_manager != null else -1
 	_pending_kick_peer = peer_key
 	_pending_kick_index = player_index
 	if _kick_dialog == null or not is_instance_valid(_kick_dialog):

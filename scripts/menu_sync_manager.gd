@@ -1012,6 +1012,10 @@ func _poll_shop_page_state_and_intercepts() -> void:
 		_reset_shop_inventory_custom_button_runtime_state()
 		return
 
+	if not _is_game_host() and not _is_client_shop_ready_for_host_state(shop):
+		# Do not consume the first snapshot or wire input into a half-built BaseShop.
+		return
+
 	_ensure_shop_state_diff_cache_for_instance(shop)
 
 	if _is_game_host():
@@ -2673,6 +2677,12 @@ func _queue_shop_state_from_menu_scene_state(state: Dictionary) -> void:
 
 
 func _apply_or_queue_shop_states(states: Array, context: Dictionary = {}) -> void:
+	# A later action/delta must not replace the full entry snapshot while BaseShop
+	# is still initializing. Replay that snapshot first, then the updates in order.
+	_try_apply_pending_shop_state()
+	if not _pending_shop_states_from_host.empty():
+		_pending_shop_states_from_host.append_array(states.duplicate(true))
+		return
 	if not _apply_all_shop_states_to_ui(states, context):
 		_pending_shop_states_from_host = states.duplicate(true)
 
@@ -2688,6 +2698,11 @@ func _apply_all_shop_states_to_ui(states: Array, _context: Dictionary = {}) -> b
 	var shop = _find_shop_node()
 	if not _is_valid_shop_node(shop):
 		return false
+	if not _is_game_host() and not _is_client_shop_ready_for_host_state(shop):
+		# Returning false keeps the Host payload pending, with no RunData/UI writes
+		# and no applied-state keys that could suppress the retry after initialization.
+		return false
+	_ensure_shop_state_diff_cache_for_instance(shop)
 	var applied = false
 	_applying_remote_run_page_action = true
 	for state in states:
@@ -2699,6 +2714,35 @@ func _apply_all_shop_states_to_ui(states: Array, _context: Dictionary = {}) -> b
 	if applied and shop.has_method("update_go_next_button_text"):
 		shop.update_go_next_button_text()
 	return applied
+
+
+func _is_client_shop_ready_for_host_state(shop: Node) -> bool:
+	if not _is_valid_shop_node(shop) or not shop.is_inside_tree() or shop.is_queued_for_deletion():
+		return false
+	# BaseShop._ready connects gold_changed only AFTER generating its local shop,
+	# clearing/restoring locks and filling every player's UI. Node existence,
+	# child _ready and RunData.shop_effects_checked all become true too early.
+	if not RunData.is_connected("gold_changed", shop, "_on_gold_changed"):
+		return false
+	if not _is_live_ref(_safe_get(shop, "_popup_manager", null)):
+		return false
+	var player_count = RunData.get_player_count()
+	if player_count <= 0:
+		return false
+	# Preflight ALL players before applying ANY state: otherwise a partially built
+	# CoopShop can return success for one player and consume the whole pending batch.
+	for player_index in range(player_count):
+		var container = shop._get_shop_items_container(player_index)
+		if not _is_live_ref(container) or not container.is_inside_tree():
+			return false
+		var item_nodes = _safe_get(container, "_shop_items", [])
+		if typeof(item_nodes) != TYPE_ARRAY or item_nodes.empty():
+			return false
+		for item_node in item_nodes:
+			if not _is_live_ref(item_node) or not item_node.is_inside_tree():
+				return false
+	# Check physical slots, not active products: a sold-out shop is still ready.
+	return true
 
 
 func _set_player_gold_from_shop_state(player_index: int, gold_value: int) -> void:

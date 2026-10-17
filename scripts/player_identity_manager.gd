@@ -23,6 +23,8 @@ var _last_status_mode = ""
 var _offline_resume = false
 var _legacy_save = false
 var _resume_bridge = null
+var _resume_mouse_mode_saved = false
+var _resume_previous_mouse_mode = Input.MOUSE_MODE_VISIBLE
 
 
 func _ready() -> void:
@@ -39,12 +41,19 @@ func _ready() -> void:
 
 func _on_node_added(node: Node) -> void:
 	if str(node.filename).ends_with("/coop_resume.tscn"):
+		# Connect as soon as vanilla _ready() has installed its signal handler.
+		# A deferred-only bind gives existing local devices one frame to advance
+		# CoopResume without passing through the ownership screen.
+		node.connect("ready", self, "bind_resume_scene", [node], CONNECT_ONESHOT)
 		call_deferred("bind_resume_scene", node)
 
 
 func bind_resume_scene(scene: Node) -> void:
 	if not is_instance_valid(scene) or scene.has_node("BrotatoOnlineIdentityResume"):
 		return
+	# Vanilla only uses this input handler to exit on Esc. Handle exit here so
+	# the online session and the waiting clients are also cleaned up.
+	scene.set_process_input(false)
 	_resume_bridge = ResumeBridge.new()
 	_resume_bridge.name = "BrotatoOnlineIdentityResume"
 	scene.add_child(_resume_bridge)
@@ -179,7 +188,53 @@ func reset_online_session_state() -> void:
 	_clear_panel()
 
 
+func _show_resume_mouse() -> void:
+	if not _resume_mouse_mode_saved:
+		_resume_previous_mouse_mode = Input.get_mouse_mode()
+		_resume_mouse_mode_saved = true
+	if Input.get_mouse_mode() != Input.MOUSE_MODE_VISIBLE:
+		Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
+
+
+func _restore_resume_mouse() -> void:
+	if not _resume_mouse_mode_saved:
+		return
+	_resume_mouse_mode_saved = false
+	Input.set_mouse_mode(_resume_previous_mouse_mode)
+
+
+func _exit_tree() -> void:
+	_restore_resume_mouse()
+
+
+func _input(event: InputEvent) -> void:
+	if event.is_action_pressed("ui_cancel") and not event.is_echo() and is_instance_valid(_resume_scene) and get_tree().current_scene == _resume_scene:
+		get_tree().set_input_as_handled()
+		_cancel_resume()
+
+
+func _cancel_resume() -> void:
+	if not is_instance_valid(_resume_scene) or get_tree().current_scene != _resume_scene:
+		return
+	_pending = false
+	_clear_panel()
+	var session = _session()
+	if session != null:
+		session.leave_lobby()
+	_offline_resume = false
+	CoopService.listening_for_inputs = false
+	get_tree().change_scene(MenuData.title_screen_scene)
+
+
+func _add_cancel_button(box: Node) -> void:
+	var button = Button.new()
+	button.text = _text("BROTATO_ONLINE_IDENTITY_CANCEL")
+	button.connect("pressed", self, "_cancel_resume")
+	box.add_child(button)
+
+
 func _clear_panel() -> void:
+	_restore_resume_mouse()
 	if is_instance_valid(_panel):
 		_panel.get_parent().queue_free()
 	_panel = null
@@ -200,6 +255,7 @@ func show_resume_session_failure() -> void:
 	retry.connect("pressed", self, "_retry_session")
 	box.add_child(retry)
 	_add_offline_button(box)
+	_add_cancel_button(box)
 
 
 func _retry_session() -> void:
@@ -232,6 +288,11 @@ func _add_offline_button(box: Node) -> void:
 
 
 func _process(delta: float) -> void:
+	# Menus/gamepad input can hide the cursor after the panel is created.
+	if is_instance_valid(_panel) and is_instance_valid(_resume_scene) and get_tree().current_scene == _resume_scene:
+		_show_resume_mouse()
+	elif _resume_mouse_mode_saved:
+		_restore_resume_mouse()
 	_poll_elapsed += delta
 	if _poll_elapsed < 0.2:
 		return
@@ -245,7 +306,9 @@ func _process(delta: float) -> void:
 	if _slots().get_local_player_indices().empty():
 		_slots()._ensure_host_player_joined()
 	_update_panel()
-	if not _manual:
+	if not _manual and _arrived_peers_to_assign().empty():
+		# A different player is waiting to be assigned. Preserve the actionable
+		# reassignment hint instead of replacing it with a missing-owner error.
 		_try_commit(false)
 
 
@@ -352,6 +415,7 @@ func _create_panel_box():
 	for side in ["left", "right", "top", "bottom"]:
 		margin.add_constant_override("margin_" + side, 16)
 	_panel.add_child(margin)
+	_show_resume_mouse()
 	var box = VBoxContainer.new()
 	box.add_constant_override("separation", 12)
 	margin.add_child(box)
@@ -394,7 +458,10 @@ func _build_panel() -> void:
 	confirm.connect("pressed", self, "_confirm_assignment")
 	box.add_child(confirm)
 	confirm.name = "ConfirmIdentity"
-	_add_offline_button(box)
+	var exit_actions = HBoxContainer.new()
+	box.add_child(exit_actions)
+	_add_offline_button(exit_actions)
+	_add_cancel_button(exit_actions)
 
 
 func _text(key: String) -> String:
@@ -422,6 +489,29 @@ func _candidates() -> Array:
 			continue
 		var label = _owner_label(str(peer))
 		result.append({"owner_id": str(peer), "local_slot": 0, "label": label})
+	return result
+
+
+func _arrived_peers_to_assign() -> Array:
+	var result = []
+	var session = _session()
+	if session == null:
+		return result
+	var host = session.get_self_steam_id()
+	var seen = {}
+	for member in session._members:
+		var peer = str(member.get("steam_id", ""))
+		if peer != "" and peer != host and not seen.has(peer):
+			seen[peer] = true
+			if _manual or registry.index_for_owner(peer) < 0:
+				result.append(peer)
+	for peer_value in session._connection_by_peer_key.keys():
+		var connected_peer = str(peer_value)
+		if connected_peer != "" and connected_peer != host and not seen.has(connected_peer):
+			seen[connected_peer] = true
+			if _manual or registry.index_for_owner(connected_peer) < 0:
+				result.append(connected_peer)
+	result.sort()
 	return result
 
 
@@ -459,10 +549,18 @@ func _update_panel() -> void:
 	var confirm = _panel.find_node("ConfirmIdentity", true, false)
 	confirm.visible = _manual
 	_panel.find_node("ReassignIdentity", true, false).visible = not _manual
-	var mode = "manual" if _manual else "waiting"
+	var arrived = _arrived_peers_to_assign()
+	var mode = ("manual" if _manual else "waiting") + ":" + to_json(arrived)
 	if mode != _last_status_mode:
 		_last_status_mode = mode
-		_status.text = _text("BROTATO_ONLINE_IDENTITY_LEGACY" if _legacy_save else "BROTATO_ONLINE_IDENTITY_ASSIGN_HINT") if _manual else _text("BROTATO_ONLINE_IDENTITY_WAITING")
+		if not arrived.empty():
+			var names = []
+			for peer in arrived:
+				names.append(_owner_label(str(peer)))
+			var prompt_key = "BROTATO_ONLINE_IDENTITY_ASSIGN_CONNECTED" if _manual else "BROTATO_ONLINE_IDENTITY_REASSIGN_REQUIRED"
+			_status.text = _text(prompt_key) % ", ".join(names)
+		else:
+			_status.text = _text("BROTATO_ONLINE_IDENTITY_LEGACY" if _legacy_save else "BROTATO_ONLINE_IDENTITY_ASSIGN_HINT") if _manual else _text("BROTATO_ONLINE_IDENTITY_WAITING")
 
 
 func _open_assignment() -> void:
@@ -500,7 +598,7 @@ func _try_commit(manual: bool) -> void:
 	if not owners.empty() and str(owners[0].owner_id) != host:
 		_resume_problem("BROTATO_ONLINE_IDENTITY_HOST_CHANGED")
 		return
-	var required_locals = 0
+	var selected_local_slots = []
 	for owner in owners:
 		var key = str(owner.owner_id)
 		var local_slot = int(owner.local_slot)
@@ -510,7 +608,7 @@ func _try_commit(manual: bool) -> void:
 			return
 		seen.append(unique_key)
 		if key == host:
-			required_locals += 1
+			selected_local_slots.append(local_slot)
 		elif not manual and key.begins_with("lan:") and str(owner.get("resume_hash", "")) == "":
 			_resume_problem("BROTATO_ONLINE_IDENTITY_PROOF_MISSING")
 			return
@@ -527,15 +625,23 @@ func _try_commit(manual: bool) -> void:
 		_status.text = _text("BROTATO_ONLINE_IDENTITY_HOST_FIRST")
 		return
 	var local_count = _slots().get_local_player_indices().size()
-	if required_locals != local_count:
-		_resume_problem("BROTATO_ONLINE_IDENTITY_LOCAL_COUNT", [required_locals, local_count])
-		return
+	for slot in selected_local_slots:
+		if int(slot) < 0 or int(slot) >= local_count:
+			_resume_problem("BROTATO_ONLINE_IDENTITY_LOCAL_COUNT", [selected_local_slots.size(), local_count])
+			return
 	if not _slots().apply_resume_identity_layout(layout):
 		_resume_problem("BROTATO_ONLINE_IDENTITY_INVALID")
 		return
-	registry.assign(owners, _lan_hashes)
+	# Remap selected physical local devices to dense saved indices.
+	selected_local_slots.sort()
+	var saved_owners = owners.duplicate(true)
+	for owner in saved_owners:
+		if str(owner.owner_id) == host:
+			owner.local_slot = selected_local_slots.find(int(owner.local_slot))
+	registry.assign(saved_owners, _lan_hashes)
 	_pending = false
 	_session()._lock_online_run_slots("resume_identity_commit")
 	_session().commit_resume_peer_order(layout)
 	persist_saved_identity()
+	_clear_panel()
 	_resume_bridge.identity_resume_committed()

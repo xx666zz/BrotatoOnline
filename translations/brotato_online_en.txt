@@ -86,6 +86,8 @@ BROTATO_ONLINE_STEAM_RECREATE_LOBBY,Recreate Lobby
 BROTATO_ONLINE_STEAM_CREATE_LOBBY,Create Lobby
 BROTATO_ONLINE_STEAM_JOINING_OVERLAY_CLIENT,Joining...
 BROTATO_ONLINE_STEAM_JOINING_OVERLAY_HOST,Joining...\nPreparing online lobby
+BROTATO_ONLINE_STEAM_JOINING_OVERLAY_CANCEL,Cancel (Esc)
+BROTATO_ONLINE_STEAM_JOINING_OVERLAY_ASSIGNMENT,Waiting for the host to assign characters...
 BROTATO_ONLINE_STEAM_RETURN_TO_LOBBY,Return to Lobby
 BROTATO_ONLINE_STEAM_HOST_DISCONNECTED_TITLE,Connection Lost
 BROTATO_ONLINE_STEAM_HOST_DISCONNECTED_MESSAGE,Connection to the host was lost. Returned to the main menu.
@@ -141,6 +143,7 @@ BROTATO_ONLINE_PLAYER_LIST_KICK_CONFIRM,Kick %s?\nThis player's character, equip
 BROTATO_ONLINE_PLAYER_LIST_KICK_CANCEL,Cancel
 BROTATO_ONLINE_PLAYER_LIST_KICK_HINT,Host gamepad: X kicks the selected player; use Up/Down in the confirmation dialog, A to confirm, B to cancel.
 BROTATO_ONLINE_PLAYER_KICKED_NOTICE,You were kicked by the host.
+BROTATO_ONLINE_IDENTITY_CANCEL,Cancel and return to main menu
 BROTATO_ONLINE_IDENTITY_TITLE,Continue: player ownership
 BROTATO_ONLINE_IDENTITY_WAITING,"Waiting for the saved players. Join in any order, or have the host reassign characters."
 BROTATO_ONLINE_IDENTITY_LEGACY,Choose a player for each saved character and confirm. Older saves have no ownership data. P1 must be host local player 1.
@@ -148,7 +151,7 @@ BROTATO_ONLINE_IDENTITY_ASSIGN,Reassign characters
 BROTATO_ONLINE_IDENTITY_CONFIRM,Confirm ownership and continue
 BROTATO_ONLINE_IDENTITY_LOCAL,Host local player
 BROTATO_ONLINE_IDENTITY_UNASSIGNED,Choose a player...
-BROTATO_ONLINE_IDENTITY_INVALID,Assign a different player to each character; join all host local players before confirming.
+BROTATO_ONLINE_IDENTITY_INVALID,Assign a different player to each character. Extra local devices can be left unassigned.
 BROTATO_ONLINE_IDENTITY_HOST_FIRST,P1 must belong to host local player 1.
 BROTATO_ONLINE_STEAM_IDENTITY_FAILED,"Unable to verify resume identity. Use the original game user directory, or ask the host to reassign characters."
 BROTATO_ONLINE_IDENTITY_ABSENT,Waiting to join
@@ -156,9 +159,11 @@ BROTATO_ONLINE_IDENTITY_SESSION_FAILED,Could not create an online room. Retry or
 BROTATO_ONLINE_IDENTITY_RETRY,Retry creating room
 BROTATO_ONLINE_IDENTITY_OFFLINE,Continue local co-op
 BROTATO_ONLINE_IDENTITY_ASSIGN_HINT,Choose a player for each character and confirm. LAN newcomers rejected earlier must reconnect; Steam members are checked again.
+BROTATO_ONLINE_IDENTITY_REASSIGN_REQUIRED,%s joined the lobby. Click Reassign characters to assign them to the saved run.
+BROTATO_ONLINE_IDENTITY_ASSIGN_CONNECTED,%s joined. Assign a character to each player, then confirm to continue.
 BROTATO_ONLINE_IDENTITY_NOT_CONNECTED,"Waiting for %s to connect. To replace a player, open Reassign characters first."
 BROTATO_ONLINE_IDENTITY_HANDSHAKE,Waiting for %s to finish joining. Please wait or ask that player to reconnect.
-BROTATO_ONLINE_IDENTITY_LOCAL_COUNT,This assignment needs %s local players; %s have joined. Adjust the joined local players or reassign characters.
+BROTATO_ONLINE_IDENTITY_LOCAL_COUNT,Selected local device is unavailable (%s selected; %s joined). Reassign characters.
 BROTATO_ONLINE_IDENTITY_PROOF_MISSING,"This save has no LAN resume proof. Open Reassign characters, then ask that player to connect."
 BROTATO_ONLINE_IDENTITY_HOST_CHANGED,The current host identity differs from this save. Reassign characters or continue local co-op.
 BROTATO_ONLINE_STEAM_DUPLICATE_IDENTITY,This identity is already connected. Close the duplicate game instance and retry.

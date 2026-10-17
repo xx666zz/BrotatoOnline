@@ -350,8 +350,8 @@ func apply_resume_identity_layout(layout: Array) -> bool:
 			remote_devices.append(device)
 			remote_by_device[device] = peer_key
 			device_by_remote[peer_key] = device
-	if used_locals.size() != local_entries.size():
-		return false
+	# Extra joined local devices are deliberately not assigned to saved slots.
+	# The saved player count and characters must remain unchanged.
 	# Commit once, with no per-player signals or RunData resizing. Gear and shop
 	# data keep their existing saved indices throughout the transaction.
 	_remote_steam_id_by_device = remote_by_device
@@ -1201,6 +1201,11 @@ func _remove_untracked_remote_placeholder_slots() -> bool:
 
 func _sync_run_data_player_count() -> void:
 	if not RunData.has_method("set_player_count"):
+		return
+	# Continue already loaded every saved character. Connected input devices
+	# and temporary remote placeholders are not additional saved characters.
+	# Never call set_player_count in this scene (not even for expansion).
+	if _is_in_official_coop_resume_scene():
 		return
 
 	var target_count = CoopService.connected_players.size()

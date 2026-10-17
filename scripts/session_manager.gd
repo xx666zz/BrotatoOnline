@@ -185,6 +185,7 @@ var _online_flow_started = false
 var _online_flow_left_since_msec = 0
 var _host_known_remote_ids = []
 var _client_hello_retry_active = false
+var _client_resume_assignment_pending = false
 var _client_hello_retry_delay_index = 0
 var _client_hello_next_retry_msec = 0
 var _sent_character_setup_key_by_steam_id = {}
@@ -640,7 +641,7 @@ func _handle_transport_identity(transport: Node, peer, message: Dictionary) -> v
 	if accepted:
 		accepted = _register_remote_connection(peer_key, transport, peer)
 		reason = _remote_connection_rejection_reason(peer_key, transport, peer) if not accepted else ""
-	var welcome = {"msg_type": "transport_welcome", "accepted": accepted, "identity_refresh": authenticated_existing, "protocol_version": LAN_PROTOCOL_VERSION, "mod_version": NETWORK_PROTOCOL_VERSION, "session_id": _get_wire_session_id(), "assigned_peer_key": peer_key if accepted else "", "host_peer_key": _self_steam_id, "member_count": get_session_member_count(), "member_limit": MAX_LOBBY_MEMBERS, "state": get_lobby_state(), "reason": "" if accepted else reason}
+	var welcome = {"msg_type": "transport_welcome", "accepted": accepted, "identity_refresh": authenticated_existing, "protocol_version": LAN_PROTOCOL_VERSION, "mod_version": NETWORK_PROTOCOL_VERSION, "session_id": _get_wire_session_id(), "assigned_peer_key": peer_key if accepted else "", "host_peer_key": _self_steam_id, "member_count": get_session_member_count(), "member_limit": MAX_LOBBY_MEMBERS, "state": get_lobby_state(), "resume_assignment_pending": _is_in_official_coop_resume_scene(), "reason": "" if accepted else reason}
 	# Tokens remain private to the initial LAN handshake. Do not log or broadcast.
 	transport.send_packet(peer, to_json(welcome).to_utf8(), P2P_CHANNEL_MENU, true)
 	if not accepted:
@@ -701,6 +702,7 @@ func _handle_transport_welcome(transport: Node, peer, welcome: Dictionary) -> vo
 	_session_active = true
 	_pending_lan_join = false
 	_online_role = "client"
+	_client_resume_assignment_pending = bool(welcome.get("resume_assignment_pending", false))
 	# transport_welcome only confirms that the LAN transport handshake finished.
 	# The client may still be on the title/public-lobby scene while waiting for the
 	# Host's character/weapon/menu_scene_state. Starting the online-flow lifecycle
@@ -1144,14 +1146,19 @@ func _publish_session_metadata() -> void:
 	_set_lobby_metadata_if_changed("member_count", str(count))
 	_set_lobby_metadata_if_changed("member_limit", str(MAX_LOBBY_MEMBERS))
 	_set_lobby_metadata_if_changed("state", state)
+	_set_lobby_metadata_if_changed("resume_assignment_pending", "1" if _is_in_official_coop_resume_scene() else "0")
 	_set_lobby_metadata_if_changed("joinable", "1" if joinable else "0")
 	_set_lobby_joinable_if_changed(joinable)
 
 
-func _input(_event: InputEvent) -> void:
-	# While Steam join / host setup is in flight, prevent the vanilla main menu or
-	# newly-opened character-selection page from accepting accidental confirm/move input.
+func _input(event: InputEvent) -> void:
+	# The client must be able to leave a pending join/ownership assignment.
 	if _joining_overlay_active:
+		if _joining_overlay_can_cancel() and event.is_action_pressed("ui_cancel") and not event.is_echo():
+			get_tree().set_input_as_handled()
+			_cancel_joining_overlay()
+			return
+		# Block the underlying menu while the overlay is displayed.
 		get_tree().set_input_as_handled()
 
 
@@ -1588,6 +1595,7 @@ func leave_lobby() -> void:
 	_pending_received_menu_focus_order.clear()
 	_host_known_remote_ids.clear()
 	_stop_client_hello_retry("leave_lobby")
+	_client_resume_assignment_pending = false
 	_last_broadcast_selection_key = ""
 	_sent_character_setup_key_by_steam_id.clear()
 	_sent_weapon_setup_key_by_steam_id.clear()
@@ -2829,6 +2837,7 @@ func _reset_transient_online_state_for_new_session(reason: String = "") -> void:
 	_client_host_disconnect_teardown_active = false
 	_reset_lobby_metadata_cache()
 	_stop_client_hello_retry("new_session:" + str(reason))
+	_client_resume_assignment_pending = false
 	_bump_online_session_generation(reason)
 	_restore_client_retry_wave_setting_override()
 	_last_online_character_selection_restage_scene_id = 0
@@ -3914,6 +3923,7 @@ func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 			return
 		if _client_should_drop_stale_menu_scene_state(message):
 			return
+		_client_resume_assignment_pending = false
 		_stop_client_hello_retry("menu_scene_state")
 		_apply_host_zone_sync_for_client(message, "menu_scene_state")
 		var menu_sync_scene_client = _get_menu_sync_manager()
@@ -8167,7 +8177,11 @@ func _update_joining_overlay_state() -> void:
 		if _joining_overlay.get_parent() != null:
 			_joining_overlay.get_parent().move_child(_joining_overlay, _joining_overlay.get_parent().get_child_count() - 1)
 		if _joining_overlay is Control:
-			_joining_overlay.grab_focus()
+			var cancel_button = _joining_overlay.get_node_or_null("Center/Panel/VBox/Cancel")
+			if cancel_button != null:
+				cancel_button.visible = _joining_overlay_can_cancel()
+				if cancel_button.visible and not cancel_button.has_focus():
+					cancel_button.grab_focus()
 
 
 func _should_show_joining_overlay() -> bool:
@@ -8181,6 +8195,11 @@ func _should_show_joining_overlay() -> bool:
 	if _main_menu_online_start_pending:
 		return true
 	if _lobby_toggle_pending_create and not _lobby_toggle_close_after_create:
+		return true
+
+	# A saved-run assignment is a hard gate even if the client was previously
+	# on a menu that would otherwise count as a usable online scene.
+	if _client_is_waiting_for_resume_assignment():
 		return true
 
 	# Client path: Steam join was requested, or lobby was joined but host setup / scene
@@ -8219,7 +8238,33 @@ func _is_client_in_usable_online_scene() -> bool:
 	return false
 
 
+func _client_is_waiting_for_resume_assignment() -> bool:
+	if not _session_active or _online_role != "client":
+		return false
+	if _client_resume_assignment_pending:
+		return true
+	if _lobby_id != 0 and _steam != null and _steam_has_method("getLobbyData"):
+		return str(_steam.getLobbyData(_lobby_id, "resume_assignment_pending")) == "1"
+	return false
+
+
+func _joining_overlay_can_cancel() -> bool:
+	return _online_role == "client" or _pending_join_lobby_id != 0 or _client_join_requested_lobby_id != 0 or _pending_lan_join
+
+
+func _cancel_joining_overlay() -> void:
+	if not _joining_overlay_can_cancel():
+		return
+	leave_lobby()
+	_remove_joining_overlay()
+	var scene = get_tree().current_scene
+	if scene != null and str(scene.filename) != str(MenuData.title_screen_scene):
+		get_tree().change_scene(MenuData.title_screen_scene)
+
+
 func _get_joining_overlay_text() -> String:
+	if _client_is_waiting_for_resume_assignment():
+		return _ui_text("joining_overlay_assignment")
 	if _online_role == "client" or _pending_join_lobby_id != 0 or _client_join_requested_lobby_id != 0:
 		return _ui_text("joining_overlay_client")
 	return _ui_text("joining_overlay_host")
@@ -8233,7 +8278,7 @@ func _ensure_joining_overlay(parent: Node) -> void:
 	if existing != null and is_instance_valid(existing):
 		_joining_overlay = existing
 		_joining_overlay_parent = parent
-		_joining_overlay_label = existing.get_node_or_null("Center/Panel/Label")
+		_joining_overlay_label = existing.get_node_or_null("Center/Panel/VBox/Label")
 		return
 
 	var overlay = Control.new()
@@ -8273,8 +8318,12 @@ func _ensure_joining_overlay(parent: Node) -> void:
 	var panel = PanelContainer.new()
 	panel.name = "Panel"
 	panel.mouse_filter = Control.MOUSE_FILTER_STOP
-	panel.rect_min_size = Vector2(360, 150)
+	panel.rect_min_size = Vector2(360, 165)
 	center.add_child(panel)
+
+	var vertical = VBoxContainer.new()
+	vertical.name = "VBox"
+	panel.add_child(vertical)
 
 	var label = Label.new()
 	label.name = "Label"
@@ -8283,7 +8332,7 @@ func _ensure_joining_overlay(parent: Node) -> void:
 	label.valign = Label.VALIGN_CENTER
 	label.autowrap = true
 	label.clip_text = false
-	label.rect_min_size = Vector2(320, 110)
+	label.rect_min_size = Vector2(320, 100)
 	label.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	label.focus_mode = Control.FOCUS_NONE
 	label.hint_tooltip = ""
@@ -8292,7 +8341,15 @@ func _ensure_joining_overlay(parent: Node) -> void:
 			label.add_font_override("font", _main_menu_online_button.get_font("font"))
 		if _main_menu_online_button.has_color("font_color"):
 			label.add_color_override("font_color", _main_menu_online_button.get_color("font_color"))
-	panel.add_child(label)
+	vertical.add_child(label)
+
+	var cancel = Button.new()
+	cancel.name = "Cancel"
+	cancel.text = _ui_text("joining_overlay_cancel")
+	cancel.focus_mode = Control.FOCUS_ALL
+	cancel.visible = _joining_overlay_can_cancel()
+	cancel.connect("pressed", self, "_cancel_joining_overlay")
+	vertical.add_child(cancel)
 
 	parent.add_child(overlay)
 	parent.move_child(overlay, parent.get_child_count() - 1)

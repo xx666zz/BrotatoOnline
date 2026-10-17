@@ -317,6 +317,55 @@ func online_sync_remote_steam_ids(remote_steam_ids: Array) -> void:
 	dump_slots()
 
 
+func apply_resume_identity_layout(layout: Array) -> bool:
+	if _is_slot_mutation_locked() or layout.size() != RunData.get_player_count():
+		return false
+	var local_entries = []
+	for index in get_local_player_indices():
+		local_entries.append(CoopService.connected_players[int(index)].duplicate())
+	var players = []
+	var remote_by_device = {}
+	var device_by_remote = {}
+	var remote_devices = []
+	var reserved = _get_connected_local_gamepad_remapped_devices()
+	for entry in local_entries:
+		if not reserved.has(int(entry[0])):
+			reserved.append(int(entry[0]))
+	var used_locals = []
+	for slot in layout:
+		var peer_key = str(slot.get("peer_key", ""))
+		if peer_key == "":
+			var local_slot = int(slot.get("local_slot", -1))
+			if local_slot < 0 or local_slot >= local_entries.size() or used_locals.has(local_slot):
+				return false
+			used_locals.append(local_slot)
+			players.append(local_entries[local_slot])
+		else:
+			if device_by_remote.has(peer_key):
+				return false
+			var device = _get_next_remote_placeholder_device_from_lists(remote_devices, players, reserved)
+			if device < 0:
+				return false
+			players.append([device, REMOTE_PLACEHOLDER_PLAYER_TYPE])
+			remote_devices.append(device)
+			remote_by_device[device] = peer_key
+			device_by_remote[peer_key] = device
+	if used_locals.size() != local_entries.size():
+		return false
+	# Commit once, with no per-player signals or RunData resizing. Gear and shop
+	# data keep their existing saved indices throughout the transaction.
+	_remote_steam_id_by_device = remote_by_device
+	_device_by_remote_steam_id = device_by_remote
+	_remote_devices = remote_devices
+	_local_mirrored_player_index = -1
+	_local_mirrored_steam_id = ""
+	_mirrored_connected_players.clear()
+	CoopService.connected_players = players
+	_last_observed_local_layout_key = _build_local_layout_key()
+	CoopService.listening_for_inputs = false
+	return true
+
+
 func online_clear_remote_players() -> void:
 	_online_run_connected_players_snapshot.clear()
 	_mirrored_connected_players.clear()
@@ -350,6 +399,15 @@ func online_reset_to_offline(reason: String = "") -> void:
 	_device_by_remote_steam_id.clear()
 	_remote_steam_id_by_device.clear()
 	_remote_devices.clear()
+
+	if _is_in_official_coop_resume_scene():
+		# Continue has already loaded every saved character. Leaving the room or
+		# falling back to local inputs must not apply selection's SOLO reset to it.
+		CoopService.listening_for_inputs = true
+		_last_observed_local_layout_key = _build_local_layout_key()
+		_bo_emit_connected_players_updated("offline_preserve_resume")
+		dump_slots()
+		return
 
 	if _is_in_active_online_run_scene():
 		# Do not shrink RunData during an active battle/shop; that can corrupt the run.

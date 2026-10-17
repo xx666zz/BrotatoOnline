@@ -130,6 +130,7 @@ func _ready() -> void:
 	_add_lan_discovery()
 	_add_lobby_browser()
 	_add_online_player_slot_manager()
+	_add_script_node("BrotatoOnlinePlayerIdentityManager", "scripts/player_identity_manager.gd", true)
 	_add_upgrade_runtime_sync()
 	_add_menu_sync_manager()
 	_add_quick_chat_wheel_manager()

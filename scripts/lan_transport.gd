@@ -136,9 +136,9 @@ func send_packet(peer, data: PoolByteArray, channel: int, reliable: bool) -> boo
 	return false
 
 
-func close_peer(peer) -> void:
+func close_peer(peer, immediately: bool = true) -> void:
 	if _peer != null and _is_host and _peer.has_method("disconnect_peer"):
-		_peer.disconnect_peer(int(peer), true)
+		_peer.disconnect_peer(int(peer), immediately)
 
 
 func _process(_delta: float) -> void:

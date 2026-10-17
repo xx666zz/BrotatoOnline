@@ -282,6 +282,9 @@ func _commit_host_removal(scene_id: int) -> void:
 		if typeof(value) == TYPE_ARRAY:
 			RunData.start_wave_state[key] = _select_array(value, kept, key != "players_data")
 	_slots().remove_online_player_slots(removed_indices)
+	var identity = get_parent().get_node_or_null("BrotatoOnlinePlayerIdentityManager")
+	if identity != null:
+		identity.compact_slots(kept)
 	revision += 1
 	_removed.clear()
 	_affects_saved_run = false
@@ -329,8 +332,12 @@ func _finish_host_removal(path: String, kept: Array, shop_states: Array, lock_ru
 		_save_current_shop(next_scene)
 	# Rebuilding the official Continue page retains players who already rejoined.
 	if path.ends_with("/coop_resume.tscn"):
-		for _index in range(CoopService.connected_players.size()):
-			next_scene._on_connected_players_updated(CoopService.connected_players)
+		var identity = get_parent().get_node_or_null("BrotatoOnlinePlayerIdentityManager")
+		if identity != null:
+			identity.bind_resume_scene(next_scene)
+		if identity == null or not identity.guards_resume(next_scene):
+			for _index in range(CoopService.connected_players.size()):
+				next_scene._on_connected_players_updated(CoopService.connected_players)
 	var state = _menu().build_menu_scene_state(true, true, true)
 	state["scene_path"] = path
 	state["run_config"]["run_config_source"] = "player_removed"

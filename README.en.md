@@ -33,6 +33,33 @@ LAN sessions can be used directly without Steam lobby discovery.
 
 > Steam public lobbies and discovered LAN rooms appear in the same lobby browser.
 
+### Saved runs and reconnection
+
+The mod stores each character's owner in a separate identity file, associated with the exact vanilla run-file contents and profile. It adds no identity fields to vanilla saves. Remote players may join in any order. Once the saved owners complete their handshake, the host restores input slots in saved character order, preserving character, gear, currency, and shop indices.
+
+- Older saves require a one-time assignment on the host's **Player ownership** page. Select a player for each character and confirm; subsequent resumes use the saved ownership.
+- To replace a player, change computers, or switch between Steam and LAN, the host first opens **Reassign characters**, then admits and assigns the replacement. A new identity never automatically takes the first disconnected slot. During an active shop/battle, only the original owner can reconnect; replacement remains available through explicit reassignment on Continue.
+- P1 remains host local player 1. Additional host local players can own other slots; join the required local inputs when resuming. Local ordinals follow their local join order.
+- LAN installation identity and private resume tokens live in `mod_data/six666-BrotatoOnline/client_identity.cfg` in the game's user directory (the previous credential file is imported automatically). Preserve it for automatic recognition, or use explicit host reassignment after moving a save to another computer.
+- Ownership tables live alongside credentials in `saved_identities.cfg`. Back up both files when moving saves; a missing or changed checkpoint falls back to explicit assignment.
+- LAN uses handshake version 3 and Steam uses protocol `5.0.0`; update all peers. The browser and direct Steam joins reject older hosts, and the host rejects incompatible client hellos before they can play.
+
+If room creation fails, retry or choose “Continue local co-op”. The ownership panel also offers local continuation; this closes the online session and keeps already joined local inputs in their saved character slots while collecting inputs for the missing slots. Waiting messages identify missing connections, handshakes, local player counts, or LAN resume proofs. Steam members are rechecked when reassignment opens; LAN newcomers rejected earlier must reconnect.
+
+### Developer validation
+
+Run with Godot 3.6 or a compatible Godot 3 engine:
+
+```powershell
+python tests/identity/run.py "C:/path/to/Godot_v3.6-stable_win64.exe"
+```
+
+The harness uses a temporary project and isolated identity file, never real game saves. It covers all six remote join orders, missing/unready owners, simultaneous disconnects and reverse reconnection, duplicate identities, spoofed senders, legacy migration, mixed host local/remote slots, removal and retry checkpoints, and per-run credential rotation in an existing room. Recovery checks cover synchronous/asynchronous creation failures, local continuation without losing saved characters, late Steam creation callbacks, reassignment refresh, specific waiting reasons, LAN handshake timeout, and rotation without restarting the joined flow. Real ENet loopback connections exercise disconnect/reconnect with changing peer IDs and delivery of refusal reasons before disconnection. Modified production scripts are also compiled by Godot.
+
+For live acceptance, install the same build on multiple machines, save a run, quit, and rejoin in reverse order. Check each player's character, gear, currency, and locked shop items. Disconnect two clients together during battle/shop and reconnect in reverse order. Automated checks pass; full Steam multiplayer and actual loss/jitter conditions still require this live check.
+
+Actual-game validation for this revision used Brotato 1.1.15.4, its custom Godot 3.7 executable, compiled vanilla scripts, and ModLoader 6.2. An isolated host and two full game clients saved a four-player mixed local/LAN layout, restarted, rejoined in reverse order, and entered the shop and battle with the same owners and currency. Offline continuation preserved the nonadjacent local controller slot while filling the remote slots. Inputs were driven by a test mod; the test-only loader profile loaded local ZIPs instead of Workshop subscriptions. Steam account sessions, physical controller input, and multi-machine loss/jitter remain unverified.
+
 ## Features
 
 ### Sessions and lobbies

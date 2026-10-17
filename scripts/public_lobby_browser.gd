@@ -5,7 +5,7 @@ extends Node
 
 const MOD_ID = "six666-BrotatoOnline"
 # Steam/LAN compatibility is negotiated independently from the package version.
-const NETWORK_PROTOCOL_VERSION = "4.0.0"
+const NETWORK_PROTOCOL_VERSION = "5.0.0"
 const DEFAULT_LAN_PORT = 27462
 const GAME_VERSION = "1.1.15.4"
 const META_PUBLIC_LOBBY_ENABLED = "brotato_online_public_lobby_enabled"

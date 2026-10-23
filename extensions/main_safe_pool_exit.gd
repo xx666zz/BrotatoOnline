@@ -420,7 +420,12 @@ func on_consumable_picked_up(consumable: Node, player_index: int) -> void:
 
 func _on_player_died(p_player, _args) -> void:
 	if not _brotato_online_is_online_client():
+		var preserve_checkpoint = _brotato_online_is_online_session_active() and _brotato_online_is_game_host() and bool(ProgressData.settings.retry_wave) and ProgressData.has_method("begin_online_retry_save_guard")
+		if preserve_checkpoint:
+			ProgressData.begin_online_retry_save_guard()
 		._on_player_died(p_player, _args)
+		if preserve_checkpoint:
+			ProgressData.end_online_retry_save_guard()
 		return
 
 	# Client-side battle failure must not reset the local saved run. The Host owns the

@@ -90,6 +90,8 @@ const HOST_SELECTION_REQUEST_REPLY_MIN_INTERVAL_MSEC = 300
 const HOST_SELECTION_REQUEST_SETUP_MIN_INTERVAL_MSEC = 2000
 const BROWSER_PING_REPLY_MIN_INTERVAL_MSEC = 100
 const RETRY_WAVE_STATE_BROADCAST_INTERVAL_MSEC = 400
+const RETRY_WAVE_AUTO_RETRY_MSEC = 15000
+const RETRY_WAVE_CHOICE_RESEND_MSEC = 1000
 const BATTLE_TERMINAL_STATE_RESEND_MSEC = 500
 const BATTLE_START_GENERATION_FENCE_MSEC = 12000
 const HOST_RETRY_TERMINAL_SUPPRESS_MSEC = 8000
@@ -270,6 +272,12 @@ var _retry_wave_starting_context_key = ""
 var _retry_wave_last_started_context_key = ""
 var _retry_wave_host_context_key = ""
 var _retry_wave_ending_context_key = ""
+var _retry_wave_auto_context_key = ""
+var _retry_wave_auto_deadline_msec = 0
+var _retry_wave_client_state = {}
+var _retry_wave_last_choice_send_msec = 0
+var _retry_wave_pending_end_context_key = ""
+var _retry_wave_end_applied_context_key = ""
 var _client_retry_wave_setting_override_active = false
 var _client_retry_wave_setting_before_override = false
 var _end_run_intercept_scene_id = 0
@@ -4175,6 +4183,12 @@ func _clear_retry_wave_sync_state(_reason: String = "") -> void:
 	_retry_wave_last_started_context_key = ""
 	_retry_wave_host_context_key = ""
 	_retry_wave_ending_context_key = ""
+	_retry_wave_auto_context_key = ""
+	_retry_wave_auto_deadline_msec = 0
+	_retry_wave_client_state.clear()
+	_retry_wave_last_choice_send_msec = 0
+	_retry_wave_pending_end_context_key = ""
+	_retry_wave_end_applied_context_key = ""
 
 
 func _clear_client_retry_wave_waiting_latch(_reason: String = "") -> void:
@@ -4267,6 +4281,8 @@ func _on_online_retry_wave_confirm_pressed() -> void:
 	var local_context_key = _get_retry_wave_network_context_key()
 	if local_context_key == "":
 		return
+	if not bool(ProgressData.settings.retry_wave) or _is_retry_wave_commit_locked() or _retry_wave_ending_context_key == local_context_key:
+		return
 	var context_key = local_context_key
 	if not _is_game_host():
 		context_key = _get_retry_wave_best_client_context_key(local_context_key)
@@ -4279,12 +4295,17 @@ func _on_online_retry_wave_confirm_pressed() -> void:
 	_retry_wave_local_waiting_context_key = context_key
 	_set_retry_wave_confirm_locked(retry_wave, true)
 	_update_retry_wave_waiting_visual(retry_wave, true, 1, max(1, RunData.get_player_count()))
+	_send_client_retry_wave_choice(context_key, false)
+
+
+func _send_client_retry_wave_choice(context_key: String, decline: bool) -> void:
+	_retry_wave_last_choice_send_msec = OS.get_ticks_msec()
 	var context_wave = _get_retry_wave_context_wave(context_key)
 	var context_retries = _get_retry_wave_context_retries(context_key)
 	var msg = {
-		"msg_type": "retry_wave_confirm",
+		"msg_type": "retry_wave_decline" if decline else "retry_wave_confirm",
 		"context_key": context_key,
-		"local_context_key": local_context_key,
+		"local_context_key": _get_retry_wave_network_context_key(),
 		"current_wave": context_wave if context_wave != -999999 else int(RunData.current_wave),
 		"retries": context_retries if context_retries != -999999 else int(RunData.retries),
 		"client_msec": OS.get_ticks_msec()
@@ -4345,6 +4366,8 @@ func _on_online_retry_wave_cancel_pressed() -> void:
 		return
 	if not _is_retry_wave_visible(retry_wave):
 		return
+	if _is_retry_wave_commit_locked():
+		return
 	var local_context_key = _get_retry_wave_network_context_key()
 	if local_context_key == "":
 		return
@@ -4356,24 +4379,22 @@ func _on_online_retry_wave_cancel_pressed() -> void:
 		_start_synced_retry_wave_end(context_key, "host_local_decline")
 		return
 	_retry_wave_ending_context_key = context_key
-	var context_wave = _get_retry_wave_context_wave(context_key)
-	var context_retries = _get_retry_wave_context_retries(context_key)
-	var msg = {
-		"msg_type": "retry_wave_decline",
-		"context_key": context_key,
-		"local_context_key": local_context_key,
-		"current_wave": context_wave if context_wave != -999999 else int(RunData.current_wave),
-		"retries": context_retries if context_retries != -999999 else int(RunData.retries),
-		"client_msec": OS.get_ticks_msec()
-	}
-	send_menu_message_to_host(msg)
+	_send_client_retry_wave_choice(context_key, true)
+
+
+func _host_can_receive_retry_wave_choice() -> bool:
+	if not _is_game_host() or not _is_in_game_scene():
+		return false
+	var retry_wave = _get_retry_wave_node()
+	var main = get_tree().current_scene
+	# UI animation/cleanup can finish at different times on the two machines.
+	return _is_retry_wave_visible(retry_wave) or (_is_live_node(main) and bool(main.get("_is_wave_failed")))
 
 
 func _handle_retry_wave_decline_from_client(from_steam_id: String, message: Dictionary) -> void:
 	if not _is_game_host():
 		return
-	var retry_wave = _get_retry_wave_node()
-	if not _is_live_node(retry_wave) or not _is_retry_wave_visible(retry_wave):
+	if not _host_can_receive_retry_wave_choice():
 		return
 	_ensure_host_coop_slot_for_remote(from_steam_id)
 	var local_context_key = _get_retry_wave_network_context_key()
@@ -4406,9 +4427,12 @@ func _start_synced_retry_wave_end(context_key: String, reason: String = "") -> v
 		_retry_wave_starting_context_key = ""
 
 	_retry_wave_ending_context_key = context_key
+	_retry_wave_pending_end_context_key = context_key
+	_retry_wave_auto_deadline_msec = 0
 
 	var msg = {
 		"msg_type": "retry_wave_end",
+		"battle_start_id": int(_host_current_battle_start_id),
 		"context_key": context_key,
 		"current_wave": int(RunData.current_wave),
 		"retries": int(RunData.retries),
@@ -4423,10 +4447,7 @@ func _start_synced_retry_wave_end(context_key: String, reason: String = "") -> v
 
 
 func _handle_retry_wave_end_from_host(message: Dictionary) -> void:
-	if _is_game_host():
-		return
-	var retry_wave = _get_retry_wave_node()
-	if not _is_live_node(retry_wave) or not _is_retry_wave_visible(retry_wave):
+	if _is_game_host() or not _is_in_game_scene() or _is_stale_retry_wave_control(message):
 		return
 	var context_key = str(message.get("context_key", ""))
 	if context_key == "":
@@ -4440,20 +4461,28 @@ func _handle_retry_wave_end_from_host(message: Dictionary) -> void:
 	if host_retries != -999999:
 		RunData.retries = host_retries
 	_retry_wave_ending_context_key = context_key
+	_retry_wave_pending_end_context_key = context_key
+	_retry_wave_auto_deadline_msec = 0
 	call_deferred("_apply_synced_retry_wave_end", context_key)
 
 
 func _apply_synced_retry_wave_end(context_key: String) -> void:
-	if context_key == "":
+	if context_key == "" or context_key != _retry_wave_pending_end_context_key:
 		return
 	var retry_wave = _get_retry_wave_node()
 	if not _is_live_node(retry_wave) or not _is_retry_wave_visible(retry_wave):
 		return
+	if _retry_wave_end_applied_context_key == context_key:
+		return
+	_retry_wave_end_applied_context_key = context_key
 	_reset_game_start_sync_state()
 	var menu_sync = _get_menu_sync_manager()
 	if menu_sync != null and menu_sync.has_method("_end_game_start_guard"):
 		menu_sync._end_game_start_guard("retry_wave_declined")
 	_set_retry_wave_all_buttons_locked(retry_wave, true)
+	if _is_game_host():
+		# Host death preserves a retryable checkpoint. An explicit No ends it.
+		ProgressData.reset_and_save_new_run_state()
 	_call_vanilla_retry_wave_cancel(retry_wave)
 
 
@@ -4467,8 +4496,7 @@ func _set_retry_wave_all_buttons_locked(retry_wave: Node, locked: bool) -> void:
 func _handle_retry_wave_confirm_from_client(from_steam_id: String, message: Dictionary) -> void:
 	if not _is_game_host():
 		return
-	var retry_wave = _get_retry_wave_node()
-	if not _is_live_node(retry_wave) or not _is_retry_wave_visible(retry_wave):
+	if not _host_can_receive_retry_wave_choice():
 		return
 	_ensure_host_coop_slot_for_remote(from_steam_id)
 	var client_context_key = str(message.get("context_key", ""))
@@ -4485,12 +4513,21 @@ func _handle_retry_wave_confirm_from_client(from_steam_id: String, message: Dict
 
 
 func _handle_retry_wave_state_from_host(message: Dictionary) -> void:
+	if not _is_in_game_scene() or _is_stale_retry_wave_control(message):
+		return
 	if message.has("retry_wave_enabled"):
 		apply_host_retry_wave_setting(bool(message.get("retry_wave_enabled", false)))
 	var context_key = str(message.get("context_key", ""))
 	if context_key == "":
 		return
 	_retry_wave_host_context_key = context_key
+	_retry_wave_client_state = message.duplicate(true)
+	var remaining_msec = int(message.get("auto_retry_remaining_msec", -1))
+	_retry_wave_auto_context_key = context_key if remaining_msec >= 0 else ""
+	_retry_wave_auto_deadline_msec = OS.get_ticks_msec() + remaining_msec if remaining_msec >= 0 else 0
+	if bool(message.get("ending", false)):
+		_handle_retry_wave_end_from_host(message)
+		return
 	var host_wave = _get_retry_wave_context_wave(context_key)
 	var host_retries = _get_retry_wave_context_retries(context_key)
 	if host_wave != -999999:
@@ -4518,6 +4555,14 @@ func _handle_retry_wave_state_from_host(message: Dictionary) -> void:
 	_update_retry_wave_waiting_visual(retry_wave, self_ready, ready_count, total_count)
 
 
+func _is_stale_retry_wave_control(message: Dictionary) -> bool:
+	var context_key = str(message.get("context_key", ""))
+	if bool(_retry_wave_client_state.get("committed", false)) and context_key == str(_retry_wave_client_state.get("context_key", "")):
+		return true
+	var packet_start_id = int(message.get("battle_start_id", 0))
+	return packet_start_id > 0 and _client_active_battle_start_id > packet_start_id
+
+
 func _mark_retry_wave_ready(steam_id: String, context_key: String, reason: String) -> void:
 	if steam_id == "":
 		steam_id = "local"
@@ -4530,13 +4575,17 @@ func _mark_retry_wave_ready(steam_id: String, context_key: String, reason: Strin
 		_set_retry_wave_confirm_locked(retry_wave, true)
 
 
-func _try_start_retry_wave_if_all_ready() -> void:
+func _try_start_retry_wave_if_all_ready(allow_unconfirmed: bool = false) -> void:
 	if not _is_game_host():
+		return
+	if not bool(ProgressData.settings.retry_wave) or not _is_retry_wave_visible(_get_retry_wave_node()):
 		return
 	if not _pending_host_game_start.empty():
 		return
 	var context_key = _get_retry_wave_network_context_key()
-	if context_key == "" or _retry_wave_ready_context_key != context_key:
+	if context_key == "" or _retry_wave_ending_context_key == context_key:
+		return
+	if not allow_unconfirmed and _retry_wave_ready_context_key != context_key:
 		return
 	if _retry_wave_last_started_context_key == context_key:
 		return
@@ -4547,7 +4596,7 @@ func _try_start_retry_wave_if_all_ready() -> void:
 		var steam_id = str(steam_id_value)
 		if steam_id == "":
 			continue
-		if not _retry_wave_ready_by_steam_id.has(steam_id):
+		if not allow_unconfirmed and not _retry_wave_ready_by_steam_id.has(steam_id):
 			return
 	_retry_wave_last_started_context_key = context_key
 	_start_synced_retry_wave_restart(context_key, expected_ids)
@@ -4555,9 +4604,15 @@ func _try_start_retry_wave_if_all_ready() -> void:
 
 func _start_synced_retry_wave_restart(context_key: String, expected_ids: Array) -> void:
 	var remote_ids = []
+	var heartbeat = get_parent().get_node_or_null("BrotatoOnlineNetworkHeartbeat")
 	for id_value in expected_ids:
 		var steam_id = str(id_value)
 		if steam_id == "" or steam_id == _get_retry_wave_self_id() or remote_ids.has(steam_id):
+			continue
+		# Keep offline owners' slots, but do not wait for their scene-ready ACKs.
+		if not _connection_by_peer_key.has(steam_id):
+			continue
+		if heartbeat != null and heartbeat.has_method("is_peer_disconnected") and bool(heartbeat.is_peer_disconnected(steam_id)):
 			continue
 		remote_ids.append(steam_id)
 	_pending_host_game_start_id += 1
@@ -4652,17 +4707,27 @@ func _broadcast_retry_wave_state(force: bool = false) -> void:
 		return
 	_retry_wave_last_state_broadcast_msec = now
 	var context_key = _retry_wave_ready_context_key
+	if _retry_wave_ending_context_key != "":
+		context_key = _retry_wave_ending_context_key
 	if context_key == "":
 		context_key = _get_retry_wave_network_context_key()
 	var expected_ids = _get_retry_wave_expected_ids()
 	var ready_ids = _retry_wave_ready_by_steam_id.keys()
+	var starting = not _pending_host_game_start.empty() and str(_pending_host_game_start.get("start_kind", "")) == "retry_wave"
+	var ending = _retry_wave_ending_context_key == context_key and context_key != ""
+	var remaining_msec = -1
+	if not starting and not ending and _retry_wave_auto_context_key == context_key and _retry_wave_auto_deadline_msec > 0:
+		remaining_msec = max(0, _retry_wave_auto_deadline_msec - now)
 	var msg = {
 		"msg_type": "retry_wave_state",
+		"battle_start_id": int(_host_current_battle_start_id),
 		"context_key": context_key,
 		"ready_count": _get_retry_wave_ready_count(),
 		"total_count": expected_ids.size(),
 		"ready_ids": ready_ids,
-		"starting": not _pending_host_game_start.empty() and str(_pending_host_game_start.get("start_kind", "")) == "retry_wave",
+		"starting": starting,
+		"ending": ending,
+		"auto_retry_remaining_msec": remaining_msec,
 		"retry_wave_enabled": bool(ProgressData.settings.retry_wave)
 	}
 	for id_value in expected_ids:
@@ -4678,25 +4743,87 @@ func _poll_retry_wave_waiting_visual(retry_wave: Node) -> void:
 	var context_key = _get_retry_wave_network_context_key()
 	if context_key == "":
 		return
+	if _retry_wave_pending_end_context_key != "":
+		_apply_synced_retry_wave_end(_retry_wave_pending_end_context_key)
+		return
+	if not _is_game_host():
+		_poll_client_retry_wave_choice()
+		if _retry_wave_ending_context_key == context_key:
+			_set_retry_wave_all_buttons_locked(retry_wave, true)
+			_update_retry_wave_waiting_visual(retry_wave, false, int(_retry_wave_client_state.get("ready_count", 0)), int(_retry_wave_client_state.get("total_count", max(1, RunData.get_player_count()))))
+			return
 	if not bool(ProgressData.settings.retry_wave):
 		if _is_game_host():
 			_broadcast_retry_wave_state(false)
 		return
 	if _is_game_host():
-		if _retry_wave_ready_context_key == context_key:
+		if not _pending_host_game_start.empty():
+			_set_retry_wave_confirm_locked(retry_wave, true)
 			_update_retry_wave_waiting_visual(retry_wave, _retry_wave_ready_by_steam_id.has(_get_retry_wave_self_id()), _get_retry_wave_ready_count(), _get_retry_wave_expected_ids().size())
-		else:
-			_set_retry_wave_confirm_locked(retry_wave, false)
+			_broadcast_retry_wave_state(false)
+			return
+		if _retry_wave_auto_context_key != context_key:
+			_retry_wave_auto_context_key = context_key
+			_retry_wave_auto_deadline_msec = OS.get_ticks_msec() + RETRY_WAVE_AUTO_RETRY_MSEC
+		if _retry_wave_ready_context_key != context_key:
+			_retry_wave_ready_context_key = context_key
+			_retry_wave_ready_by_steam_id.clear()
+		var self_ready = _retry_wave_ready_by_steam_id.has(_get_retry_wave_self_id())
+		_set_retry_wave_confirm_locked(retry_wave, self_ready or not _pending_host_game_start.empty())
+		_update_retry_wave_waiting_visual(retry_wave, self_ready, _get_retry_wave_ready_count(), _get_retry_wave_expected_ids().size())
+		if not self_ready:
 			_ensure_retry_wave_confirm_focus(retry_wave)
 		# Also carries the Host-authoritative retry_wave_enabled setting. Broadcasting
 		# while the prompt is open repairs any client that missed the earlier run config.
 		_broadcast_retry_wave_state(false)
+		# Re-evaluate after a kick as well as after a new confirmation.
+		_try_start_retry_wave_if_all_ready()
+		if _pending_host_game_start.empty() and OS.get_ticks_msec() >= _retry_wave_auto_deadline_msec:
+			# Drain this frame's incoming choices before committing the timeout.
+			call_deferred("_try_start_retry_wave_after_timeout", context_key, retry_wave.get_instance_id())
 	else:
-		if _retry_wave_contexts_exact(_retry_wave_local_waiting_context_key, context_key) or _retry_wave_contexts_exact(_retry_wave_local_waiting_context_key, _retry_wave_host_context_key):
-			_set_retry_wave_confirm_locked(retry_wave, true)
-		else:
-			_set_retry_wave_confirm_locked(retry_wave, false)
+		var self_ready = _retry_wave_contexts_exact(_retry_wave_local_waiting_context_key, context_key)
+		var state = _retry_wave_client_state if str(_retry_wave_client_state.get("context_key", "")) == context_key else {}
+		var ready_ids = state.get("ready_ids", [])
+		if typeof(ready_ids) == TYPE_ARRAY:
+			self_ready = self_ready or ready_ids.has(_get_retry_wave_self_id())
+		_set_retry_wave_confirm_locked(retry_wave, self_ready or bool(state.get("starting", false)))
+		_update_retry_wave_waiting_visual(retry_wave, self_ready, int(state.get("ready_count", 0)), int(state.get("total_count", max(1, RunData.get_player_count()))))
+		if not self_ready:
 			_ensure_retry_wave_confirm_focus(retry_wave)
+
+
+func _try_start_retry_wave_after_timeout(context_key: String, retry_node_id: int) -> void:
+	var retry_wave = _get_retry_wave_node()
+	if not _session_active or not _is_game_host() or not _is_live_node(retry_wave):
+		return
+	if retry_wave.get_instance_id() != retry_node_id or context_key != _retry_wave_auto_context_key:
+		return
+	if _retry_wave_auto_deadline_msec <= 0 or OS.get_ticks_msec() < _retry_wave_auto_deadline_msec:
+		return
+	_try_start_retry_wave_if_all_ready(true)
+
+
+func _poll_client_retry_wave_choice() -> void:
+	if _is_retry_wave_commit_locked() or _retry_wave_pending_end_context_key != "":
+		return
+	if OS.get_ticks_msec() - _retry_wave_last_choice_send_msec < RETRY_WAVE_CHOICE_RESEND_MSEC:
+		return
+	var context_key = _get_retry_wave_best_client_context_key(_get_retry_wave_network_context_key())
+	if _retry_wave_contexts_same_wave(_retry_wave_ending_context_key, context_key):
+		_retry_wave_ending_context_key = context_key
+		_send_client_retry_wave_choice(context_key, true)
+	elif _retry_wave_contexts_same_wave(_retry_wave_local_waiting_context_key, context_key):
+		_retry_wave_local_waiting_context_key = context_key
+		var ready_ids = _retry_wave_client_state.get("ready_ids", [])
+		if typeof(ready_ids) != TYPE_ARRAY or not ready_ids.has(_get_retry_wave_self_id()):
+			_send_client_retry_wave_choice(context_key, false)
+
+
+func _is_retry_wave_commit_locked() -> bool:
+	if _is_game_host():
+		return bool(_pending_host_game_start.get("retry_run_data_reset_done", false))
+	return bool(_retry_wave_client_state.get("committed", false)) and str(_retry_wave_client_state.get("context_key", "")) == _get_retry_wave_network_context_key()
 
 
 func _update_retry_wave_waiting_visual(retry_wave: Node, local_waiting: bool, ready_count: int, total_count: int) -> void:
@@ -4709,10 +4836,19 @@ func _update_retry_wave_waiting_visual(retry_wave: Node, local_waiting: bool, re
 	if Text != null and Text.has_method("text"):
 		base = Text.text("RETRY_NUMBER", [str(RunData.retries)])
 	if base == "":
-		base = "Retries: " + str(RunData.retries)
-	var wait_text = "Waiting retry confirmations: " + str(ready_count) + "/" + str(max(1, total_count))
+		base = _ui_text("retry_number") % [int(RunData.retries)]
+	var wait_text = _ui_text("retry_waiting") % [ready_count, max(1, total_count)]
 	if local_waiting:
-		wait_text += "\nYou are ready."
+		wait_text += "\n" + _ui_text("retry_ready")
+	var context_key = _get_retry_wave_network_context_key()
+	var starting = not _pending_host_game_start.empty() if _is_game_host() else bool(_retry_wave_client_state.get("starting", false))
+	if _retry_wave_ending_context_key == context_key:
+		wait_text += "\n" + _ui_text("retry_ending")
+	elif starting or _is_retry_wave_commit_locked():
+		wait_text += "\n" + _ui_text("retry_starting")
+	elif _retry_wave_auto_context_key == context_key and _retry_wave_auto_deadline_msec > 0:
+		var seconds_left = int(ceil(float(max(0, _retry_wave_auto_deadline_msec - OS.get_ticks_msec())) / 1000.0))
+		wait_text += "\n" + (_ui_text("retry_auto_countdown") % [seconds_left])
 	label.text = base + "\n" + wait_text
 
 
@@ -4720,13 +4856,18 @@ func _set_retry_wave_confirm_locked(retry_wave: Node, locked: bool) -> void:
 	var button = _get_retry_wave_confirm_button(retry_wave)
 	if not _is_live_node(button):
 		return
+	var was_locked = bool(button.get("disabled"))
 	button.set("disabled", locked)
 	var cancel_button = _get_retry_wave_cancel_button(retry_wave)
 	if _is_live_node(cancel_button):
-		# Once this player has confirmed retry, keep the whole local choice fixed.
-		# Another player can still decline and make the Host end the run for everyone,
-		# but this prevents a late local reversal racing the retry commit.
-		cancel_button.set("disabled", locked)
+		# Yes only locks Yes. A player may still veto during voting/prepare, but
+		# cannot reverse the decision after RunData has been reset for commit.
+		var ending = _retry_wave_contexts_exact(_retry_wave_ending_context_key, _get_retry_wave_network_context_key())
+		cancel_button.set("disabled", ending or _is_retry_wave_commit_locked())
+		if locked and not was_locked and not bool(cancel_button.get("disabled")) and _is_retry_wave_visible(retry_wave):
+			var focus_owner = _get_gui_focus_owner_safe(button)
+			if _safe_node_contains(retry_wave, focus_owner):
+				cancel_button.call_deferred("grab_focus")
 	if locked:
 		retry_wave.set("confirm_button_pressed", true)
 	else:
@@ -5619,6 +5760,11 @@ func _handle_game_start_commit_from_host(message: Dictionary) -> void:
 	var commit_start_kind = str(message.get("start_kind", "difficulty"))
 	var commit_retry_context_key = str(_safe_dict_get(message.get("run_config", {}), "retry_context_key", message.get("retry_context_key", "")))
 	_arm_client_battle_generation_fence(commit_start_id, commit_start_kind, commit_retry_context_key, "commit")
+	if commit_start_kind == "retry_wave":
+		_retry_wave_client_state = {"context_key": commit_retry_context_key, "starting": true, "committed": true}
+		_retry_wave_auto_deadline_msec = 0
+		_retry_wave_pending_end_context_key = ""
+		_retry_wave_ending_context_key = ""
 	var apply_msec = int(message.get("client_enter_msec", 0))
 	if bool(message.get("wait_host_for_client_scene_ready", false)):
 		apply_msec = now
@@ -7773,6 +7919,10 @@ func _poll_end_run_intercept() -> void:
 		_end_run_intercept_new_run_button_id = 0
 		_end_run_intercept_exit_button_id = 0
 		return
+	if _is_game_host() and _retry_wave_ending_context_key != "":
+		# A reliable End packet can arrive before a client's RetryWave is visible.
+		# Repeat the final decision while results are open so that client can catch up.
+		_broadcast_retry_wave_state(false)
 	var scene = get_tree().current_scene
 	if not _is_live_node(scene):
 		return

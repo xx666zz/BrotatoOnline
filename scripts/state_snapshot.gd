@@ -224,6 +224,7 @@ func build_snapshot() -> Dictionary:
 		"entities": entities,
 		"active_entity_ids": active_dynamic_net_ids.keys(),
 		"wave_timer_state": wave_timer_state,
+		"terrain": get_tree().current_scene.bo_terrain() if get_tree().current_scene != null and get_tree().current_scene.has_method("bo_terrain") else {},
 		"economy_state": economy_state,
 		"progression_state": progression_state,
 		"events": events,
@@ -1418,6 +1419,13 @@ func apply_entity_kill_claim(from_steam_id: String, message: Dictionary) -> void
 	var player_index = int(message.get("player_index", -1))
 	if player_index < 0:
 		player_index = _get_player_index_for_steam_id(from_steam_id)
+	# A remotely confirmed killing blow bypasses the local shovel hit callback.
+	var dig_chance = float(message.get("crate_dig_chance", 0.0))
+	if dig_chance > 0 and "crate_dig_chance" in target and player_index >= 0 and player_index < RunData.get_player_count() and player_index == _get_player_index_for_steam_id(from_steam_id):
+		for weapon in RunData.get_player_weapons(player_index):
+			for effect in weapon.effects:
+				if effect is CrateDigChanceEffect:
+					target.crate_dig_chance = max(target.crate_dig_chance, min(dig_chance, effect.get_dig_chance()))
 	var pos = _dict_to_vec2(message.get("pos", _last_entity_pos_by_net_id.get(net_id, _vec_to_dict(_get_global_pos(target)))))
 	var damage = 1
 	var current_stats = target.get("current_stats")

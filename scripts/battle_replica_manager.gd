@@ -1005,6 +1005,9 @@ func _apply_latest_snapshot_if_needed() -> void:
 			_append_entity_sample(net_id, server_time_msec, pos, vel)
 
 	_apply_remote_player_states(snapshot, server_time_msec)
+	var main = get_tree().current_scene
+	if main != null and main.has_method("bo_apply_terrain"):
+		main.bo_apply_terrain(snapshot.get("terrain", {}))
 	_apply_host_wave_timer_state(snapshot)
 	_apply_pickups(snapshot)
 	_apply_host_economy_state(snapshot)
@@ -2099,6 +2102,8 @@ func _send_entity_kill_claim(net_id: String, category: String, entity: Node = nu
 		"pos": _vec_to_dict(death_pos),
 		"client_time_msec": OS.get_ticks_msec()
 	}
+	if is_instance_valid(entity) and "crate_dig_chance" in entity and entity.crate_dig_chance > 0:
+		msg["crate_dig_chance"] = entity.crate_dig_chance
 	steam.send_battle_message_to_host(msg, true)
 
 
@@ -2345,6 +2350,9 @@ func _spawn_entity_from_birth_marker_state(birth_id: String, birth_state: Dictio
 	if category == "":
 		category = _category_from_entity_type(int(birth_state.get("entity_type", -1)))
 	if category == "":
+		return false
+	# Warnings precede the native evolution roll. Use the final reliable entity birth.
+	if category in ["enemy", "boss"] and RunData.enabled_dlcs.has("primal_dread"):
 		return false
 	var scene_path = str(birth_state.get("spawn_scene_path", birth_state.get("scene_path", "")))
 	if scene_path == "":

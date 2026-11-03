@@ -9,6 +9,11 @@ var mod_dir_path = ""
 func _init() -> void:
 	mod_dir_path = ModLoaderMod.get_unpacked_dir().plus_file(MOD_DIR)
 	ModLoaderMod.install_script_extension(mod_dir_path.plus_file("extensions/item_service_session_content.gd"))
+	ModLoaderMod.install_script_extension(mod_dir_path.plus_file("extensions/gpe_layout.gd"))
+	ModLoaderMod.install_script_extension(mod_dir_path.plus_file("extensions/dig_sites.gd"))
+	ModLoaderMod.install_script_extension(mod_dir_path.plus_file("extensions/enemy_evolution.gd"))
+	ModLoaderMod.install_script_extension(mod_dir_path.plus_file("extensions/long_description_input.gd"))
+	ModLoaderMod.install_script_extension(mod_dir_path.plus_file("extensions/wave_mutations.gd"))
 	_install_player_local_outline_extension()
 	_install_main_safe_pool_exit_extension()
 	_install_entity_spawner_online_player_count_guard_extension()

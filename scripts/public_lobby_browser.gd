@@ -1504,7 +1504,7 @@ func _update_room_name_marquees(delta: float) -> void:
 
 func _format_lobby_state(entry: Dictionary) -> String:
 	if not bool(entry.get("compatible", false)):
-		return Protocol.format_mismatch(_text("version_mismatch"), entry.get("mod_version", ""), entry.get("game_version", ""), _text("version_unknown"))
+		return Protocol.format_mismatch(_text("protocol_mismatch"), _text("game_version_mismatch"), entry.get("mod_version", ""), entry.get("game_version", ""), _text("version_unknown"))
 	if bool(entry.get("full", false)):
 		return _text("full")
 	var state = str(entry.get("state", "unknown"))

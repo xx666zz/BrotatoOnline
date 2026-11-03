@@ -2471,57 +2471,11 @@ func _discard_player_weapon_authoritative(shop: Node, player_index: int, weapon_
 	if before_count <= 0:
 		return false
 
-	RunData.add_recycled(player_index)
-
-	var gear_container = shop._get_gear_container(player_index) if shop.has_method("_get_gear_container") else null
-	var weapons_container = _safe_get(gear_container, "weapons_container", null) if _is_live_ref(gear_container) else null
-	if _is_live_ref(weapons_container):
-		var elements = _safe_get(weapons_container, "_elements", null)
-		if _is_live_ref(elements) and elements.has_method("remove_element"):
-			elements.remove_element(weapon_data, 1, true)
-
-	var removed_weapon_tracked_value = RunData.remove_weapon(weapon_data, player_index)
-	if RunData.get_player_weapons(player_index).size() >= before_count:
-		var fallback_index = _get_player_weapon_index_for_action_payload(player_index, weapon_data)
-		if fallback_index >= 0 and fallback_index < RunData.get_player_weapons(player_index).size():
-			removed_weapon_tracked_value = RunData.remove_weapon_by_index(fallback_index, player_index)
-
-	if RunData.get_player_weapons(player_index).size() >= before_count:
+	if not RunData.get_player_weapons(player_index).has(weapon_data):
 		return false
-
-	var base_recycling_value = _safe_get(weapon_data, "value", 0)
-	var specific_recycling_price_factor = 1.0
-	for specific_item_price in RunData.get_player_effect(Keys.specific_items_price_hash, player_index):
-		if typeof(specific_item_price) != TYPE_ARRAY or specific_item_price.size() < 2:
-			continue
-		var specific_hash = int(specific_item_price[0])
-		if Keys.hash_to_string.has(specific_hash) and str(Keys.hash_to_string[specific_hash]) in str(_safe_get(weapon_data, "my_id", "")):
-			specific_recycling_price_factor = float(specific_item_price[1])
-			break
-	base_recycling_value *= specific_recycling_price_factor
-
-	var recycling_value = ItemService.get_recycling_value(RunData.current_wave, base_recycling_value, player_index, true)
-	RunData.add_gold(recycling_value, player_index)
-	RunData.update_recycling_tracking_value(weapon_data, player_index)
-
-	var nb_coupons = RunData.get_nb_item(Keys.item_coupon_hash, player_index)
-	if nb_coupons > 0:
-		var base_value = ItemService.get_recycling_value(RunData.current_wave, _safe_get(weapon_data, "value", 0), player_index, true, false)
-		var actual_value = ItemService.get_recycling_value(RunData.current_wave, _safe_get(weapon_data, "value", 0), player_index, true)
-		var val_lost = int(base_value - actual_value)
-		RunData.add_tracked_value(player_index, Keys.item_coupon_hash, -val_lost)
-
-	if shop.has_method("_update_stats"):
-		shop._update_stats(player_index)
-	var shop_items_container = shop._get_shop_items_container(player_index) if shop.has_method("_get_shop_items_container") else null
-	if _is_live_ref(shop_items_container) and shop_items_container.has_method("reload_shop_items"):
-		shop_items_container.reload_shop_items()
-	var reroll_button = shop._get_reroll_button(player_index) if shop.has_method("_get_reroll_button") else null
-	if _is_live_ref(reroll_button) and reroll_button.has_method("set_color_from_currency"):
-		reroll_button.set_color_from_currency(RunData.get_player_gold(player_index))
-
+	shop._on_item_discard_button_pressed(weapon_data, player_index)
 	_force_rebuild_shop_gear_container(shop, player_index)
-	return true
+	return RunData.get_player_weapons(player_index).size() < before_count
 
 
 func _force_rebuild_shop_gear_container(shop: Node, player_index: int) -> void:
@@ -4819,6 +4773,8 @@ func _duplicate_shop_sync_variant(value):
 
 
 func _build_shop_run_data_sync_state(player_index: int, force_full_snapshot: bool = false, held_items_mode: String = SHOP_HELD_ITEMS_SYNC_HASH_ONLY, force_full_held_items: bool = false) -> Dictionary:
+	if player_index >= 0 and player_index < RunData.get_player_count() and not RunData.players_data[player_index].recently_mutated.empty():
+		force_full_held_items = true
 	held_items_mode = _resolve_shop_held_items_sync_mode(held_items_mode, force_full_held_items)
 	var run_data_key = ""
 	var run_data_state = {}
@@ -6081,6 +6037,7 @@ func _apply_one_serialized_player_run_data(player_index: int, run_data_state, pr
 
 	var player_data = PlayerRunData.new()
 	player_data.deserialize(run_data_state)
+	player_data.pending_mutations = int(run_data_state.get("pending_mutations", 0))
 	_restore_inventory_effect_state(player_data, run_data_state)
 	if keep_local_appearances:
 		if not preserved_local_appearances.empty():
@@ -11733,6 +11690,7 @@ func _serialize_player_run_data_for_shop_sync(index: int, mode: String) -> Dicti
 	var state = _serialize_player_run_data_for_shop_sync_base(index, mode)
 	if index >= 0 and index < RunData.get_player_count():
 		var player = RunData.players_data[index]
+		state["pending_mutations"] = player.pending_mutations
 		for kind in ["items", "weapons"]:
 			var entries = state.get(kind, [])
 			var resources = player.get(kind)
@@ -11787,7 +11745,10 @@ func _build_shop_action_delta_state(index: int, action: String, message: Diction
 		if applied and message.has("meca_upgrade_preview"):
 			state["meca_upgrade_preview"] = message.meca_upgrade_preview
 		return state
-	return _build_shop_action_delta_state_base(index, action, message, applied)
+	var state = _build_shop_action_delta_state_base(index, action, message, applied)
+	if action == "shop_discard_weapon" and applied and RunData.get_player_effect(Keys.burn_weapon_give_primitive_bonus_hash, index) != 0 and not state.get("run_data_full", false):
+		_append_incremental_shop_runtime_state_to_delta_state(state, index, action)
+	return state
 
 
 func _apply_shop_player_state_to_ui(shop: Node, state: Dictionary) -> bool:

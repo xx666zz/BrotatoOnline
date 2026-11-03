@@ -388,6 +388,11 @@ func _brotato_online_discard_client_end_wave_pickups(reason: String) -> void:
 
 
 func clean_up_room() -> void:
+	if _brotato_online_is_online_session_active():
+		if _brotato_online_is_game_host() and "primal_dread" in ProgressData.active_update_data and not _bo_finish_peer_pickups():
+			return
+		if _brotato_online_is_online_client():
+			_bo_flush()
 	if _brotato_online_is_online_client():
 		var replica = _brotato_online_get_battle_replica_manager()
 		if replica != null and replica.has_method("intercept_client_room_cleanup"):
@@ -411,6 +416,21 @@ func on_gold_picked_up(gold: Node, player_index: int) -> void:
 
 
 func on_consumable_picked_up(consumable: Node, player_index: int) -> void:
+	if consumable.has_meta("bo_pickup") and _brotato_online_is_online_session_active():
+		if consumable.already_picked_up:
+			return
+		var id = str(consumable.get_meta("bo_pickup"))
+		consumable.remove_meta("bo_pickup")
+		_bo_ground.erase(id)
+		if id.begins_with("dig:") or (_bo_sealed and not _cleaning_up) or (not _cleaning_up and not _brotato_online_get_slot_manager().get_local_player_indices().has(player_index)) or (_cleaning_up and _brotato_online_is_online_client()):
+			_bo_removed[id] = true
+			despawn_consumable(consumable)
+			return
+		var kind = str(consumable.consumable_data.my_id)
+		var full_hp = _players[player_index].current_stats.health >= _players[player_index].max_stats.health
+		.on_consumable_picked_up(consumable, player_index)
+		_bo_record_pickup(id, kind, player_index, full_hp)
+		return
 	if _brotato_online_is_online_client() and bool(_cleaning_up):
 		_consumables.erase(consumable)
 		_brotato_online_pool_or_free_client_pickup(consumable, _consumable_pool_id, "client_cleanup_consumable_signal")
@@ -689,6 +709,23 @@ func brotato_online_preroll_drop_for_unit(unit: Node, net_id: String = "", categ
 		_brotato_online_predicted_item_boxes_this_wave += 1
 		prediction_counted = true
 	var result = _brotato_online_serialize_consumable_drop(consumable_data, bool(rolled.get("from_enemy_fruit_effect", false)), forced_box_roll, prediction_counted, unit)
+	result["dig_roll"] = randf()
+	if unit is Enemy and "primal_dread" in ProgressData.active_update_data:
+		var dlc = ItemService.get_dlc_data_by_id("primal_dread")
+		if dlc != null:
+			var reward = ""
+			if unit._is_mutant:
+				if dlc.get_mutation_fruit_to_drop() != null:
+					reward = "mutation"
+			elif unit._is_meca:
+				if dlc.get_meca_parts_to_drop() != null:
+					reward = "parts"
+			elif Utils.get_chance_success(dlc.evolution_fruit_base_chance * DebugService.evolution_consumables_drop_mult):
+				reward = "evolution"
+			if reward != "":
+				result["special"] = reward
+				result["drop_id"] = net_id if net_id != "" else "fallback_" + str(unit.get_instance_id()) + "_" + str(OS.get_ticks_usec())
+				_bo_known[result.drop_id] = reward
 	if net_id != "":
 		result["net_id"] = net_id
 	if category != "":
@@ -770,10 +807,13 @@ func spawn_consumables(unit: Unit) -> void:
 	# the Host birth event has not arrived or this source was never authoritative.
 	if drop_result.empty():
 		return
-	if not bool(drop_result.get("has_drop", false)):
-		return
-
-	var consumable_to_spawn = _brotato_online_resolve_consumable_from_drop_result(drop_result)
+	var consumable_to_spawn = null
+	if "crate_dig_chance" in unit and unit.crate_dig_chance > 0 and not unit.stats.always_drop_consumables and float(drop_result.get("dig_roll", 1.0)) < unit.crate_dig_chance / (1.0 + _items_spawned_this_wave):
+		consumable_to_spawn = ItemService.get_consumable_for_tier(Tier.UNCOMMON)
+		drop_result = drop_result.duplicate()
+		drop_result["from_enemy_fruit_effect"] = false
+	elif bool(drop_result.get("has_drop", false)):
+		consumable_to_spawn = _brotato_online_resolve_consumable_from_drop_result(drop_result)
 	if consumable_to_spawn == null:
 		return
 
@@ -833,6 +873,9 @@ func add_enemy_projectile(instance: Projectile) -> void:
 
 
 func add_node_to_pool(node: Node, id: int) -> void:
+	if is_instance_valid(node) and node.has_meta("bo_pickup"):
+		_bo_ground.erase(str(node.get_meta("bo_pickup")))
+		node.remove_meta("bo_pickup")
 	_brotato_online_clear_drop_meta(node, "pool_add")
 	_brotato_online_sanitize_pool_node(node, "pool_add")
 	.add_node_to_pool(node, id)
@@ -995,3 +1038,283 @@ func _handle_manual_aim_visuals() -> void:
 	_crosshair.global_position = get_viewport().get_canvas_transform().affine_inverse().xform(get_viewport().get_mouse_position())
 	if not _crosshair.visible:
 		_crosshair.show()
+
+# Scene-owned state: a retry gets a new ledger even when the wave number repeats.
+const BO_SPECIALS = {
+	"meca_consumable_fruit": "evolution", "mutant_consumable_fruit": "evolution",
+	"mutation_consumable_fruit": "mutation", "meca_parts_consumable": "parts"
+}
+var _bo_known = {}
+var _bo_ground = {}
+var _bo_removed = {}
+var _bo_received = {}
+var _bo_outbox = []
+var _bo_flush_scheduled = false
+var _bo_sealed = false
+var _bo_closing = false
+var _bo_closed = false
+var _bo_waiting = {}
+var _bo_digs = []
+var _bo_layout_scanned = false
+
+func bo_terrain() -> Dictionary:
+	if not is_instance_valid(_gpe_spawner) or not is_instance_valid(_gpe_container):
+		return {}
+	if not _bo_layout_scanned:
+		for child in _gpe_container.get_children():
+			if child is DigSite:
+				_bo_digs.append(child)
+		_bo_layout_scanned = true
+	var rows = []
+	for site in _bo_digs:
+		if is_instance_valid(site):
+			rows.append([int(site.position.x), int(site.position.y), stepify(site.get_progress_ratio(), 0.01), site.dug_up])
+	return {"holes": _gpe_spawner.online_hole_layout, "digs": rows}
+
+func bo_apply_terrain(state: Dictionary) -> void:
+	if state.empty() or not is_instance_valid(_gpe_container) or _cleaning_up:
+		return
+	_gpe_spawner.apply_online_hole_layout(str(state.get("holes", "")))
+	var rows = state.get("digs", [])
+	if typeof(rows) != TYPE_ARRAY:
+		return
+	for i in rows.size():
+		var row = rows[i]
+		if typeof(row) != TYPE_ARRAY or row.size() != 4:
+			return
+		var created = i == _bo_digs.size()
+		if created:
+			var site = preload("res://entities/gpe/dig_site/dig_site.tscn").instance()
+			site.position = Vector2(row[0], row[1])
+			_gpe_container.add_child(site)
+			site.set_physics_process(false)
+			site._area.disconnect("body_entered", site, "_on_body_entered")
+			site._area.disconnect("body_exited", site, "_on_body_exited")
+			site._area.set_deferred("monitoring", false)
+			_bo_digs.append(site)
+		var site = _bo_digs[i]
+		if not created and not site.dug_up and bool(row[3]):
+			ProgressData.increment_stat("dig_sites_dug_up")
+			ChallengeService.try_complete_challenge(ChallengeService.chal_dig_site_hash, ProgressData.data.dig_sites_dug_up)
+			# Visual replica. Only the Host's real crate enters progression.
+			_bo_spawn_pickup("dig:" + str(i), site._get_crate(), site.global_position, site.global_position)
+		site.dug_up = bool(row[3])
+		site.progress = clamp(float(row[2]), 0.0, 1.0) * site.dig_time
+		site.update()
+
+func spawn_evolution_fruit(unit: Unit, args: Entity.DieArgs) -> void:
+	if not _brotato_online_is_online_session_active():
+		.spawn_evolution_fruit(unit, args)
+		return
+	var roll = _brotato_online_get_valid_drop_meta(unit)
+	if roll.get("special", "") != "evolution":
+		return
+	var player_index = args.killed_by_player_index if args.killed_by_player_index >= 0 else 0
+	if player_index >= RunData.get_player_count():
+		return
+	var dlc = ItemService.get_dlc_data_by_id("primal_dread")
+	if dlc == null:
+		return
+	var evolution = RunData.get_player_effect(Keys.stat_evolution_hash, player_index)
+	var data
+	if RunData.is_meca_only(player_index):
+		data = dlc.meca_fruit
+	elif RunData.is_mutant_only(player_index):
+		data = dlc.mutant_fruit
+	elif not RunData.is_dual_evolution(player_index) and abs(evolution) > ItemService.EVOLUTION_CAMP_LOCK_THRESHOLD:
+		data = dlc.meca_fruit if evolution > 0 else dlc.mutant_fruit
+	else:
+		data = Utils.get_rand_element([dlc.meca_fruit, dlc.mutant_fruit])
+	_bo_drop(unit, roll, data)
+
+func spawn_mutation_fruit(unit: Unit) -> void:
+	if not _brotato_online_is_online_session_active():
+		.spawn_mutation_fruit(unit)
+		return
+	var roll = _brotato_online_get_valid_drop_meta(unit)
+	if roll.get("special", "") == "mutation":
+		_bo_drop(unit, roll, ItemService.get_dlc_data_by_id("primal_dread").mutation_fruit)
+
+func spawn_meca_parts(unit: Unit) -> void:
+	if not _brotato_online_is_online_session_active():
+		.spawn_meca_parts(unit)
+		return
+	var roll = _brotato_online_get_valid_drop_meta(unit)
+	if roll.get("special", "") == "parts":
+		_bo_drop(unit, roll, ItemService.get_dlc_data_by_id("primal_dread").meca_parts_consumable)
+
+func _bo_drop(unit, roll, data) -> void:
+	var id = str(roll.get("drop_id", ""))
+	if id == "" or data == null or _bo_closed or _bo_removed.has(id) or _bo_ground.has(id):
+		return
+	_bo_known[id] = roll.special
+	var pos = unit.global_position
+	var dest = ZoneService.get_rand_pos_in_area(pos, rand_range(50, 100 + unit.stats.gold_spread), 0)
+	_bo_spawn_pickup(id, data.duplicate(), dest, pos)
+
+func _bo_spawn_pickup(id: String, data, dest: Vector2, pos: Vector2) -> void:
+	var node = get_node_from_pool(_consumable_pool_id, _consumables_container)
+	if node == null:
+		node = consumable_scene.instance()
+		_consumables_container.call_deferred("add_child", node)
+		node.connect("picked_up", self, "on_consumable_picked_up")
+		yield(node, "ready")
+	if _bo_removed.has(id) or _cleaning_up:
+		add_node_to_pool(node, _consumable_pool_id)
+		return
+	node.set_meta("bo_pickup", id)
+	node.already_picked_up = false
+	node.consumable_data = data
+	node.set_texture(data.icon)
+	node.drop(dest, 0, pos)
+	_consumables.push_back(node)
+	_bo_ground[id] = node
+
+func _bo_record_pickup(id: String, kind: String, idx: int, full_hp: bool) -> void:
+	_bo_removed[id] = true
+	var key = str(idx) + ":" + id
+	if _bo_received.has(key):
+		return
+	_bo_received[key] = true
+	_bo_outbox.append([id, kind, idx, full_hp, _cleaning_up and _brotato_online_is_game_host()])
+	if _bo_outbox.size() >= 32:
+		_bo_flush()
+	elif not _bo_flush_scheduled:
+		_bo_flush_scheduled = true
+		get_tree().create_timer(0.08).connect("timeout", self, "_bo_scheduled_flush", [], CONNECT_ONESHOT)
+
+func _on_EndWaveTimer_timeout() -> void:
+	if _brotato_online_is_online_session_active():
+		_bo_flush()
+	._on_EndWaveTimer_timeout()
+
+
+func _bo_packet(action: String) -> Dictionary:
+	return {"msg_type": "dlc_pickups", "action": action, "wave": RunData.current_wave}
+
+func _bo_scheduled_flush() -> void:
+	_bo_flush_scheduled = false
+	_bo_flush()
+
+func _bo_flush() -> void:
+	if _bo_outbox.empty():
+		return
+	var session = _brotato_online_get_session_manager()
+	var msg = _bo_packet("items")
+	while not _bo_outbox.empty():
+		var n = min(32, _bo_outbox.size())
+		msg["items"] = _bo_outbox.slice(0, n - 1)
+		if _brotato_online_is_game_host():
+			session.broadcast_message(msg)
+		elif not session.send_battle_message_to_host(msg, true):
+			if not _bo_flush_scheduled:
+				_bo_flush_scheduled = true
+				get_tree().create_timer(0.08).connect("timeout", self, "_bo_scheduled_flush", [], CONNECT_ONESHOT)
+			return
+		for _i in n:
+			_bo_outbox.pop_front()
+
+func bo_receive_pickups(msg: Dictionary, sender: int, peer: String) -> void:
+	var session = _brotato_online_get_session_manager()
+	match str(msg.get("action", "")):
+		"seal":
+			if sender >= 0:
+				return
+			_bo_sealed = true
+			_bo_flush()
+			if _bo_outbox.empty():
+				session.send_battle_message_to_host(_bo_packet("sealed"), true)
+		"sealed":
+			if sender >= 0:
+				_bo_waiting.erase(peer)
+		"items":
+			var rows = msg.get("items", [])
+			if typeof(rows) != TYPE_ARRAY or rows.size() > 32:
+				return
+			var accepted = []
+			for row in rows:
+				if typeof(row) != TYPE_ARRAY or row.size() != 5:
+					continue
+				var idx = int(row[2])
+				var id = str(row[0])
+				var kind = str(row[1])
+				if idx < 0 or idx >= RunData.get_player_count() or not BO_SPECIALS.has(kind):
+					continue
+				if sender >= 0 and (bool(row[4]) or idx != sender or _bo_known.get(id, "") != BO_SPECIALS[kind] or _bo_closed):
+					continue
+				var key = str(idx) + ":" + id
+				if _bo_received.has(key):
+					continue
+				_bo_received[key] = true
+				_bo_removed[id] = true
+				var ground = _bo_ground.get(id)
+				if is_instance_valid(ground):
+					despawn_consumable(ground)
+				_bo_ground.erase(id)
+				if bool(row[4]) or not _brotato_online_get_slot_manager().get_local_player_indices().has(idx):
+					_bo_apply_remote_reward(kind, idx, bool(row[3]))
+				accepted.append(row)
+			if sender >= 0 and not accepted.empty():
+				var relay = _bo_packet("items")
+				relay["items"] = accepted
+				session.broadcast_message(relay, peer)
+
+func _bo_apply_remote_reward(kind: String, idx: int, full_hp: bool) -> void:
+	var data = ItemService.get_element_safe(ItemService.consumables, kind)
+	if data == null:
+		var dlc = ItemService.get_dlc_data_by_id("primal_dread")
+		if dlc == null:
+			return
+		match kind:
+			"meca_consumable_fruit": data = dlc.meca_fruit
+			"mutant_consumable_fruit": data = dlc.mutant_fruit
+			"mutation_consumable_fruit": data = dlc.mutation_fruit
+			"meca_parts_consumable": data = dlc.meca_parts_consumable
+	if data == null:
+		return
+	# Mirror durable results, never run remote collisions, explosions or hit claims twice.
+	var pd = RunData.players_data[idx]
+	pd.consumables_picked_up_this_run += 1
+	if kind == "mutation_consumable_fruit" and not RunData.is_meca_only(idx):
+		pd.pending_mutations += 1
+	if full_hp:
+		var effects = RunData.get_player_effect(Keys.consumable_stats_while_max_hash, idx)
+		for i in effects.size():
+			var e = effects[i]
+			if e.size() > 2:
+				var caps = RunData.max_consumable_stats_gained_this_wave[idx]
+				if i >= caps.size() or caps[i][2] >= e[2]:
+					continue
+				caps[i][2] += e[1]
+			RunData.add_stat(e[0], e[1], idx)
+			if e[0] == Keys.stat_max_hp_hash:
+				RunData.add_tracked_value(idx, Keys.item_extra_stomach_hash, e[1])
+	RunData.apply_item_effects(data, idx)
+
+func _bo_finish_peer_pickups() -> bool:
+	if _bo_closed:
+		return true
+	if not _bo_closing:
+		_bo_closing = true
+		_bo_sealed = true
+		_bo_flush()
+		for peer in _brotato_online_get_session_manager().bo_live_pickup_peers():
+			_bo_waiting[str(peer)] = true
+	if _bo_waiting.empty():
+		_bo_closed = true
+		return true
+	if not has_meta("bo_seal_timer"):
+		set_meta("bo_seal_timer", true)
+		_brotato_online_get_session_manager().broadcast_message(_bo_packet("seal"))
+		get_tree().create_timer(0.25).connect("timeout", self, "_bo_retry_seal", [], CONNECT_ONESHOT)
+	return false
+
+func _bo_retry_seal() -> void:
+	remove_meta("bo_seal_timer")
+	var connected = _brotato_online_get_session_manager().bo_live_pickup_peers()
+	for peer in _bo_waiting.keys():
+		if not connected.has(peer):
+			_bo_waiting.erase(peer)
+	clean_up_room()
+
+

@@ -10,7 +10,7 @@ var _effect_property_cache = {}
 
 
 func serialize_upgrade_effect_state(upgrade_data) -> Array:
-	if upgrade_data == null or not (upgrade_data is UpgradeData):
+	if upgrade_data == null or not (upgrade_data is ItemParentData):
 		return []
 	var effects = upgrade_data.get("effects")
 	if typeof(effects) != TYPE_ARRAY:
@@ -55,7 +55,7 @@ func serialize_upgrade_effect_state(upgrade_data) -> Array:
 
 
 func apply_upgrade_effect_state(upgrade_data, effect_state) -> void:
-	if upgrade_data == null or not (upgrade_data is UpgradeData):
+	if upgrade_data == null or not (upgrade_data is ItemParentData):
 		return
 	if typeof(effect_state) != TYPE_ARRAY:
 		return
@@ -68,6 +68,7 @@ func apply_upgrade_effect_state(upgrade_data, effect_state) -> void:
 	# wire-safe properties. This prevents a plain Effect from receiving a specialized
 	# key such as effect_reduce_stat_gains without its required stat_displayed field.
 	var effects = base_effects.duplicate()
+	effects.resize(effect_state.size())
 	for entry in effect_state:
 		if typeof(entry) != TYPE_DICTIONARY:
 			continue
@@ -283,3 +284,10 @@ func _coerce_wire_value(value, target_type: int):
 	if target_type == TYPE_STRING:
 		return str(value)
 	return value
+
+
+func serialize_item_effect_state(item) -> Array:
+	return serialize_upgrade_effect_state(item)
+
+func apply_item_effect_state(item, state) -> void:
+	apply_upgrade_effect_state(item, state)

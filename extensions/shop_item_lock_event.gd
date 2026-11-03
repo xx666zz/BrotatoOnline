@@ -14,3 +14,11 @@ func change_lock_status(button_pressed: bool) -> void:
 	var is_locked = bool(locked)
 	if is_locked != was_locked:
 		emit_signal("bo_lock_status_changed", is_locked, self)
+
+
+func _update_dismantle_parts_label() -> void:
+	# Some recovered scenes lose unique-name ownership. Use the known local path once.
+	if not is_instance_valid(_dismantle_parts_label) and is_instance_valid(_dismantle_button):
+		_dismantle_parts_label = _dismantle_button.get_node_or_null("HBoxContainer/DismantlePartsLabel")
+	if is_instance_valid(_dismantle_parts_label):
+		._update_dismantle_parts_label()

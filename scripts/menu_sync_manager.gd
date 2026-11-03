@@ -1,5 +1,10 @@
 extends Node
 
+const ItemRuntimeState = preload("item_runtime_state.gd")
+const ShopDlcActions = preload("shop_dlc_actions.gd")
+var _item_runtime_state = ItemRuntimeState.new()
+var _shop_dlc_actions = ShopDlcActions.new()
+
 const SessionContentCatalog = preload("session_content_catalog.gd")
 var _session_content_catalog = SessionContentCatalog.new()
 
@@ -867,6 +872,8 @@ func receive_run_page_action_sync(from_steam_id: String, message: Dictionary, se
 			applied = _apply_shop_discard_weapon_action(player_index, message)
 		else:
 			applied = true
+	elif _get_dlc_shop_actions().is_action(action_type):
+		applied = _get_dlc_shop_actions().apply(player_index, action_type, message) if _is_game_host() else true
 	elif action_type == "shop_reroll":
 		if _is_game_host():
 			applied = _apply_shop_reroll_action(player_index, message)
@@ -980,7 +987,7 @@ func receive_run_page_action_sync(from_steam_id: String, message: Dictionary, se
 			var shop_state_after = message.get("host_shop_state_after", message.get("host_state_after", message.get("state_after", {})))
 			if typeof(shop_state_after) == TYPE_DICTIONARY and not shop_state_after.empty():
 				_apply_or_queue_shop_states([shop_state_after], message)
-		if action_type == "shop_combine_weapon" or action_type == "shop_discard_weapon":
+		if action_type in ["shop_combine_weapon", "shop_discard_weapon", "shop_meca_upgrade"]:
 			_close_shop_popup_for_player(_find_shop_node(), player_index, message)
 		return {}
 
@@ -1125,7 +1132,7 @@ func _debug_host_shop_focus_snapshot(shop: Node) -> void:
 					active_count += 1
 
 
-func _reset_shop_state_diff_cache() -> void:
+func _reset_shop_state_diff_cache_base() -> void:
 	# Client can receive the Host's first shop_state before CoopShop has finished
 	# entering the tree. Do not drop that pending payload during the transient
 	# no-shop-node frames, or the client keeps its locally generated random shop.
@@ -1408,7 +1415,7 @@ func _deferred_broadcast_host_shop_item_lock_toggled(button_pressed: bool, shop_
 	_queue_local_run_page_action(msg)
 
 
-func _install_host_shop_local_mutation_observer(shop: Node) -> void:
+func _install_host_shop_local_mutation_observer_base(shop: Node) -> void:
 	if not _is_game_host() or not _is_valid_shop_node(shop):
 		return
 	for raw_player_index in _get_host_local_player_indices():
@@ -1482,6 +1489,17 @@ func _deferred_broadcast_host_local_shop_state(player_index: int, source_action_
 	if not _is_valid_shop_node(shop) or player_index < 0:
 		return
 
+	if source_action_type == "shop_buy" and (bool(item_state.get("is_meca", false)) or bool(item_state.get("is_mutant", false))):
+		# Native purchases may already have consumed EffectOptions before this observer.
+		# Send the resulting inventory once instead of replaying an ambiguous choice.
+		_mark_host_shop_run_data_dirty(player_index)
+		var variant_state = _build_shop_player_state(player_index, shop, false, false)
+		_append_forced_shop_run_data_repair_to_delta_state(variant_state, player_index, "host_variant_buy")
+		var event = {"msg_type": "run_page_action_sync", "action_type": "shop_buy", "screen": "shop", "player_index": player_index, "host_applied": true, "steal": reason == "host_steal", "host_state_after": variant_state, "state_after": variant_state}
+		if reason == "host_steal":
+			event["steal_extra_enemies_next_wave"] = _get_shop_steal_extra_enemies_next_wave(player_index)
+		_queue_local_run_page_action(event)
+		return
 	if source_action_type == "shop_buy":
 		_mark_host_shop_run_data_dirty(player_index)
 		# The purchase event performs the real vanilla mutation on remote Clients. Attach
@@ -1586,7 +1604,7 @@ func _apply_shop_focus_visual_action(player_index: int, message: Dictionary) -> 
 	return true
 
 
-func _install_client_shop_intercepts(shop: Node, player_index: int) -> void:
+func _install_client_shop_intercepts_base(shop: Node, player_index: int) -> void:
 	if not _is_valid_shop_node(shop):
 		return
 	var key = str(shop.get_instance_id()) + ":" + str(player_index)
@@ -1665,7 +1683,7 @@ func _get_cached_shop_item_slot(shop: Node, player_index: int, shop_item) -> int
 	return slot_index
 
 
-func _intercept_client_shop_item_buttons(container: Node, player_index: int) -> void:
+func _intercept_client_shop_item_buttons_base(container: Node, player_index: int) -> void:
 	if not _is_live_ref(container):
 		return
 	var shop_item_nodes = _safe_get(container, "_shop_items", [])
@@ -1903,6 +1921,7 @@ func _build_client_shop_item_action(action_type: String, shop_item, player_index
 		"action_type": action_type,
 		"screen": "shop",
 		"player_index": player_index,
+		"effect_choice": int(_safe_get(shop_item, "effect_choice_selected", -1)),
 		"target": "item_" + str(idx),
 		"shop_index": idx,
 		# Host already has the authoritative item in this shop slot. Sending the full
@@ -2104,6 +2123,7 @@ func _build_shop_state_prediction_key_from_state(state: Dictionary) -> String:
 	return to_json({
 		"player": int(state.get("player_index", -1)),
 		"gold": int(state.get("gold", 0)),
+		"meca_parts": int(state.get("meca_parts", 0)),
 		"current_health": int(state.get("current_health", 0)),
 		"current_wave": int(state.get("current_wave", 0)),
 		"items": item_keys,
@@ -2180,6 +2200,8 @@ func _apply_host_local_shop_action(message: Dictionary, label: String = "") -> v
 		applied = _apply_shop_combine_weapon_action(player_index, message)
 	elif action_type == "shop_discard_weapon":
 		applied = _apply_shop_discard_weapon_action(player_index, message)
+	elif _get_dlc_shop_actions().is_action(action_type):
+		applied = _get_dlc_shop_actions().apply(player_index, action_type, message)
 	elif action_type == "shop_reroll":
 		applied = _apply_shop_reroll_action(player_index, message)
 	elif action_type == "shop_go":
@@ -2187,7 +2209,7 @@ func _apply_host_local_shop_action(message: Dictionary, label: String = "") -> v
 	elif action_type == "shop_lock":
 		applied = _apply_shop_lock_action(player_index, message)
 	_applying_remote_run_page_action = false
-	if applied and (action_type == "shop_buy" or action_type == "shop_combine_weapon" or action_type == "shop_discard_weapon"):
+	if applied and action_type in ["shop_buy", "shop_combine_weapon", "shop_discard_weapon", "shop_dismantle", "shop_meca_upgrade"]:
 		_mark_host_shop_run_data_dirty(player_index)
 
 	var state_after = _build_shop_action_delta_state(player_index, action_type, message, applied)
@@ -2287,6 +2309,16 @@ func _apply_shop_buy_action(player_index: int, message: Dictionary) -> bool:
 		return false
 	var container = shop._get_shop_items_container(player_index) if shop.has_method("_get_shop_items_container") else null
 	var resolved_item_data = _safe_get(shop_item, "item_data", null)
+	if resolved_item_data != null and resolved_item_data.is_meca:
+		var options = 0
+		for effect in resolved_item_data.effects:
+			if effect is EffectOption:
+				options += 1
+		if options > 0:
+			var choice = int(message.get("effect_choice", -1))
+			if options != 2 or choice < 0 or choice > 1:
+				return false
+			shop_item.effect_choice_selected = choice
 	message["resolved_shop_index"] = _get_shop_item_index(shop_item, player_index)
 	if typeof(message.get("resolved_item", {})) != TYPE_DICTIONARY or message.get("resolved_item", {}).empty():
 		message["resolved_item"] = _serialize_item_parent_identity_for_action(resolved_item_data)
@@ -2325,6 +2357,7 @@ func _apply_shop_buy_action(player_index: int, message: Dictionary) -> bool:
 			shop.on_shop_item_bought(shop_item, player_index)
 		else:
 			return false
+	message["resolved_item"] = _serialize_item_parent_data(shop_item.item_data)
 	if shop_item.has_method("deactivate"):
 		shop_item.deactivate()
 	if _is_live_ref(container) and container.has_method("update_buttons_color"):
@@ -2787,7 +2820,7 @@ func _build_shop_slots_state_key_from_entries(item_entries: Array) -> String:
 	return "|".join(parts)
 
 
-func _build_shop_action_delta_state(player_index: int, action_type: String, message: Dictionary = {}, applied: bool = true) -> Dictionary:
+func _build_shop_action_delta_state_base(player_index: int, action_type: String, message: Dictionary = {}, applied: bool = true) -> Dictionary:
 	var shop = _find_shop_node()
 	if not _is_valid_shop_node(shop) or player_index < 0:
 		return {}
@@ -2858,6 +2891,7 @@ func _build_shop_items_resync_state(player_index: int) -> Dictionary:
 func _append_shop_scalar_state(state: Dictionary, shop: Node, player_index: int) -> void:
 	state["current_wave"] = int(RunData.current_wave)
 	state["gold"] = int(RunData.get_player_gold(player_index))
+	state["meca_parts"] = int(RunData.get_player_meca_parts(player_index))
 	state["current_health"] = _get_player_current_health_value(player_index)
 	state["reroll_price"] = int(_get_node_array_value(shop, "_reroll_price", player_index, 0))
 	state["reroll_count"] = int(_get_node_array_value(shop, "_reroll_count", player_index, 0))
@@ -2953,7 +2987,7 @@ func _build_forced_full_shop_run_data_repair_state(player_index: int, reason: St
 	var player_data = RunData.players_data[player_index]
 	if not player_data.has_method("serialize"):
 		return {}
-	var run_data_state = player_data.serialize()
+	var run_data_state = _serialize_player_run_data_for_shop_sync(player_index, SHOP_HELD_ITEMS_SYNC_COMPACT)
 	if typeof(run_data_state) != TYPE_DICTIONARY or run_data_state.empty():
 		return {}
 	run_data_state["player_index"] = player_index
@@ -3184,7 +3218,7 @@ func _apply_shop_delta_entries_to_container(container, item_entries: Array, play
 		_apply_shop_item_entry_button_state(container, entry)
 
 
-func _apply_shop_player_state_to_ui(shop: Node, state: Dictionary) -> bool:
+func _apply_shop_player_state_to_ui_base(shop: Node, state: Dictionary) -> bool:
 	var player_index = int(state.get("player_index", -1))
 	if player_index < 0:
 		return false
@@ -3418,7 +3452,7 @@ func _find_shop_inventory_element_by_instance_id(shop: Node, player_index: int, 
 	return null
 
 
-func _ensure_shop_item_popup_action_connections(shop: Node, player_index: int, client_action_intercept: bool) -> void:
+func _ensure_shop_item_popup_action_connections_base(shop: Node, player_index: int, client_action_intercept: bool) -> void:
 	if not _is_valid_shop_node(shop):
 		return
 	var item_popup = shop._get_item_popup(player_index) if shop.has_method("_get_item_popup") else null
@@ -3555,7 +3589,10 @@ func _is_shop_inventory_custom_popup_button(item_popup: Node, button: Node) -> b
 	var vanilla_refs = [
 		_safe_get(item_popup, "_combine_button", null),
 		_safe_get(item_popup, "_discard_button", null),
-		_safe_get(item_popup, "_cancel_button", null)
+		_safe_get(item_popup, "_cancel_button", null),
+		_safe_get(item_popup, "_upgrade_button", null),
+		_safe_get(item_popup, "_effect_button_0", null),
+		_safe_get(item_popup, "_effect_button_1", null)
 	]
 	for vanilla_button in vanilla_refs:
 		if _is_live_ref(vanilla_button) and vanilla_button == button:
@@ -4268,6 +4305,7 @@ func _build_shop_player_state(player_index: int, shop: Node = null, force_run_da
 		"player_index": player_index,
 		"current_wave": int(RunData.current_wave),
 		"gold": int(RunData.get_player_gold(player_index)),
+		"meca_parts": int(RunData.get_player_meca_parts(player_index)),
 		"current_health": _get_player_current_health_value(player_index),
 		"shop_items": shop_items,
 		"shop_slot_count": shop_items.size(),
@@ -4514,6 +4552,9 @@ func _build_serialized_held_items_hash_payload(serialized_items: Array) -> Strin
 
 func _build_stable_hash_string(value) -> String:
 	var value_type = typeof(value)
+	if value_type == TYPE_INT or value_type == TYPE_REAL:
+		# JSON transports numbers as reals; 1 and 1.0 describe the same wire state.
+		return "n:" + str(value)
 	if value_type == TYPE_DICTIONARY:
 		var parts = []
 		for raw_key in value.keys():
@@ -4529,15 +4570,7 @@ func _build_stable_hash_string(value) -> String:
 
 
 func _build_local_held_items_hash(player_index: int) -> String:
-	if player_index < 0 or player_index >= RunData.players_data.size():
-		return "0"
-	var player_data = RunData.players_data[player_index]
-	if player_data == null or not player_data.has_method("serialize"):
-		return "0"
-	var serialized = player_data.serialize()
-	if typeof(serialized) != TYPE_DICTIONARY:
-		return "0"
-	return _build_serialized_held_items_hash(serialized.get("items", []))
+	return _build_serialized_held_items_hash(_get_local_serialized_held_items(player_index))
 
 
 func _get_local_serialized_held_items(player_index: int) -> Array:
@@ -4546,7 +4579,7 @@ func _get_local_serialized_held_items(player_index: int) -> Array:
 	var player_data = RunData.players_data[player_index]
 	if player_data == null or not player_data.has_method("serialize"):
 		return []
-	var serialized = player_data.serialize()
+	var serialized = _serialize_player_run_data_for_shop_sync(player_index, SHOP_HELD_ITEMS_SYNC_COMPACT)
 	if typeof(serialized) != TYPE_DICTIONARY:
 		return []
 	var items = serialized.get("items", [])
@@ -4646,7 +4679,7 @@ func _build_compact_owned_items_for_shop_sync(player_index: int, serialized_item
 	return {"items": compact_items, "item_hashes": item_hashes}
 
 
-func _is_owned_item_state_compactable_for_shop_sync(serialized: Dictionary) -> bool:
+func _is_owned_item_state_compactable_for_shop_sync_base(serialized: Dictionary) -> bool:
 	if bool(serialized.get("is_cursed", false)):
 		return false
 	if serialized.has("serialized_data"):
@@ -4837,7 +4870,7 @@ func _build_shop_run_data_sync_state(player_index: int, force_full_snapshot: boo
 	}
 
 
-func _mark_host_shop_run_data_dirty(player_index: int = -1) -> void:
+func _mark_host_shop_run_data_dirty_base(player_index: int = -1) -> void:
 	if player_index >= 0:
 		_host_shop_run_data_dirty_by_player[player_index] = true
 		return
@@ -4845,7 +4878,7 @@ func _mark_host_shop_run_data_dirty(player_index: int = -1) -> void:
 		_host_shop_run_data_dirty_by_player[idx] = true
 
 
-func _serialize_player_run_data_for_shop_sync(player_index: int, held_items_mode: String) -> Dictionary:
+func _serialize_player_run_data_for_shop_sync_base(player_index: int, held_items_mode: String) -> Dictionary:
 	if player_index < 0 or player_index >= RunData.players_data.size():
 		return {}
 	var player_data = RunData.players_data[player_index]
@@ -4896,6 +4929,7 @@ func _build_player_scalar_runtime_key_for_incremental_items(player_index: int) -
 	return to_json({
 		"current_wave": int(RunData.current_wave),
 		"gold": int(RunData.get_player_gold(player_index)),
+		"meca_parts": int(RunData.get_player_meca_parts(player_index)),
 		"current_health": _get_player_current_health_value(player_index),
 		"current_level": int(_safe_get(player_data, "current_level", 0)),
 		"current_xp": int(_safe_get(player_data, "current_xp", 0)),
@@ -4927,7 +4961,7 @@ func _build_id_only_live_inventory_key(items, compact_counts: bool) -> String:
 	return ",".join(result)
 
 
-func _build_live_inventory_id_key(item) -> String:
+func _build_live_inventory_id_key_base(item) -> String:
 	if item == null:
 		return ""
 	var item_id = str(_safe_get(item, "my_id", ""))
@@ -4960,6 +4994,7 @@ func _build_player_effects_runtime_key(player_index: int) -> String:
 		return ""
 	return to_json({
 		"current_health": serialized.get("current_health", 0),
+		"meca_parts": serialized.get("meca_parts", 0),
 		"current_level": serialized.get("current_level", 0),
 		"current_xp": serialized.get("current_xp", 0),
 		"effects": serialized.get("effects", {}),
@@ -5048,7 +5083,7 @@ func _get_wave_value_from_shop_pair(pair, fallback: int) -> int:
 	return fallback
 
 
-func _build_shop_item_stable_identity(item_data) -> Dictionary:
+func _build_shop_item_stable_identity_base(item_data) -> Dictionary:
 	if item_data == null:
 		return {}
 	var data_type = "weapon" if item_data is WeaponData else "item"
@@ -5066,13 +5101,13 @@ func _build_shop_item_stable_identity(item_data) -> Dictionary:
 	return identity
 
 
-func _shop_item_stable_identity_key(identity) -> String:
+func _shop_item_stable_identity_key_base(identity) -> String:
 	if typeof(identity) != TYPE_DICTIONARY or identity.empty():
 		return ""
 	return str(identity.get("type", "")) + "|" + str(identity.get("my_id_hash", 0)) + "|" + str(identity.get("my_id", "")) + "|" + str(identity.get("weapon_id_hash", 0)) + "|" + str(identity.get("weapon_id", "")) + "|" + str(identity.get("item_log", "")) + "|" + str(identity.get("is_cursed", false)) + "|" + str(identity.get("curse_factor", 0.0))
 
 
-func _shop_item_matches_stable_identity(item_data, identity) -> bool:
+func _shop_item_matches_stable_identity_base(item_data, identity) -> bool:
 	if item_data == null or typeof(identity) != TYPE_DICTIONARY or identity.empty():
 		return false
 
@@ -5149,7 +5184,7 @@ func _shop_item_matches_custom_popup_message(item_data, message: Dictionary) -> 
 	return not has_legacy_identity
 
 
-func _get_shop_item_identity_key(item_data) -> String:
+func _get_shop_item_identity_key_base(item_data) -> String:
 	if item_data == null:
 		return ""
 	var curse_suffix = ":C0"
@@ -5801,7 +5836,7 @@ func _get_shop_item_for_action(shop: Node, player_index: int, message: Dictionar
 	return null
 
 
-func _shop_item_matches_action(shop_item, message: Dictionary) -> bool:
+func _shop_item_matches_action_base(shop_item, message: Dictionary) -> bool:
 	if not _is_live_ref(shop_item):
 		return false
 	if not bool(_safe_get(shop_item, "active", true)):
@@ -5866,7 +5901,7 @@ func _weapon_data_identity_matches(candidate, wanted) -> bool:
 	return false
 
 
-func _find_player_weapon_for_shop_action(player_index: int, message: Dictionary):
+func _find_player_weapon_for_shop_action_base(player_index: int, message: Dictionary):
 	if player_index < 0 or player_index >= RunData.get_player_count():
 		return null
 	var weapons = RunData.get_player_weapons(player_index)
@@ -6046,6 +6081,7 @@ func _apply_one_serialized_player_run_data(player_index: int, run_data_state, pr
 
 	var player_data = PlayerRunData.new()
 	player_data.deserialize(run_data_state)
+	_restore_inventory_effect_state(player_data, run_data_state)
 	if keep_local_appearances:
 		if not preserved_local_appearances.empty():
 			player_data.appearances = preserved_local_appearances
@@ -7529,6 +7565,7 @@ func _build_progression_visible_option(player_index: int, ui: Node = null) -> Di
 			"mode": "upgrade",
 			"player_index": player_index,
 			"gold": int(RunData.get_player_gold(player_index)),
+		"meca_parts": int(RunData.get_player_meca_parts(player_index)),
 			"level": int(_safe_get(container, "_level", 0)),
 			"reroll_price": int(_safe_get(container, "_reroll_price", 0)),
 			"reroll_count": int(_safe_get(container, "_reroll_count", 0)),
@@ -7538,7 +7575,7 @@ func _build_progression_visible_option(player_index: int, ui: Node = null) -> Di
 	return {"mode": "none", "player_index": player_index}
 
 
-func _serialize_item_parent_identity_for_action(data) -> Dictionary:
+func _serialize_item_parent_identity_for_action_base(data) -> Dictionary:
 	if data == null:
 		return {}
 	var data_type = "item"
@@ -7567,7 +7604,7 @@ func _serialize_item_parent_identity_for_action(data) -> Dictionary:
 	return result
 
 
-func _serialize_item_parent_data(data) -> Dictionary:
+func _serialize_item_parent_data_base(data) -> Dictionary:
 	if data == null:
 		return {}
 	var data_type = "item"
@@ -7756,7 +7793,7 @@ func _make_missing_host_item_placeholder(state: Dictionary, data_type: String):
 	return copy
 
 
-func _duplicate_with_synced_value_if_needed(data, state: Dictionary):
+func _duplicate_with_synced_value_if_needed_base(data, state: Dictionary):
 	if data == null:
 		return null
 	var serialized_data = state.get("serialized_data", {})
@@ -7957,6 +7994,9 @@ func _is_mutating_run_page_action(action_type: String) -> bool:
 		"shop_buy",
 		"shop_combine_weapon",
 		"shop_discard_weapon",
+		"shop_dismantle",
+		"shop_meca_preview",
+		"shop_meca_upgrade",
 		"shop_reroll",
 		"shop_go",
 		"shop_lock"
@@ -7979,6 +8019,8 @@ func _build_mutating_run_page_action_fingerprint(message: Dictionary, origin_ste
 	parts.append(str(message.get("weapon_weapon_id_hash", "")))
 	parts.append(str(message.get("weapon_slot_index", "")))
 	parts.append(str(message.get("state_key", "")))
+	parts.append(str(message.get("preview_id", "")))
+	parts.append(str(message.get("effect_choice", "")))
 	return "|".join(parts)
 
 
@@ -8643,7 +8685,7 @@ func _build_run_config_for_scene_sync(include_player_run_data: bool = true, held
 				var run_data_sync = _build_shop_run_data_sync_state(player_index, true, held_items_mode, force_full_held_items)
 				serialized_run_data = run_data_sync.get("run_data", {})
 			else:
-				serialized_run_data = _compact_player_run_data_for_shop_sync(player_index, player_data.serialize(), held_items_mode, force_full_held_items)
+				serialized_run_data = _compact_player_run_data_for_shop_sync(player_index, _serialize_player_run_data_for_shop_sync(player_index, held_items_mode), held_items_mode, force_full_held_items)
 
 		players.append({
 			"player_index": player_index,
@@ -11616,3 +11658,236 @@ func _restore_local_content_configuration() -> void:
 	RunData.active_update_data_ids = ProgressData.active_update_data.duplicate()
 	RunData.enabled_dlcs = ProgressData.available_dlc_ids.duplicate()
 	ItemService.init_unlocked_pool()
+
+
+func _is_owned_item_state_compactable_for_shop_sync(serialized: Dictionary) -> bool:
+	return _item_runtime_state.can_compact(serialized)
+
+
+func _serialize_item_parent_data(data) -> Dictionary:
+	var state = _serialize_item_parent_data_base(data)
+	if data is ItemParentData:
+		_append_item_variant_identity(state, data)
+		if data.is_meca or data.is_mutant or (data is ItemData and not (data is CharacterData) and not _item_runtime_state.can_compact(data.serialize())):
+			state["serialized_data"] = data.serialize()
+			state["bo_effect_state"] = _serialize_runtime_effect_state(data)
+	return state
+
+
+func _serialize_item_parent_identity_for_action(data) -> Dictionary:
+	var state = _serialize_item_parent_identity_for_action_base(data)
+	if data is ItemParentData:
+		_append_item_variant_identity(state, data)
+	return state
+
+
+func _build_shop_item_stable_identity(data) -> Dictionary:
+	var state = _build_shop_item_stable_identity_base(data)
+	if data is ItemParentData:
+		_append_item_variant_identity(state, data)
+	return state
+
+
+func _shop_item_stable_identity_key(identity) -> String:
+	return _shop_item_stable_identity_key_base(identity) + ":M" + str(identity.get("is_meca", false)) + ":U" + str(identity.get("is_mutant", false)) + ":R" + str(identity.get("runtime_key", ""))
+
+
+func _get_shop_item_identity_key(data) -> String:
+	return _get_shop_item_identity_key_base(data) + ":R" + _item_runtime_state.fingerprint(data)
+
+
+func _shop_item_matches_stable_identity(data, identity) -> bool:
+	if not _shop_item_matches_stable_identity_base(data, identity):
+		return false
+	return not identity.has("runtime_key") or str(identity.runtime_key) == _item_runtime_state.fingerprint(data)
+
+
+func _shop_item_matches_action(node, message: Dictionary) -> bool:
+	var identity = message.get("item", {})
+	if typeof(identity) == TYPE_DICTIONARY and identity.has("runtime_key"):
+		if not _is_live_ref(node) or str(identity.runtime_key) != _item_runtime_state.fingerprint(_safe_get(node, "item_data", null)):
+			return false
+	return _shop_item_matches_action_base(node, message)
+
+
+func _find_player_weapon_for_shop_action(player_index: int, message: Dictionary):
+	var identity = message.get("weapon", {})
+	if typeof(identity) == TYPE_DICTIONARY and identity.has("runtime_key"):
+		for weapon in RunData.get_player_weapons(player_index):
+			if _shop_item_matches_stable_identity(weapon, identity):
+				return weapon
+		return null
+	return _find_player_weapon_for_shop_action_base(player_index, message)
+
+
+func _duplicate_with_synced_value_if_needed(data, state: Dictionary):
+	var copy = _duplicate_with_synced_value_if_needed_base(data, state)
+	if copy != null and state.has("bo_effect_state"):
+		var sync = _get_upgrade_runtime_sync()
+		if sync != null:
+			sync.apply_item_effect_state(copy, state.bo_effect_state)
+	return copy
+
+
+func _serialize_player_run_data_for_shop_sync(index: int, mode: String) -> Dictionary:
+	var state = _serialize_player_run_data_for_shop_sync_base(index, mode)
+	if index >= 0 and index < RunData.get_player_count():
+		var player = RunData.players_data[index]
+		for kind in ["items", "weapons"]:
+			var entries = state.get(kind, [])
+			var resources = player.get(kind)
+			for i in range(min(entries.size(), resources.size())):
+				var data = resources[i]
+				if data == null or typeof(entries[i]) != TYPE_DICTIONARY:
+					continue
+				# PlayerRunData.serialize() caches every uncursed item by my_id. Distinct
+				# variants with the same ID must not inherit the first instance's state.
+				if kind == "items" and (data.is_meca or data.is_mutant or bool(entries[i].get("is_meca", false)) != data.is_meca or bool(entries[i].get("is_mutant", false)) != data.is_mutant):
+					entries[i] = data.serialize()
+				if kind == "weapons" or not _item_runtime_state.can_compact(entries[i]):
+					# Native normal-item cache entries can share the same Dictionary.
+					entries[i] = entries[i].duplicate()
+					entries[i]["bo_effect_state"] = _serialize_runtime_effect_state(data)
+	return state
+
+
+func _reset_shop_state_diff_cache() -> void:
+	_reset_shop_state_diff_cache_base()
+	_item_runtime_state.clear()
+	_shop_dlc_actions.reset()
+
+
+func _mark_host_shop_run_data_dirty(index: int = -1) -> void:
+	if index < 0:
+		_item_runtime_state.clear()
+	else:
+		_item_runtime_state.invalidate_player(index)
+	_mark_host_shop_run_data_dirty_base(index)
+
+
+func _build_live_inventory_id_key(data) -> String:
+	var key = _build_live_inventory_id_key_base(data)
+	if data != null and (data.is_meca or data.is_mutant):
+		key += ":R" + _item_runtime_state.fingerprint(data)
+	return key
+
+
+func _build_shop_action_delta_state(index: int, action: String, message: Dictionary = {}, applied: bool = true) -> Dictionary:
+	if action == "shop_meca_preview":
+		# A preview changes no inventory. Keep its response independent of backpack size.
+		var state = {"mode": "shop", "shop_delta": true, "delta_action": action, "host_applied": applied, "player_index": index, "meca_parts": int(RunData.get_player_meca_parts(index))}
+		if applied and message.has("meca_upgrade_preview"):
+			state["meca_upgrade_preview"] = message.meca_upgrade_preview
+		return state
+	if _get_dlc_shop_actions().is_action(action):
+		var state = _build_shop_player_state(index, _find_shop_node(), true, false)
+		state["host_applied"] = applied
+		state["delta_action"] = action
+		_append_forced_shop_run_data_repair_to_delta_state(state, index, action)
+		if applied and message.has("meca_upgrade_preview"):
+			state["meca_upgrade_preview"] = message.meca_upgrade_preview
+		return state
+	return _build_shop_action_delta_state_base(index, action, message, applied)
+
+
+func _apply_shop_player_state_to_ui(shop: Node, state: Dictionary) -> bool:
+	var applied = _apply_shop_player_state_to_ui_base(shop, state)
+	if applied:
+		_get_dlc_shop_actions().apply_client_state(shop, state)
+	return applied
+
+
+func _install_client_shop_intercepts(shop: Node, index: int) -> void:
+	_install_client_shop_intercepts_base(shop, index)
+	if _is_valid_shop_node(shop):
+		_get_dlc_shop_actions().wire_popup(shop, index, true)
+		var container = shop._get_shop_items_container(index)
+		if container != null and container.is_connected("shop_item_dismantled", shop, "on_shop_item_dismantled"):
+			container.disconnect("shop_item_dismantled", shop, "on_shop_item_dismantled")
+
+
+func _ensure_shop_item_popup_action_connections(shop: Node, index: int, intercept: bool) -> void:
+	_ensure_shop_item_popup_action_connections_base(shop, index, intercept)
+	if _is_valid_shop_node(shop):
+		_get_dlc_shop_actions().wire_popup(shop, index, intercept)
+
+
+func _intercept_client_shop_item_buttons(container: Node, index: int) -> void:
+	_intercept_client_shop_item_buttons_base(container, index)
+	for node in _safe_get(container, "_shop_items", []):
+		if not _is_live_ref(node):
+			continue
+		if node.is_connected("dismantle_button_pressed", container, "on_shop_item_dismantle_button_pressed"):
+			node.disconnect("dismantle_button_pressed", container, "on_shop_item_dismantle_button_pressed")
+		if not node.is_connected("dismantle_button_pressed", self, "_on_client_shop_dismantled"):
+			node.connect("dismantle_button_pressed", self, "_on_client_shop_dismantled", [index])
+
+
+func _install_host_shop_local_mutation_observer(shop: Node) -> void:
+	_install_host_shop_local_mutation_observer_base(shop)
+	if not _is_game_host() or not _is_valid_shop_node(shop):
+		return
+	for index in _get_host_local_player_indices():
+		_get_dlc_shop_actions().wire_popup(shop, index, false)
+		var container = shop._get_shop_items_container(index)
+		if container != null and not container.is_connected("shop_item_dismantled", self, "_on_host_shop_dismantled_observed"):
+			container.connect("shop_item_dismantled", self, "_on_host_shop_dismantled_observed", [index])
+
+
+func _get_dlc_shop_actions():
+	_shop_dlc_actions.manager = self
+	return _shop_dlc_actions
+
+func _append_item_variant_identity(state: Dictionary, data) -> void:
+	state["is_meca"] = bool(data.is_meca)
+	state["is_mutant"] = bool(data.is_mutant)
+	state["runtime_key"] = _item_runtime_state.fingerprint(data)
+	if data is WeaponData:
+		state["meca_rank"] = int(data.meca_rank)
+		state["meca_power"] = int(data.meca_power)
+
+func _serialize_runtime_effect_state(data) -> Array:
+	var sync = _get_upgrade_runtime_sync()
+	if sync == null:
+		return []
+	var effects = sync.serialize_item_effect_state(data)
+	# Runtime copies have no resource path. Script identity is stable across peers.
+	for entry in effects:
+		entry.erase("resource_path")
+	return effects
+
+func _restore_inventory_effect_state(player, state: Dictionary) -> void:
+	var sync = _get_upgrade_runtime_sync()
+	if sync == null:
+		return
+	for kind in ["items", "weapons"]:
+		var entries = state.get(kind, [])
+		var resources = player.get(kind)
+		for i in range(min(entries.size(), resources.size())):
+			var entry = entries[i]
+			var data = resources[i]
+			if typeof(entry) == TYPE_DICTIONARY and data != null and str(data.my_id) == str(entry.get("my_id", "")) and entry.has("bo_effect_state"):
+				sync.apply_item_effect_state(data, entry.bo_effect_state)
+
+func _on_client_shop_dismantled(node, index: int) -> void:
+	if _applying_remote_run_page_action:
+		return
+	_submit_local_shop_action(_build_client_shop_item_action("shop_dismantle", node, index), index, "dismantle")
+
+func _on_client_meca_preview_pressed(index: int) -> void:
+	_get_dlc_shop_actions().request(index, "shop_meca_preview")
+
+func _on_client_meca_effect_pressed(index: int, choice: int) -> void:
+	_get_dlc_shop_actions().request(index, "shop_meca_upgrade", choice)
+
+func _on_host_shop_dismantled_observed(_node, index: int) -> void:
+	if _applying_remote_run_page_action:
+		return
+	_mark_host_shop_run_data_dirty(index)
+	_schedule_host_local_shop_state_sync(index, "shop_dismantle", "host_dismantle")
+
+func _on_host_meca_upgrade_observed(_source, _upgraded, index: int) -> void:
+	if _applying_remote_run_page_action:
+		return
+	_mark_host_shop_run_data_dirty(index)
+	_schedule_host_local_shop_state_sync(index, "shop_meca_upgrade", "host_meca_upgrade")

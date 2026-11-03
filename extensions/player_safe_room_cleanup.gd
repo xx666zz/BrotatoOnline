@@ -238,7 +238,7 @@ func take_damage(value: int, args: TakeDamageArgs) -> Array:
 	return .take_damage(value, args)
 
 
-func die(args = Utils.default_die_args) -> void:
+func die(args: Entity.DieArgs = Utils.default_die_args) -> void:
 	# Local overlap damage must not kill a remote proxy. Remote death sync sets
 	# brotato_online_allow_remote_die before calling die(), so synced deaths still work.
 	if _brotato_online_is_remote_hurtbox_proxy() and not bool(get_meta("brotato_online_allow_remote_die", false)):

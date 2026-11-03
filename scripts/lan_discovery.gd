@@ -1,9 +1,11 @@
 extends Node
 
+const Protocol = preload("protocol.gd")
+
 signal lobby_found(entry)
 
 const PROTOCOL = "brotato_online_lan"
-const PROTOCOL_VERSION = 1
+const PROTOCOL_VERSION = Protocol.DISCOVERY_PROTOCOL_VERSION
 const DEFAULT_GAME_PORT = 27462
 const DISCOVERY_PORT = 27463
 const SEARCH_DURATION_MSEC = 2500

@@ -1,13 +1,15 @@
 extends Node
 
+const Protocol = preload("protocol.gd")
+
 # Steam and LAN discovery share one list; SessionManager remains the only owner
 # of join/leave and gameplay state.
 
 const MOD_ID = "six666-BrotatoOnline"
 # Steam/LAN compatibility is negotiated independently from the package version.
-const NETWORK_PROTOCOL_VERSION = "5.0.0"
+const NETWORK_PROTOCOL_VERSION = Protocol.NETWORK_PROTOCOL_VERSION
 const DEFAULT_LAN_PORT = 27462
-const GAME_VERSION = "1.1.15.4"
+const GAME_VERSION = Protocol.GAME_VERSION
 const META_PUBLIC_LOBBY_ENABLED = "brotato_online_public_lobby_enabled"
 const SETTINGS_FILE_PATH = "user://brotato_online_settings.cfg"
 const SETTINGS_SECTION = "network"
@@ -1166,7 +1168,7 @@ func _read_lobby_entry(lobby_id: int) -> Dictionary:
 	if member_count <= 0:
 		member_count = 1
 
-	var compatible = mod_version == NETWORK_PROTOCOL_VERSION and game_version == GAME_VERSION
+	var compatible = Protocol.is_compatible(mod_version, game_version)
 	var joinable_state = state == "character_selection" or state == "coop_resume"
 	var full = member_count >= member_limit
 	var host_mods = _read_steam_host_mod_metadata(lobby_id)
@@ -1182,6 +1184,8 @@ func _read_lobby_entry(lobby_id: int) -> Dictionary:
 		"member_count": member_count,
 		"member_limit": member_limit,
 		"state": state,
+		"mod_version": mod_version,
+		"game_version": game_version,
 		"compatible": compatible,
 		"joinable": compatible and joinable_state and not full and host_id != "" and host_id != "0",
 		"full": full,
@@ -1221,7 +1225,7 @@ func _on_lan_lobby_found(entry: Dictionary) -> void:
 	if room_name == "":
 		room_name = str(normalized.get("host_name", ""))
 	normalized["room_name"] = room_name
-	normalized["compatible"] = str(normalized.get("mod_version", "")) == NETWORK_PROTOCOL_VERSION
+	normalized["compatible"] = Protocol.is_compatible(normalized.get("mod_version", ""), normalized.get("game_version", ""))
 	var member_count = int(normalized.get("member_count", 1))
 	var member_limit = int(normalized.get("member_limit", 4))
 	normalized["full"] = member_count >= member_limit
@@ -1264,7 +1268,7 @@ func _lobby_row_data_changed(previous: Dictionary, incoming: Dictionary) -> bool
 	# endpoint/entry ids do not affect the visible row either.
 	for key in [
 		"source", "host_id", "host_name", "room_name",
-		"member_count", "member_limit", "state", "compatible",
+		"member_count", "member_limit", "state", "compatible", "mod_version", "game_version",
 		"joinable", "full", "host_mods_format", "host_mods_payload",
 		"host_mods_too_large"
 	]:
@@ -1355,7 +1359,8 @@ func _add_lobby_row(entry: Dictionary) -> void:
 	state.text = _format_lobby_state(entry)
 	state.rect_min_size = Vector2(220, 60)
 	state.valign = Label.VALIGN_CENTER
-	state.clip_text = true
+	state.hint_tooltip = state.text
+	state.clip_text = false
 	row.add_child(state)
 
 	var view_mods = Button.new()
@@ -1499,7 +1504,7 @@ func _update_room_name_marquees(delta: float) -> void:
 
 func _format_lobby_state(entry: Dictionary) -> String:
 	if not bool(entry.get("compatible", false)):
-		return _text("version_mismatch")
+		return Protocol.format_mismatch(_text("version_mismatch"), entry.get("mod_version", ""), entry.get("game_version", ""), _text("version_unknown"))
 	if bool(entry.get("full", false)):
 		return _text("full")
 	var state = str(entry.get("state", "unknown"))
@@ -1674,6 +1679,11 @@ func _on_lobby_data_update(success = false, lobby_id = 0, member_id = 0) -> void
 		return
 
 	var entry = _read_lobby_entry(target_lobby_id)
+	if not entry.empty() and not bool(entry.get("compatible", false)):
+		_upsert_lobby_entry(entry)
+		_rebuild_lobby_rows()
+		_set_status(_format_lobby_state(entry))
+		return
 	if entry.empty() or not bool(entry.get("joinable", false)):
 		_remove_lobby_entry(target_lobby_id)
 		_rebuild_lobby_rows()

@@ -13,6 +13,7 @@ var _affects_saved_run = false
 var _last_poll_msec = 0
 var _progression_finished_key = ""
 var _kick_notice_pending = false
+var _kick_protocol_message = {}
 var _pending_client_roster = {}
 var _exiting_after_kick = false
 
@@ -368,7 +369,7 @@ func handle_network_message(sender: String, message: Dictionary) -> bool:
 		_exiting_after_kick = true
 		_pending_client_roster.clear()
 		transitioning = true
-		call_deferred("_exit_kicked_client")
+		call_deferred("_exit_kicked_client", message)
 	elif type == "player_removed":
 		if int(message.get("roster_revision", 0)) != revision:
 			return true
@@ -475,11 +476,13 @@ func should_drop_message(sender: String, message: Dictionary) -> bool:
 	return packet_revision != revision
 
 
-func _exit_kicked_client() -> void:
+func _exit_kicked_client(message: Dictionary = {}) -> void:
 	_session()._freeze_current_run_for_host_disconnect()
 	_session().leave_lobby()
 	get_tree().paused = false
 	get_tree().change_scene(MenuData.title_screen_scene)
+	# Keep diagnostic metadata after leave_lobby resets session state.
+	_kick_protocol_message = message.duplicate() if str(message.get("reason", "")) == "protocol_mismatch" else {}
 	_kick_notice_pending = true
 
 
@@ -490,7 +493,12 @@ func _show_kicked_notice() -> void:
 	_kick_notice_pending = false
 	var dialog = AcceptDialog.new()
 	dialog.window_title = _txt("BROTATO_ONLINE_PLAYER_LIST_KICK")
-	dialog.dialog_text = _txt("BROTATO_ONLINE_PLAYER_KICKED_NOTICE")
+	if not _kick_protocol_message.empty():
+		dialog.window_title = _session()._ui_text("join_failed_title")
+		dialog.dialog_text = _session().get_protocol_mismatch_text(_kick_protocol_message)
+	else:
+		dialog.dialog_text = _txt("BROTATO_ONLINE_PLAYER_KICKED_NOTICE")
+	_kick_protocol_message.clear()
 	dialog.pause_mode = Node.PAUSE_MODE_PROCESS
 	scene.add_child(dialog)
 	dialog.connect("popup_hide", dialog, "queue_free")

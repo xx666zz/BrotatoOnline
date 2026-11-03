@@ -7,7 +7,7 @@ extends Node
 
 const PHASE = "B12_delayed_death_sync"
 const LOOTER_ENEMY_ID = "looter"
-const LOOTER_SCENE_PATH = "res://entities/units/enemies/looter/looter.tscn"
+const LOOTER_SCENE_PATH = "res://entities/units/enemies/crash_zone/basic/looter/looter.tscn"
 const LOCAL_SUPPRESS_INTERVAL_MSEC = 700
 const PLAYER_STATE_SEND_INTERVAL_MSEC = 80
 const BOSS_DAMAGE_SEND_INTERVAL_MSEC = 120
@@ -1171,7 +1171,7 @@ func _get_or_create_host_entity(net_id: String, state: Dictionary) -> Node:
 				node.set_meta("brotato_online_display_only_fallback", true)
 		else:
 			spawn_scene_path = _get_spawnable_combat_scene_path(scene_path, category)
-			node = _spawn_local_combat_entity(spawn_scene_path, entity_type, pos, spawn_player_index, data_res)
+			node = _spawn_local_combat_entity(spawn_scene_path, entity_type, pos, spawn_player_index, data_res, state)
 		if _is_valid_node(node) and spawn_scene_path != scene_path:
 			node.set_meta("brotato_online_scene_fallback", true)
 			node.set_meta("brotato_online_original_scene_path", scene_path)
@@ -1234,7 +1234,7 @@ func _get_missing_combat_scene_fallback(category: String) -> String:
 		"enemy":
 			return "res://entities/units/enemies/enemy.tscn"
 		"boss":
-			return "res://entities/units/enemies/boss/boss.tscn"
+			return "res://entities/units/enemies/bosses/boss.tscn"
 		"neutral":
 			return "res://entities/units/neutral/tree.tscn"
 		"pet":
@@ -1249,44 +1249,44 @@ func _infer_structure_data_path(scene_path: String, stats_path: String = "") -> 
 	# the Host can recover an exact birth data_path.
 	match scene_path:
 		"res://entities/structures/turret/turret.tscn":
-			return "res://items/all/turret/turret_effect_1.tres"
+			return "res://items/all/00_base_game/turret/turret_effect_1.tres"
 		"res://entities/structures/turret/flame/flame_turret.tscn":
-			return "res://items/all/turret_flame/turret_flame_effect_1.tres"
+			return "res://items/all/00_base_game/turret_flame/turret_flame_effect_1.tres"
 		"res://entities/structures/turret/laser/laser_turret.tscn":
-			return "res://items/all/turret_laser/turret_laser_effect_1.tres"
+			return "res://items/all/00_base_game/turret_laser/turret_laser_effect_1.tres"
 		"res://entities/structures/turret/rocket/rocket_turret.tscn":
-			return "res://items/all/turret_rocket/turret_rocket_effect_1.tres"
+			return "res://items/all/00_base_game/turret_rocket/turret_rocket_effect_1.tres"
 		"res://entities/structures/turret/healing/healing_turret.tscn":
-			return "res://items/all/turret_healing/turret_healing_effect_1.tres"
+			return "res://items/all/00_base_game/turret_healing/turret_healing_effect_1.tres"
 		"res://entities/structures/turret/tyler/tyler.tscn":
-			return "res://items/all/tyler/tyler_effect_1.tres"
+			return "res://items/all/00_base_game/tyler/tyler_effect_1.tres"
 		"res://entities/structures/turret/wandering_bot/wandering_bot.tscn":
-			return "res://items/all/wandering_bot/wandering_bot_effect_1.tres"
+			return "res://items/all/00_base_game/wandering_bot/wandering_bot_effect_1.tres"
 		"res://entities/structures/turret/garden/garden.tscn":
-			return "res://items/all/garden/garden_effect_1.tres"
+			return "res://items/all/00_base_game/garden/garden_effect_1.tres"
 		"res://entities/structures/landmine/landmine.tscn":
-			return "res://items/all/landmines/landmines_effect_1.tres"
+			return "res://items/all/00_base_game/landmines/landmines_effect_1.tres"
 	return ""
 
 
 func _infer_pet_data_path(scene_path: String) -> String:
 	match scene_path:
 		"res://entities/units/pet/blazemander/blazemander.tscn":
-			return "res://items/all/blazemander/blazemander_effect_0.tres"
+			return "res://items/all/03_paws_n_claws/blazemander/blazemander_effect_0.tres"
 		"res://entities/units/pet/bonk_dog/bonk_dog.tscn":
-			return "res://items/all/bonk_dog/bonk_dog_effect_0.tres"
+			return "res://items/all/03_paws_n_claws/bonk_dog/bonk_dog_effect_0.tres"
 		"res://entities/units/pet/bot_o_mine/bot_o_mine.tscn":
-			return "res://items/all/bot_o_mine/bot_o_mine_effect_0.tres"
+			return "res://items/all/03_paws_n_claws/bot_o_mine/bot_o_mine_effect_0.tres"
 		"res://entities/units/pet/catling_gun/catling_gun.tscn":
-			return "res://items/all/catling_gun/catling_gun_effect_0.tres"
+			return "res://items/all/03_paws_n_claws/catling_gun/catling_gun_effect_0.tres"
 		"res://entities/units/pet/doc_moth/doc_moth.tscn":
-			return "res://items/all/doc_moth/doc_moth_effect_0.tres"
+			return "res://items/all/03_paws_n_claws/doc_moth/doc_moth_effect_0.tres"
 		"res://entities/units/pet/lootworm/lootworm.tscn":
-			return "res://items/all/lootworm/lootworm_effect_0.tres"
+			return "res://items/all/03_paws_n_claws/lootworm/lootworm_effect_0.tres"
 		"res://entities/units/pet/ratzilla/ratzilla.tscn":
-			return "res://items/all/ratzilla/ratzilla_effect_0.tres"
+			return "res://items/all/03_paws_n_claws/ratzilla/ratzilla_effect_0.tres"
 		"res://entities/units/pet/scapegoat/scapegoat.tscn":
-			return "res://items/all/scapegoat/scapegoat_effect_0.tres"
+			return "res://items/all/03_paws_n_claws/scapegoat/scapegoat_effect_0.tres"
 	return ""
 
 
@@ -1337,7 +1337,7 @@ func _prime_pooled_player_index_before_spawn(spawner: Node, packed: PackedScene,
 	_set_creation_player_index(candidate, player_index)
 
 
-func _spawn_local_combat_entity(scene_path: String, entity_type: int, pos: Vector2, player_index: int, data_res: Resource = null) -> Node:
+func _spawn_local_combat_entity(scene_path: String, entity_type: int, pos: Vector2, player_index: int, data_res: Resource = null, spawn_state: Dictionary = {}) -> Node:
 	# Final lifecycle gate: no caller may create combat objects once the battle has begun
 	# quiescing or once every local mirrored Player is dead. This preserves vanilla's
 	# invariant that Enemy.init() always has at least one live target.
@@ -1352,14 +1352,17 @@ func _spawn_local_combat_entity(scene_path: String, entity_type: int, pos: Vecto
 	var locator = _get_runtime_locator()
 	var spawner = locator.get_entity_spawner() if locator != null and locator.has_method("get_entity_spawner") else null
 	if spawner != null and spawner.has_method("spawn_entity"):
-		var args = spawner.get("_spawn_entity_args")
+		# A fresh args object also prevents pooled mutant/meca flags from leaking.
+		var args = EntitySpawner.SpawnEntityArgs.new(pos, entity_type)
 		if args != null:
 			args.position = pos
 			args.type = entity_type
 			args.player_index = spawn_player_index
+			args.is_mutant = bool(spawn_state.get("is_mutant", false))
+			args.is_meca = bool(spawn_state.get("is_meca", false))
 			_prime_pooled_player_index_before_spawn(spawner, packed, entity_type, spawn_player_index)
 
-			var spawned = spawner.spawn_entity(packed, args, data_res, null, -1)
+			var spawned = spawner.spawn_entity(packed, args, data_res, null, int(spawn_state.get("charmed_by", -1)))
 			if _is_valid_node(spawned):
 				return spawned
 
@@ -1373,6 +1376,12 @@ func _spawn_local_combat_entity(scene_path: String, entity_type: int, pos: Vecto
 	_set_creation_player_index(node, spawn_player_index)
 	parent.add_child(node)
 	_init_fallback_local_combat_entity(node, spawner, entity_type, pos, spawn_player_index, data_res)
+	if node.get("_is_mutant") != null:
+		node.set("_is_mutant", bool(spawn_state.get("is_mutant", false)))
+	if node.get("_is_meca") != null:
+		node.set("_is_meca", bool(spawn_state.get("is_meca", false)))
+	if int(spawn_state.get("charmed_by", -1)) >= 0 and node.has_method("set_charmed"):
+		node.set_charmed(int(spawn_state.charmed_by))
 	_set_node_global_pos(node, pos)
 	return node
 
@@ -2334,6 +2343,18 @@ func _spawn_entity_from_birth_marker_state(birth_id: String, birth_state: Dictio
 		return false
 	if birth_id == "" or typeof(birth_state) != TYPE_DICTIONARY or birth_state.empty():
 		return false
+	if int(birth_state.get("group_count", -1)) > 0:
+		var spawned_any = false
+		var member_ids = birth_state.get("spawn_net_ids", [])
+		if typeof(member_ids) != TYPE_ARRAY or member_ids.size() != int(birth_state.group_count):
+			return false
+		for member_id in member_ids:
+			var member_state = birth_state.duplicate(true)
+			member_state["group_count"] = -1
+			member_state["spawn_net_id"] = str(member_id)
+			member_state["entity_net_id"] = str(member_id)
+			spawned_any = _spawn_entity_from_birth_marker_state(birth_id, member_state) or spawned_any
+		return spawned_any
 	var entity_net_id = str(birth_state.get("spawn_net_id", birth_state.get("entity_net_id", "")))
 	if entity_net_id == "" or _spawned_from_birth_marker_entity_ids.has(entity_net_id):
 		return false
@@ -2357,6 +2378,9 @@ func _spawn_entity_from_birth_marker_state(birth_id: String, birth_state: Dictio
 		"scene_path": scene_path,
 		"data_path": str(birth_state.get("data_path", "")),
 		"spawn_data": birth_state.get("spawn_data", {}),
+		"is_mutant": bool(birth_state.get("is_mutant", false)),
+		"is_meca": bool(birth_state.get("is_meca", false)),
+		"charmed_by": int(birth_state.get("charmed_by", -1)),
 		"player_index": int(birth_state.get("player_index", -1)),
 		"pos": pos,
 		"vel": {"x": 0.0, "y": 0.0},
@@ -2396,7 +2420,8 @@ func _get_or_create_birth_marker(id: String, birth_state: Dictionary) -> Node:
 
 
 func _spawn_birth_display_node(birth_state: Dictionary) -> Node:
-	var packed = load("res://entities/birth/entity_birth.tscn")
+	var birth_scene_path = "res://entities/birth/entity_group_birth.tscn" if int(birth_state.get("group_count", -1)) > 0 else "res://entities/birth/entity_birth.tscn"
+	var packed = load(birth_scene_path)
 	if packed == null or not (packed is PackedScene):
 		return null
 	var node = packed.instance()
@@ -2466,10 +2491,18 @@ func _configure_birth_display_node(node: Node, birth_state: Dictionary) -> void:
 	# Use Brotato's real EntityBirth visual timing/flicker.
 	# overlay. The Host also sends a reserved entity_net_id in the warning packet,
 	# so the client can create the matching entity as soon as the marker expires.
-	if node.has_signal("birth_timeout") and not node.is_connected("birth_timeout", self, "_on_replica_birth_marker_timeout"):
-		node.connect("birth_timeout", self, "_on_replica_birth_marker_timeout", [id])
+	var timeout_signal = "birth_group_timeout" if int(birth_state.get("group_count", -1)) > 0 else "birth_timeout"
+	if node.has_signal(timeout_signal) and not node.is_connected(timeout_signal, self, "_on_replica_birth_marker_timeout"):
+		node.connect(timeout_signal, self, "_on_replica_birth_marker_timeout", [id])
 	if node.has_method("start") and packed_scene != null:
-		node.call("start", entity_type, packed_scene, pos, null, player_index, null, -1)
+		var request = SpawnRequest.new(entity_type, packed_scene, pos)
+		request.player_index = player_index
+		request.data = _load_resource_from_path(str(birth_state.get("data_path", "")))
+		request.group_count = int(birth_state.get("group_count", -1))
+		request.is_mutant = bool(birth_state.get("is_mutant", false))
+		request.is_meca = bool(birth_state.get("is_meca", false))
+		request.charmed_by = int(birth_state.get("charmed_by", -1))
+		node.call("start", request)
 	else:
 		_set_node_global_pos(node, pos)
 		if node.get("type") != null:

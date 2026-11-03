@@ -2,7 +2,7 @@ extends Node
 
 const REMOTE_DEAD_DISPLAY_HP = -999
 const LOOTER_ENEMY_ID = "looter"
-const LOOTER_SCENE_PATH = "res://entities/units/enemies/looter/looter.tscn"
+const LOOTER_SCENE_PATH = "res://entities/units/enemies/crash_zone/basic/looter/looter.tscn"
 
 # Host-side snapshot collector for battle sync.
 # Birth-only entities are announced once through reliable battle events; host-motion
@@ -410,6 +410,9 @@ func _build_dynamic_entity_state_from_net_id(entity: Node, net_id: String, categ
 		"entity_type": entity_type,
 		"path": _safe_node_path(entity),
 		"name": str(entity.name),
+		"is_mutant": _safe_bool_from_object(entity, "_is_mutant", false),
+		"is_meca": _safe_bool_from_object(entity, "_is_meca", false),
+		"charmed_by": int(entity.get_charmed_by_player_index()) if entity.has_method("get_charmed_by_player_index") else -1,
 		"scene_path": scene_path,
 		"type_path": type_path,
 		"stats_path": stats_path,
@@ -780,15 +783,25 @@ func _build_birth_state(birth: Node, registry: Node, now_msec: int) -> Dictionar
 	if net_id == "":
 		return {}
 
+	var request = birth.get("request")
+	if request == null:
+		return {}
 	var scene_path = ""
-	var scene = birth.get("scene")
+	var scene = request.scene
 	if scene != null:
 		scene_path = str(scene.resource_path)
 
 	var entity_type = _safe_int_from_object(birth, "type", -1)
 	var spawn_category = _category_from_entity_type(entity_type)
-	var spawn_net_id = _get_or_create_reserved_spawn_net_id(net_id, registry, spawn_category, entity_type, scene_path, _get_global_pos(birth), now_msec)
-	var spawn_data = birth.get("data")
+	# Each member of a native group needs its own reserved ID. Host spawn signals
+	# bind those IDs individually, so prediction and reconciliation cannot duplicate it.
+	var group_count = int(request.group_count)
+	var spawn_net_ids = []
+	for i in range(max(1, group_count)):
+		var reservation_id = net_id + ":" + str(i) if group_count > 0 else net_id
+		spawn_net_ids.append(_get_or_create_reserved_spawn_net_id(reservation_id, registry, spawn_category, entity_type, scene_path, _get_global_pos(birth), now_msec))
+	var spawn_net_id = str(spawn_net_ids[0])
+	var spawn_data = request.data
 	var data_path = _get_valid_spawn_data_path(spawn_data, scene_path, "birth:" + spawn_category + ":" + net_id)
 	var spawn_data_state = _build_spawn_data_sync_state(spawn_data)
 
@@ -801,7 +814,12 @@ func _build_birth_state(birth: Node, registry: Node, now_msec: int) -> Dictionar
 		"data_path": data_path,
 		"pos": _vec_to_dict(_get_global_pos(birth)),
 		"dead": false,
-		"player_index": _safe_int_from_object(birth, "player_index", -1),
+		"player_index": int(request.player_index),
+		"group_count": group_count,
+		"spawn_net_ids": spawn_net_ids,
+		"is_mutant": bool(request.is_mutant),
+		"is_meca": bool(request.is_meca),
+		"charmed_by": int(request.charmed_by),
 		"time_before_spawn": _safe_float_from_object(birth, "time_before_spawn", 60.0),
 		"current_time_before_spawn": _safe_float_from_object(birth, "_current_time_before_spawn", 60.0),
 		"server_time_msec": now_msec,

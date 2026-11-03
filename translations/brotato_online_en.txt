@@ -59,7 +59,7 @@ BROTATO_ONLINE_PUBLIC_LOBBY_CHECKING_LOBBY,Checking lobby status...
 BROTATO_ONLINE_PUBLIC_LOBBY_LOBBY_NO_LONGER_PUBLIC,This lobby is no longer public. Refresh the list.
 BROTATO_ONLINE_PUBLIC_LOBBY_LOBBY_NO_LONGER_JOINABLE,This lobby is no longer joinable.
 BROTATO_ONLINE_PUBLIC_LOBBY_JOIN_VERIFY_FAILED,Could not verify the lobby status. Refresh and try again.
-BROTATO_ONLINE_PUBLIC_LOBBY_VERSION_MISMATCH,Version mismatch
+BROTATO_ONLINE_PUBLIC_LOBBY_VERSION_MISMATCH,Protocol or game version mismatch.\nLocal protocol: %s\nRemote protocol: %s\nLocal game: %s\nRemote game: %s
 BROTATO_ONLINE_PUBLIC_LOBBY_FULL,Full
 BROTATO_ONLINE_PUBLIC_LOBBY_CHARACTER_SELECTION,Character select
 BROTATO_ONLINE_PUBLIC_LOBBY_COOP_RESUME,Waiting for reconnect
@@ -104,7 +104,7 @@ BROTATO_ONLINE_STEAM_JOIN_FAILED_INVALID,The lobby information is invalid.
 BROTATO_ONLINE_STEAM_JOIN_FAILED_STEAM_UNAVAILABLE,The Steam lobby service is unavailable.
 BROTATO_ONLINE_STEAM_JOIN_FAILED_LAN_UNAVAILABLE,Could not connect to the LAN host.
 BROTATO_ONLINE_STEAM_JOIN_FAILED_ROOM_FULL,The room is full.
-BROTATO_ONLINE_STEAM_JOIN_FAILED_PROTOCOL_MISMATCH,The host uses an incompatible protocol or mod version.
+BROTATO_ONLINE_STEAM_JOIN_FAILED_PROTOCOL_MISMATCH,Protocol or game version mismatch.\nLocal protocol: %s\nRemote protocol: %s\nLocal game: %s\nRemote game: %s
 BROTATO_ONLINE_STEAM_LAN_ROOM_ACTIVE,LAN room is open
 BROTATO_ONLINE_STEAM_JOIN_FAILED_TIMEOUT,Joining the lobby timed out. Refresh the lobby list and try again.
 BROTATO_ONLINE_STEAM_JOIN_FAILED_STALE,The lobby is closed or the host has left.
@@ -174,3 +174,6 @@ BROTATO_ONLINE_IDENTITY_PROOF_MISSING,"This save has no LAN resume proof. Open R
 BROTATO_ONLINE_IDENTITY_HOST_CHANGED,The current host identity differs from this save. Reassign characters or continue local co-op.
 BROTATO_ONLINE_STEAM_DUPLICATE_IDENTITY,This identity is already connected. Close the duplicate game instance and retry.
 BROTATO_ONLINE_STEAM_RESUME_REASSIGNMENT_REQUIRED,"This room is waiting for the saved players. Ask the host to open Reassign characters, then reconnect."
+BROTATO_ONLINE_STEAM_LAN_VERSION_DETAILS,Local LAN handshake: %s; Remote LAN handshake: %s
+BROTATO_ONLINE_STEAM_VERSION_UNKNOWN,Not provided
+BROTATO_ONLINE_PUBLIC_LOBBY_VERSION_UNKNOWN,Not provided

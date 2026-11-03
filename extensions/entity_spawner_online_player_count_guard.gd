@@ -131,10 +131,16 @@ func init(zone_min_pos: Vector2, zone_max_pos: Vector2, current_wave_data: WaveD
 	_brotato_online_force_run_player_count("entity_spawner_init_after_vanilla")
 
 
-func spawn_entity_birth(type: int, scene: PackedScene, pos: Vector2, data: Resource = null, player_index: int = -1, source = null, charmed_by: int = -1) -> void:
-	if _brotato_online_should_block_client_spawn_type(type):
+func spawn_entity_birth(request: SpawnRequest) -> void:
+	if request == null or _brotato_online_should_block_client_spawn_type(request.type):
 		return
-	.spawn_entity_birth(type, scene, pos, data, player_index, source, charmed_by)
+	.spawn_entity_birth(request)
+
+
+func spawn_group_entity_birth(request: SpawnRequest) -> void:
+	if request == null or _brotato_online_should_block_client_spawn_type(request.type):
+		return
+	.spawn_group_entity_birth(request)
 
 
 func spawn_entity(scene: PackedScene, args: SpawnEntityArgs, data: Resource = null, source = null, charmed_by: int = -1) -> KinematicBody2D:
@@ -146,7 +152,9 @@ func spawn_entity(scene: PackedScene, args: SpawnEntityArgs, data: Resource = nu
 
 
 func on_entity_birth_timeout(birth: EntityBirth) -> void:
-	if birth != null and _brotato_online_should_block_client_spawn_type(int(birth.type)):
+	if birth == null or not is_instance_valid(birth):
+		return
+	if _brotato_online_should_block_client_spawn_type(int(birth.type)):
 		active_births = int(max(0, int(active_births) - 1))
 		if is_instance_valid(birth):
 			if _main != null and is_instance_valid(_main) and _main.has_method("add_node_to_pool"):
@@ -155,3 +163,16 @@ func on_entity_birth_timeout(birth: EntityBirth) -> void:
 				birth.queue_free()
 		return
 	.on_entity_birth_timeout(birth)
+
+func on_entity_group_birth_timeout(birth: EntityBirth) -> void:
+	if birth == null or not is_instance_valid(birth):
+		return
+	if _brotato_online_should_block_client_spawn_type(int(birth.type)):
+		var count = max(0, int(birth.request.group_count)) if birth.request != null else 0
+		active_births = int(max(0, active_births - count))
+		if _main != null and is_instance_valid(_main) and _main.has_method("add_node_to_pool"):
+			_main.add_node_to_pool(birth, _entity_group_birth_pool_id)
+		elif not birth.is_queued_for_deletion():
+			birth.queue_free()
+		return
+	.on_entity_group_birth_timeout(birth)

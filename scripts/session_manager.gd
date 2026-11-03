@@ -1,15 +1,17 @@
 extends Node
 
+const Protocol = preload("protocol.gd")
+
 
 const BROTATO_APP_ID = 1942280
 const MAX_LOBBY_MEMBERS = 4
-# Identity resume changes ownership semantics; mixed versions must not play.
-const NETWORK_PROTOCOL_VERSION = "5.0.0"
+# Brotato 1.2 SpawnRequest/content changes require the same game and wire protocol.
+const NETWORK_PROTOCOL_VERSION = Protocol.NETWORK_PROTOCOL_VERSION
 const DEFAULT_LAN_PORT = 27462
 const LAN_DISCOVERY_PORT = 27463
-const LAN_PROTOCOL_VERSION = 3
+const LAN_PROTOCOL_VERSION = Protocol.LAN_PROTOCOL_VERSION
 # Optional pre-join host mod metadata. This is deliberately independent from
-# NETWORK_PROTOCOL_VERSION/LAN_PROTOCOL_VERSION so older clients keep working.
+# the gameplay wire version; its own payload format remains unchanged.
 const HOST_MODS_FORMAT_VERSION = "1"
 const HOST_MODS_LOBBY_CHUNK_CHARS = 1000
 const HOST_MODS_LOBBY_MAX_PARTS = 24
@@ -421,6 +423,14 @@ func _ui_text(key: String) -> String:
 	return translation_key
 
 
+func get_protocol_mismatch_text(message: Dictionary, include_lan: bool = false) -> String:
+	var unknown = _ui_text("version_unknown")
+	var details = Protocol.format_mismatch(_ui_text("join_failed_protocol_mismatch"), message.get("mod_version", ""), message.get("game_version", ""), unknown)
+	if include_lan:
+		details += "\n" + _ui_text("lan_version_details") % [str(LAN_PROTOCOL_VERSION), Protocol.display_version(message.get("protocol_version", null), unknown)]
+	return details
+
+
 func _disable_custom_button_auto_translation(button: Node) -> void:
 	if button != null and button.has_method("set_message_translation"):
 		button.set_message_translation(false)
@@ -620,8 +630,8 @@ func _handle_transport_identity(transport: Node, peer, message: Dictionary) -> v
 	if msg_type == "transport_identity_request":
 		if _is_game_host() or not (_pending_lan_join or (_session_active and _online_role == "client")):
 			return
-		if int(message.get("protocol_version", 0)) != LAN_PROTOCOL_VERSION or str(message.get("mod_version", "")) != NETWORK_PROTOCOL_VERSION:
-			_fail_lan_handshake(transport, "join_failed_protocol_mismatch")
+		if int(message.get("protocol_version", 0)) != LAN_PROTOCOL_VERSION or not Protocol.is_compatible(message.get("mod_version", ""), message.get("game_version", "")):
+			_fail_lan_handshake(transport, "join_failed_protocol_mismatch", message)
 			return
 		var credential = identity.client_identity_for_run(str(message.get("run_id", "")))
 		if credential.empty():
@@ -630,6 +640,8 @@ func _handle_transport_identity(transport: Node, peer, message: Dictionary) -> v
 		credential["msg_type"] = "transport_identity"
 		credential["run_id"] = str(message.run_id)
 		credential["protocol_version"] = LAN_PROTOCOL_VERSION
+		credential["mod_version"] = NETWORK_PROTOCOL_VERSION
+		credential["game_version"] = Protocol.get_game_version()
 		transport.send_packet(peer, to_json(credential).to_utf8(), P2P_CHANNEL_MENU, true)
 		return
 	if not _is_game_host() or not _session_active:
@@ -643,13 +655,13 @@ func _handle_transport_identity(transport: Node, peer, message: Dictionary) -> v
 	var peer_key = "lan:" + str(message.get("installation_id", ""))
 	var existing = _connection_by_peer_key.get(peer_key, {})
 	var authenticated_existing = str(challenge.get("existing_owner", "")) == peer_key and existing.get("transport", null) == transport and existing.get("peer", null) == peer
-	var accepted = int(message.get("protocol_version", 0)) == LAN_PROTOCOL_VERSION
+	var accepted = int(message.get("protocol_version", 0)) == LAN_PROTOCOL_VERSION and Protocol.is_compatible(message.get("mod_version", ""), message.get("game_version", ""))
 	accepted = accepted and identity.accept_lan_identity(str(message.get("installation_id", "")), str(message.get("resume_token", "")), authenticated_existing)
 	var reason = "identity_failed"
 	if accepted:
 		accepted = _register_remote_connection(peer_key, transport, peer)
 		reason = _remote_connection_rejection_reason(peer_key, transport, peer) if not accepted else ""
-	var welcome = {"msg_type": "transport_welcome", "accepted": accepted, "identity_refresh": authenticated_existing, "protocol_version": LAN_PROTOCOL_VERSION, "mod_version": NETWORK_PROTOCOL_VERSION, "session_id": _get_wire_session_id(), "assigned_peer_key": peer_key if accepted else "", "host_peer_key": _self_steam_id, "member_count": get_session_member_count(), "member_limit": MAX_LOBBY_MEMBERS, "state": get_lobby_state(), "resume_assignment_pending": _is_in_official_coop_resume_scene(), "reason": "" if accepted else reason}
+	var welcome = {"msg_type": "transport_welcome", "accepted": accepted, "identity_refresh": authenticated_existing, "protocol_version": LAN_PROTOCOL_VERSION, "mod_version": NETWORK_PROTOCOL_VERSION, "game_version": Protocol.get_game_version(), "session_id": _get_wire_session_id(), "assigned_peer_key": peer_key if accepted else "", "host_peer_key": _self_steam_id, "member_count": get_session_member_count(), "member_limit": MAX_LOBBY_MEMBERS, "state": get_lobby_state(), "resume_assignment_pending": _is_in_official_coop_resume_scene(), "reason": "" if accepted else reason}
 	# Tokens remain private to the initial LAN handshake. Do not log or broadcast.
 	transport.send_packet(peer, to_json(welcome).to_utf8(), P2P_CHANNEL_MENU, true)
 	if not accepted:
@@ -664,10 +676,10 @@ func _handle_transport_identity(transport: Node, peer, message: Dictionary) -> v
 func _challenge_lan_identity(peer, run_id: String) -> void:
 	var lookup = _connection_lookup_key(_lan_transport, peer)
 	_lan_identity_challenges[lookup] = {"run_id": run_id, "peer": peer, "existing_owner": str(_peer_key_by_connection.get(lookup, ""))}
-	# v1/v2 clients understand welcome but not the v3 negotiation marker. They
-	# reject its version before reading the (not yet assigned) connection fields.
-	_lan_transport.send_packet(peer, to_json({"msg_type": "transport_welcome", "accepted": true, "identity_required": true, "protocol_version": LAN_PROTOCOL_VERSION, "mod_version": NETWORK_PROTOCOL_VERSION}).to_utf8(), P2P_CHANNEL_MENU, true)
-	_lan_transport.send_packet(peer, to_json({"msg_type": "transport_identity_request", "run_id": run_id, "protocol_version": LAN_PROTOCOL_VERSION, "mod_version": NETWORK_PROTOCOL_VERSION}).to_utf8(), P2P_CHANNEL_MENU, true)
+	# Earlier clients reject this welcome's wire version before reading the
+	# not-yet-assigned connection fields.
+	_lan_transport.send_packet(peer, to_json({"msg_type": "transport_welcome", "accepted": true, "identity_required": true, "protocol_version": LAN_PROTOCOL_VERSION, "mod_version": NETWORK_PROTOCOL_VERSION, "game_version": Protocol.get_game_version()}).to_utf8(), P2P_CHANNEL_MENU, true)
+	_lan_transport.send_packet(peer, to_json({"msg_type": "transport_identity_request", "run_id": run_id, "protocol_version": LAN_PROTOCOL_VERSION, "mod_version": NETWORK_PROTOCOL_VERSION, "game_version": Protocol.get_game_version()}).to_utf8(), P2P_CHANNEL_MENU, true)
 
 
 func refresh_lan_identities_for_run(run_id: String) -> void:
@@ -687,8 +699,8 @@ func refresh_lan_identities_for_run(run_id: String) -> void:
 func _handle_transport_welcome(transport: Node, peer, welcome: Dictionary) -> void:
 	if transport != _lan_transport or _is_game_host():
 		return
-	if int(welcome.get("protocol_version", 0)) != LAN_PROTOCOL_VERSION or str(welcome.get("mod_version", "")) != NETWORK_PROTOCOL_VERSION:
-		_fail_lan_handshake(transport, "join_failed_protocol_mismatch")
+	if int(welcome.get("protocol_version", 0)) != LAN_PROTOCOL_VERSION or not Protocol.is_compatible(welcome.get("mod_version", ""), welcome.get("game_version", "")):
+		_fail_lan_handshake(transport, "join_failed_protocol_mismatch", welcome)
 		return
 	if not bool(welcome.get("accepted", false)):
 		var reason = str(welcome.get("reason", "room_full"))
@@ -728,7 +740,7 @@ func _handle_transport_welcome(transport: Node, peer, welcome: Dictionary) -> vo
 	_send_client_hello_to_host()
 
 
-func _fail_lan_handshake(transport: Node, error_key: String) -> void:
+func _fail_lan_handshake(transport: Node, error_key: String, version_message: Dictionary = {}) -> void:
 	if _session_active:
 		leave_lobby()
 	else:
@@ -738,7 +750,7 @@ func _fail_lan_handshake(transport: Node, error_key: String) -> void:
 		_peer_key_by_connection.clear()
 		transport.stop()
 		_update_online_session_runtime_flag()
-	_show_join_failure(_ui_text(error_key))
+	_show_join_failure(get_protocol_mismatch_text(version_message, true) if error_key == "join_failed_protocol_mismatch" else _ui_text(error_key))
 
 
 func _handle_transport_session_id(transport: Node, message: Dictionary) -> void:
@@ -746,7 +758,7 @@ func _handle_transport_session_id(transport: Node, message: Dictionary) -> void:
 		return
 	if int(message.get("protocol_version", 0)) != LAN_PROTOCOL_VERSION:
 		return
-	if str(message.get("mod_version", "")) != NETWORK_PROTOCOL_VERSION:
+	if not Protocol.is_compatible(message.get("mod_version", ""), message.get("game_version", "")):
 		return
 	var next_session_id = str(message.get("session_id", ""))
 	if next_session_id == "":
@@ -764,6 +776,7 @@ func _broadcast_transport_session_id() -> void:
 		"msg_type": "transport_session_id",
 		"protocol_version": LAN_PROTOCOL_VERSION,
 		"mod_version": NETWORK_PROTOCOL_VERSION,
+		"game_version": Protocol.get_game_version(),
 		"session_id": wire_session_id
 	}).to_utf8()
 	for peer_key in _connection_by_peer_key.keys():
@@ -1134,8 +1147,8 @@ func get_lan_discovery_info() -> Dictionary:
 		"member_limit": MAX_LOBBY_MEMBERS,
 		"state": get_lobby_state(),
 		"mod_version": NETWORK_PROTOCOL_VERSION,
-		# Optional fields: old LAN browsers ignore them; new browsers can show the
-		# host's loaded mods before joining without changing discovery protocol v1.
+		"game_version": Protocol.get_game_version(),
+		# Optional host-mod details have an independent payload format.
 		"host_mods_format": HOST_MODS_FORMAT_VERSION,
 		"host_mods_payload": host_mods_payload,
 		"host_mods_too_large": host_mods_too_large,
@@ -2004,7 +2017,7 @@ func _on_lobby_created(connect_result = 0, lobby_id = 0) -> void:
 
 
 func _is_lobby_protocol_compatible(lobby_id) -> bool:
-	return _steam != null and str(_steam.getLobbyData(lobby_id, "mod_version")) == NETWORK_PROTOCOL_VERSION
+	return _steam != null and Protocol.is_compatible(_steam.getLobbyData(lobby_id, "mod_version"), _steam.getLobbyData(lobby_id, "game_version"))
 
 
 func _on_lobby_joined(lobby_id = 0, permissions = 0, locked = false, response = 0) -> void:
@@ -2020,10 +2033,13 @@ func _on_lobby_joined(lobby_id = 0, permissions = 0, locked = false, response = 
 		return
 	# Also guard friend invites/direct joins, which bypass the lobby browser.
 	if not _is_lobby_protocol_compatible(lobby_id):
+		# Read metadata before leaving; Steam may discard it after leaveLobby.
+		var version_message = {"mod_version": _steam.getLobbyData(lobby_id, "mod_version") if _steam != null else "", "game_version": _steam.getLobbyData(lobby_id, "game_version") if _steam != null else ""}
+		var failure_text = get_protocol_mismatch_text(version_message)
 		if _steam != null:
 			_steam.leaveLobby(lobby_id)
 		_clear_pending_join_request()
-		_show_join_failure(_ui_text("join_failed_protocol_mismatch"))
+		_show_join_failure(failure_text)
 		return
 
 	var joined_from_client_request = _client_join_requested_lobby_id != 0 and str(_client_join_requested_lobby_id) == str(lobby_id)
@@ -2237,7 +2253,7 @@ func _setup_lobby_data() -> void:
 			host_name = host_name.substr(0, 64)
 		_set_lobby_metadata_if_changed("mod", "six666-BrotatoOnline")
 		_set_lobby_metadata_if_changed("mod_version", NETWORK_PROTOCOL_VERSION)
-		_set_lobby_metadata_if_changed("game_version", "1.1.15.4")
+		_set_lobby_metadata_if_changed("game_version", Protocol.get_game_version())
 		_set_lobby_metadata_if_changed("state", "character_selection")
 		_set_lobby_metadata_if_changed("host", _self_steam_id)
 		_set_lobby_metadata_if_changed("host_name", host_name)
@@ -3279,6 +3295,7 @@ func _send_client_hello_to_host() -> void:
 		"steam_id": _self_steam_id,
 		"mod": "six666-BrotatoOnline",
 		"mod_version": NETWORK_PROTOCOL_VERSION,
+		"game_version": Protocol.get_game_version(),
 		"player_list_enabled": true,
 		"content_capability": _build_client_content_capability_for_hello()
 	}, true)
@@ -3692,11 +3709,11 @@ func _update_client_members_from_selection_state(message: Dictionary) -> void:
 
 
 func _accept_client_protocol(peer_key: String, message: Dictionary) -> bool:
-	if str(message.get("mod_version", "")) == NETWORK_PROTOCOL_VERSION:
+	if Protocol.is_compatible(message.get("mod_version", ""), message.get("game_version", "")):
 		return true
 	# This existing control message is understood by the previous release too.
 	# Flush its reliable notice before closing, and never acknowledge the hello.
-	detach_kicked_peer(peer_key)
+	detach_kicked_peer(peer_key, {"reason": "protocol_mismatch", "mod_version": NETWORK_PROTOCOL_VERSION, "game_version": Protocol.get_game_version()})
 	_seen_client_hello_by_steam_id.erase(peer_key)
 	_sync_host_coop_slots_from_lobby()
 	return false
@@ -9644,11 +9661,13 @@ func _get_player_removal_manager() -> Node:
 	return get_parent().get_node_or_null("BrotatoOnlinePlayerRemovalManager")
 
 
-func detach_kicked_peer(peer_key: String) -> void:
+func detach_kicked_peer(peer_key: String, rejection: Dictionary = {}) -> void:
 	if not _is_game_host() or not _session_remote_peer_keys.has(peer_key):
 		return
 	_drop_pending_p2p_sends_for_target(peer_key)
-	_send_p2p_json(peer_key, {"msg_type": "player_kicked"}, true)
+	var notice = rejection.duplicate()
+	notice["msg_type"] = "player_kicked"
+	_send_p2p_json(peer_key, notice, true)
 	var connection = _connection_by_peer_key.get(peer_key, {}).duplicate()
 	_kicked_departing_peer_keys[peer_key] = true
 	_session_remote_peer_keys.erase(peer_key)

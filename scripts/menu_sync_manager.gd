@@ -114,6 +114,7 @@ var _host_client_character_catalog_key_by_steam_id = {}
 var _host_client_shop_content_catalog_key_by_steam_id = {}
 var _host_common_shop_fallback_cache = {}
 var _host_dlc_gate_catalog_dirty = false
+var _host_content_override_active = false
 var _last_host_dlc_gate_apply_key = ""
 var _last_host_dlc_gate_log_key = ""
 var _client_intercept_selection_instance_id = 0
@@ -484,6 +485,7 @@ func _reset_run_page_runtime_state_for_game_start(clear_queued_actions: bool = t
 
 
 func reset_online_session_state(reason: String = "") -> void:
+	_restore_local_content_configuration()
 	# Full per-room cleanup. This intentionally does not modify the player's real save data;
 	# it only clears transient online mirrors, Host catalogs, pending authoritative states,
 	# and local client identity cached from the previous lobby.
@@ -568,6 +570,7 @@ func _ready() -> void:
 func _process(_delta: float) -> void:
 	# Offline/single-player must remain completely vanilla.
 	if not _is_online_session_active():
+		_restore_local_content_configuration()
 		return
 
 	var now = OS.get_ticks_msec()
@@ -8656,6 +8659,8 @@ func _build_run_config_for_scene_sync(include_player_run_data: bool = true, held
 		"full_item_list_for_scene_sync": bool(force_full_held_items),
 		"zone_selected": int(ProgressData.settings.zone_selected),
 		"zone_is_random": bool(ProgressData.settings.zone_is_random),
+		"enabled_dlcs": RunData.enabled_dlcs.duplicate(),
+		"active_update_data_ids": RunData.active_update_data_ids.duplicate(),
 		# Host-authoritative future-wave schedule. This is required for D6+
 		# nightmare warning icons/fog/bullet-hell waves and for elite/horde
 		# warnings. Clients must not regenerate these RNG tables locally.
@@ -8717,6 +8722,7 @@ func _apply_run_config_before_client_scene_change(config: Dictionary, target_scr
 	if config.has("zone_is_random"):
 		ProgressData.settings.zone_is_random = bool(config.get("zone_is_random", ProgressData.settings.zone_is_random))
 
+	_apply_host_content_configuration(config)
 	_apply_host_wave_schedule_from_run_config(config)
 
 	# Client 进入后续界面前必须有与 Host 一致的 RunData 数量；否则 weapon_selection / difficulty_selection 的 _ready 会读空角色或空武器。
@@ -8908,7 +8914,8 @@ func _apply_difficulty_start_for_client(config: Dictionary) -> void:
 		RunData.reset_elites_spawn()
 		RunData.init_elites_spawn()
 		RunData.init_events_nightmare()
-	RunData.enabled_dlcs = ProgressData.get_active_dlc_ids()
+	_apply_host_content_configuration(config)
+	ItemService.init_unlocked_pool()
 
 	var difficulty = ItemService.get_element(ItemService.difficulties, Keys.empty_hash, difficulty_value)
 	if difficulty != null:
@@ -10399,6 +10406,8 @@ func _apply_selected_visual_only(selection: Node, player_index: int, element, re
 		# should still show the actual character/weapon panel, not just the local lock placeholder.
 		_apply_item_to_panel(selection, player_index, item)
 		_apply_item_to_selection_cache(selection, player_index, item)
+		if _get_selection_screen(selection) == SCREEN_WEAPON_SELECTION:
+			_apply_weapon_pick_state(selection, player_index, item_state, element)
 
 
 func _apply_focus_element_for_host_display(selection: Node, player_index: int, element, item_state = {}) -> void:
@@ -10477,7 +10486,30 @@ func _apply_item_to_selection_cache(selection: Node, player_index: int, item) ->
 	elif screen == "weapon_selection":
 		var player_weapons = selection.get("_player_weapons")
 		if typeof(player_weapons) == TYPE_ARRAY and player_index >= 0 and player_index < player_weapons.size():
-			player_weapons[player_index] = item
+			player_weapons[player_index] = [item]
+
+
+func _apply_weapon_pick_state(selection: Node, player_index: int, state: Dictionary, fallback_element) -> void:
+	var picks = []
+	var elements = []
+	var states = state.get("picks", [state])
+	if typeof(states) != TYPE_ARRAY:
+		return
+	for pick_state in states:
+		if typeof(pick_state) != TYPE_DICTIONARY:
+			continue
+		var item = _find_data_item_for_screen(SCREEN_WEAPON_SELECTION, pick_state)
+		if not _is_live_ref(item):
+			continue
+		picks.append(item)
+		var element = _find_element_by_state(selection, player_index, pick_state, true)
+		elements.append(element if _is_live_ref(element) else fallback_element)
+	var player_weapons = selection.get("_player_weapons")
+	if typeof(player_weapons) == TYPE_ARRAY and player_index >= 0 and player_index < player_weapons.size():
+		player_weapons[player_index] = picks
+	var picked_elements = selection.get("_picked_elements")
+	if typeof(picked_elements) == TYPE_ARRAY and player_index >= 0 and player_index < picked_elements.size():
+		picked_elements[player_index] = elements
 
 
 func _set_latest_focused_element(selection: Node, player_index: int, element) -> void:
@@ -10781,28 +10813,14 @@ func _select_character_element(selection: Node, player_index: int, element) -> v
 
 
 func _select_weapon_element(selection: Node, player_index: int, element) -> void:
-	if not _is_live_ref(element):
+	if not _is_live_ref(element) or not selection.has_method("_on_element_pressed"):
 		return
-
-	var item = _safe_get(element, "item", null)
-	if not _is_live_ref(item):
-		return
-
 	var player_weapons = selection.get("_player_weapons")
-	if typeof(player_weapons) != TYPE_ARRAY:
+	if typeof(player_weapons) != TYPE_ARRAY or player_index < 0 or player_index >= player_weapons.size():
 		return
-
-	if player_index < 0 or player_index >= player_weapons.size():
-		return
-
-	player_weapons[player_index] = item
-	selection.set("_player_weapons", player_weapons)
-
-	if selection.has_method("_display_element_panel_data"):
-		selection._display_element_panel_data(element, player_index)
-
-	if selection.has_method("_set_selected_element"):
-		selection._set_selected_element(player_index)
+	# Brotato 1.2 owns a list of picks per player, plus matching UI elements.
+	# Use its native path to keep extra starting choices and ready counts intact.
+	selection._on_element_pressed(element, player_index)
 
 
 func _apply_focus_element(selection: Node, player_index: int, element) -> void:
@@ -10921,8 +10939,11 @@ func _clear_selection_item_cache(selection: Node, player_index: int) -> void:
 	elif screen == SCREEN_WEAPON_SELECTION:
 		var player_weapons = selection.get("_player_weapons")
 		if typeof(player_weapons) == TYPE_ARRAY and player_index >= 0 and player_index < player_weapons.size():
-			player_weapons[player_index] = null
+			player_weapons[player_index] = []
 			selection.set("_player_weapons", player_weapons)
+			var picked_elements = selection.get("_picked_elements")
+			if typeof(picked_elements) == TYPE_ARRAY and player_index < picked_elements.size():
+				picked_elements[player_index] = []
 
 
 func _refresh_panel_for_focus_after_cancel(selection: Node, player_index: int, focused_element) -> void:
@@ -10995,7 +11016,8 @@ func _get_selected_item_for_player(selection: Node, player_index: int):
 	elif screen == "weapon_selection":
 		var player_weapons = selection.get("_player_weapons")
 		if typeof(player_weapons) == TYPE_ARRAY and player_index >= 0 and player_index < player_weapons.size():
-			return player_weapons[player_index]
+			var picks = player_weapons[player_index]
+			return picks.back() if typeof(picks) == TYPE_ARRAY and not picks.empty() else null
 	return null
 
 
@@ -11003,7 +11025,13 @@ func _get_selected_state_for_player(selection: Node, player_index: int) -> Dicti
 	var selected_item = _get_selected_item_for_player(selection, player_index)
 	if not _is_live_ref(selected_item):
 		return {}
-	return _element_to_state(_make_item_state_proxy(selected_item))
+	var state = _element_to_state(_make_item_state_proxy(selected_item))
+	if _get_selection_screen(selection) == SCREEN_WEAPON_SELECTION:
+		var picks = selection.get("_player_weapons")[player_index]
+		state["picks"] = []
+		for item in picks:
+			state["picks"].append(_data_object_to_sync_state(item))
+	return state
 
 
 func _get_selected_element_for_player(selection: Node, player_index: int):
@@ -11450,3 +11478,27 @@ func reset_after_player_roster_change() -> void:
 	_client_scene_change_in_flight_until_msec = 0
 	_end_game_start_guard("player_removed")
 	_invalidate_selection_element_cache()
+
+func _apply_host_content_configuration(config: Dictionary) -> void:
+	var enabled = config.get("enabled_dlcs", ProgressData.available_dlc_ids)
+	var updates = config.get("active_update_data_ids", ProgressData.active_update_data)
+	if typeof(enabled) != TYPE_ARRAY or typeof(updates) != TYPE_ARRAY:
+		return
+	var changed = RunData.enabled_dlcs != enabled or ProgressData.active_update_data != updates
+	RunData.enabled_dlcs = enabled.duplicate()
+	RunData.active_update_data_ids = updates.duplicate()
+	ProgressData.apply_run_update_data(RunData.active_update_data_ids)
+	_host_content_override_active = true
+	if changed:
+		ItemService.init_unlocked_pool()
+
+
+func _restore_local_content_configuration() -> void:
+	if not _host_content_override_active:
+		return
+	_host_content_override_active = false
+	# Rebuild from local preferences; never persist the Host's content selection.
+	ProgressData.refresh_active_update_data()
+	RunData.active_update_data_ids = ProgressData.active_update_data.duplicate()
+	RunData.enabled_dlcs = ProgressData.available_dlc_ids.duplicate()
+	ItemService.init_unlocked_pool()

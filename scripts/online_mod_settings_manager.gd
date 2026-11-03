@@ -1020,21 +1020,21 @@ func _apply_settings_button_styles(button: BaseButton) -> void:
 
 
 func _configure_option_check_button(check: CheckButton) -> void:
-	var option_font = load("res://resources/fonts/actual/base/font_30_outline.tres")
+	var option_font = load("res://resources/fonts/actual/base/font_32_outline.tres")
 	if option_font != null:
 		check.add_font_override("font", option_font)
 	_apply_settings_button_styles(check)
 
 
 func _configure_input_device_option_button(option: OptionButton) -> void:
-	var option_font = load("res://resources/fonts/actual/base/font_30_outline.tres")
+	var option_font = load("res://resources/fonts/actual/base/font_32_outline.tres")
 	if option_font != null:
 		option.add_font_override("font", option_font)
 	_apply_settings_button_styles(option)
 
 
 func _configure_settings_action_button(button: Button) -> void:
-	var button_font = load("res://resources/fonts/actual/base/font_30_outline.tres")
+	var button_font = load("res://resources/fonts/actual/base/font_32_outline.tres")
 	if button_font != null:
 		button.add_font_override("font", button_font)
 	_apply_settings_button_styles(button)

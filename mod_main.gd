@@ -8,6 +8,7 @@ var mod_dir_path = ""
 
 func _init() -> void:
 	mod_dir_path = ModLoaderMod.get_unpacked_dir().plus_file(MOD_DIR)
+	ModLoaderMod.install_script_extension(mod_dir_path.plus_file("extensions/item_service_session_content.gd"))
 	_install_player_local_outline_extension()
 	_install_main_safe_pool_exit_extension()
 	_install_entity_spawner_online_player_count_guard_extension()

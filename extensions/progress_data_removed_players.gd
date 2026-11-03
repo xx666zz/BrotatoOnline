@@ -39,3 +39,11 @@ func save() -> void:
 	var identity = get_node_or_null("/root/ModLoader/six666-BrotatoOnline/BrotatoOnlinePlayerIdentityManager")
 	if identity != null:
 		identity.persist_saved_identity()
+
+
+func is_dlc_available_and_active(dlc_id: String) -> bool:
+	# Native runtime effects consult this method. Use this client's registered
+	# Host run configuration while keeping available_dlc_ids and ownership intact.
+	if ItemService.has_meta("brotato_online_session_content"):
+		return ItemService.get_meta("brotato_online_session_content").get("enabled_dlcs", []).has(dlc_id)
+	return .is_dlc_available_and_active(dlc_id)

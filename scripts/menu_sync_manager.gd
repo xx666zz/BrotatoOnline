@@ -1,5 +1,8 @@
 extends Node
 
+const SessionContentCatalog = preload("session_content_catalog.gd")
+var _session_content_catalog = SessionContentCatalog.new()
+
 
 const STATE_POLL_INTERVAL_MSEC = 250
 const CLIENT_CHARACTER_SELECT_REPEAT_GUARD_MSEC = 2000
@@ -108,6 +111,7 @@ var _host_built_catalog_build_key_by_screen = {}
 var _host_dlc_gate_logged_missing_keys = {}
 var _dlc_safe_fallback_warning_keys = {}
 var _host_client_character_lookup_by_steam_id = {}
+var _host_client_character_access_lookup_by_steam_id = {}
 var _host_client_item_lookup_by_steam_id = {}
 var _host_client_weapon_lookup_by_steam_id = {}
 var _host_client_character_catalog_key_by_steam_id = {}
@@ -521,6 +525,7 @@ func reset_online_session_state(reason: String = "") -> void:
 	_host_dlc_gate_logged_missing_keys.clear()
 	_dlc_safe_fallback_warning_keys.clear()
 	_host_client_character_lookup_by_steam_id.clear()
+	_host_client_character_access_lookup_by_steam_id.clear()
 	_host_client_item_lookup_by_steam_id.clear()
 	_host_client_weapon_lookup_by_steam_id.clear()
 	_host_client_character_catalog_key_by_steam_id.clear()
@@ -638,7 +643,10 @@ func receive_menu_message(from_steam_id: String, message: Dictionary) -> void:
 	elif msg_type == "select_character":
 		apply_remote_select_by_item_id(player_index, item_id, "character_selection")
 	elif msg_type == "select_weapon":
-		apply_remote_select_by_item_id(player_index, item_id, "weapon_selection")
+		if bool(message.get("random_empty", false)):
+			_apply_remote_empty_weapon_random(player_index)
+		else:
+			apply_remote_select_by_item_id(player_index, item_id, "weapon_selection")
 	elif msg_type == "select_difficulty":
 		pass
 	else:
@@ -9131,13 +9139,18 @@ func _find_character_data_by_id(character_id: String):
 func build_local_client_content_capability_for_hello() -> Dictionary:
 	# Sent by the Client once during hello/retry. Keep this id-only: the Host only
 	# needs presence/absence for DLC/content gating, not serialized resources.
-	var characters = _build_data_object_id_state_array(ItemService.characters) if ItemService != null else []
-	var items = _build_data_object_id_state_array(ItemService.items) if ItemService != null else []
-	var weapons = _build_data_object_id_state_array(ItemService.weapons) if ItemService != null else []
+	# Report resources this client can load, independently of local ownership/unlocks.
+	# The Host still selects from its own enabled and unlocked content.
+	var loadable = _session_content_catalog.get_loadable_catalog()
+	var characters = _build_data_object_id_state_array(loadable.characters)
+	var owned_characters = _build_data_object_id_state_array(_session_content_catalog.get_locally_owned_characters(loadable.characters))
+	var items = _build_data_object_id_state_array(loadable.items)
+	var weapons = _build_data_object_id_state_array(loadable.weapons)
 	return {
-		"version": 3,
+		"version": 4,
 		"id_only": true,
 		"characters": characters,
+		"owned_characters": owned_characters,
 		"items": items,
 		"weapons": weapons,
 		"character_count": characters.size(),
@@ -9194,6 +9207,12 @@ func receive_client_content_capability_from_hello(steam_id: String, message: Dic
 		return false
 
 	var character_lookup = _build_lookup_from_sync_state_array(characters)
+	# Legacy capability lists were already filtered by native DLC ownership.
+	# New clients separately report resource presence and character selection rights.
+	var owned_characters = capability.get("owned_characters", characters)
+	if typeof(owned_characters) != TYPE_ARRAY:
+		owned_characters = []
+	var character_access_lookup = _build_lookup_from_sync_state_array(owned_characters)
 	if character_lookup.empty():
 		# Fail open instead of locking the entire character page if the Client sent an
 		# early/invalid list. Normal Clients still report all base-game characters, so
@@ -9220,6 +9239,9 @@ func receive_client_content_capability_from_hello(steam_id: String, message: Dic
 			"weapon_id_hash": str(state.get("weapon_id_hash", "")),
 			"log": str(state.get("log", ""))
 		})
+	for state in owned_characters:
+		if typeof(state) == TYPE_DICTIONARY:
+			stable_states.append({"kind": "owned_character", "id": str(state.get("id", "")), "id_hash": str(state.get("id_hash", ""))})
 	for state in items:
 		if typeof(state) != TYPE_DICTIONARY:
 			continue
@@ -9246,6 +9268,7 @@ func receive_client_content_capability_from_hello(steam_id: String, message: Dic
 	_host_client_character_catalog_key_by_steam_id[steam_id] = key
 	_host_client_shop_content_catalog_key_by_steam_id[steam_id] = key
 	_host_client_character_lookup_by_steam_id[steam_id] = character_lookup
+	_host_client_character_access_lookup_by_steam_id[steam_id] = character_access_lookup
 	if not item_lookup.empty():
 		_host_client_item_lookup_by_steam_id[steam_id] = item_lookup
 	else:
@@ -9277,6 +9300,18 @@ func _get_active_remote_client_ids_for_dlc_gate() -> Array:
 		if steam_id != "" and steam_id != "0" and not result.has(steam_id):
 			result.append(steam_id)
 	return result
+
+
+func _is_character_available_for_player(character, player_index: int) -> bool:
+	var slot_manager = _get_slot_manager()
+	if slot_manager == null or not slot_manager.has_method("get_remote_steam_id"):
+		return true
+	var peer_key = str(slot_manager.get_remote_steam_id(player_index))
+	if peer_key == "" or peer_key == "0":
+		return true # The Host's local slots retain native DLC and unlock rules.
+	if not _host_client_character_access_lookup_by_steam_id.has(peer_key):
+		return false # Wait for hello before allowing a remote character selection.
+	return _data_object_matches_lookup(character, _host_client_character_access_lookup_by_steam_id[peer_key])
 
 
 func _get_clients_missing_character(item) -> Array:
@@ -9311,7 +9346,7 @@ func _clear_ready_for_characters_missing_client_content(selection: Node) -> void
 			continue
 		var selected_item = _get_selected_item_for_player(selection, player_index)
 		var missing_clients = _get_clients_missing_character(selected_item)
-		if missing_clients.empty():
+		if missing_clients.empty() and _is_character_available_for_player(selected_item, player_index):
 			continue
 		_clear_client_local_ready_after_send(selection, player_index)
 
@@ -9343,7 +9378,7 @@ func _try_apply_host_dlc_gate_to_current_selection(fast_screen: String = "") -> 
 	for steam_id in _host_client_character_catalog_key_by_steam_id.keys():
 		cap_key_parts.append(str(steam_id) + "=" + str(_host_client_character_catalog_key_by_steam_id.get(steam_id, "")))
 	cap_key_parts.sort()
-	var apply_key = selection_id + "|" + ";".join(cap_key_parts)
+	var apply_key = selection_id + "|" + str(RunData.get_player_count()) + "|" + ";".join(cap_key_parts)
 	if not _host_dlc_gate_catalog_dirty and _last_host_dlc_gate_apply_key == apply_key:
 		return true
 
@@ -9421,7 +9456,9 @@ func _build_host_catalog_for_screen_uncached(screen: String) -> Dictionary:
 			if screen == SCREEN_CHARACTER_SELECTION and host_unlocked:
 				missing_clients = _get_clients_missing_character(item)
 				client_content_available = missing_clients.empty()
-			var host_selectable = host_unlocked and client_content_available
+			var character_allowed = screen != SCREEN_CHARACTER_SELECTION or _is_character_available_for_player(item, player_index)
+			var host_selectable = host_unlocked and client_content_available and character_allowed
+			state["client_character_allowed"] = character_allowed
 			state["host_selectable"] = host_selectable
 			state["host_locked"] = not host_selectable
 			state["host_unlocked"] = host_unlocked
@@ -9533,7 +9570,7 @@ func _try_apply_online_catalog_to_current_selection() -> bool:
 		_host_catalog_key_by_screen[screen] = catalog_key
 		_host_catalog_player_key_by_screen[screen] = _build_catalog_player_key_map(catalog)
 
-	var key = str(selection.get_instance_id()) + "|" + catalog_key
+	var key = str(selection.get_instance_id()) + "|" + catalog_key + "|" + str(_get_local_client_player_index()) + "|" + str(RunData.get_player_count())
 	if str(_last_applied_catalog_key_by_screen.get(screen, "")) == key:
 		return true
 
@@ -9577,6 +9614,30 @@ func _selection_inventories_ready(selection: Node) -> bool:
 	return true
 
 
+func _get_character_inventory_owner(inventories: Array, inventory: Node) -> int:
+	# CharacterSelection has one grid shared by every player. A remote player's
+	# access restrictions must never overwrite the local input owner's grid.
+	var candidates = []
+	for index in range(RunData.get_player_count()):
+		if inventories[index % inventories.size()] == inventory:
+			candidates.append(index)
+	if candidates.empty():
+		return -1
+	if candidates.size() == 1:
+		return int(candidates[0])
+	if not _is_game_host() and _local_client_steam_id != "":
+		var local_index = _get_local_client_player_index()
+		return local_index if candidates.has(local_index) else -1
+	var slots = _get_slot_manager()
+	for index in candidates:
+		if slots == null or not slots.has_method("get_remote_steam_id"):
+			return int(index)
+		var remote_key = str(slots.get_remote_steam_id(index))
+		if remote_key == "" or remote_key == "0":
+			return int(index)
+	return -1
+
+
 func _apply_online_catalog_to_player_inventory(selection: Node, screen: String, player_index: int, player_catalog: Dictionary) -> bool:
 	if not selection.has_method("_get_inventories"):
 		return false
@@ -9588,10 +9649,18 @@ func _apply_online_catalog_to_player_inventory(selection: Node, screen: String, 
 	if not _is_live_ref(inventory):
 		return false
 
+	var owner_changed = false
+	if screen == SCREEN_CHARACTER_SELECTION:
+		var owner = _get_character_inventory_owner(inventories, inventory)
+		if player_index != owner:
+			return false
+		owner_changed = int(inventory.get_meta("bo_character_catalog_owner", -1)) != owner
+		inventory.set_meta("bo_character_catalog_owner", owner)
+
 	var cache_slot = screen + "|" + str(selection.get_instance_id()) + "|" + str(inventory.get_instance_id()) + "|" + str(player_index)
 	var player_key = _get_catalog_player_stable_key(screen, player_index, player_catalog)
 	var apply_key = str(inventory.get_child_count()) + "|" + player_key
-	if str(_last_applied_catalog_player_key_by_inventory.get(cache_slot, "")) == apply_key:
+	if not owner_changed and str(_last_applied_catalog_player_key_by_inventory.get(cache_slot, "")) == apply_key:
 		return false
 
 	var selectable_lookup = _build_selectable_lookup_from_player_catalog(player_catalog)
@@ -9947,6 +10016,12 @@ func _on_client_inventory_element_pressed(element, selection: Node, screen: Stri
 	var concrete_element = element
 	var pressed_random = bool(_safe_get(element, "is_random", false))
 	if pressed_random:
+		if screen == SCREEN_WEAPON_SELECTION and not _get_player_catalog(screen, player_index).empty() and _get_host_selectable_states_for_player(screen, player_index).empty():
+			# Vanilla accepts the random tile even when every starting option is locked.
+			# Send the intent; the Host rechecks its own options and invokes vanilla.
+			_queued_local_client_menu_messages.append({"msg_type": "select_weapon", "screen": screen, "random_empty": true})
+			_clear_client_local_ready_after_send(selection, player_index)
+			return
 		concrete_element = _pick_random_host_selectable_element(selection, screen, player_index)
 		if not _is_live_ref(concrete_element):
 			_clear_client_local_ready_after_send(selection, player_index)
@@ -10658,6 +10733,36 @@ func apply_remote_focus_by_item_id(player_index: int, item_id) -> void:
 		_bo_ui_diag_log("REMOTE_FOCUS", "total_us=" + str(total_usec) + " find_selection_us=" + str(selection_usec) + " find_element_us=" + str(find_usec) + " collect_us=" + str(collect_usec) + " scan_us=" + str(scan_usec) + " candidates=" + str(candidate_count) + " cache_hit=" + str(cache_hit) + " cache_build_us=" + str(cache_build_usec) + " apply_us=" + str(apply_usec) + " cancel_us=" + str(cancel_usec) + " control_us=" + str(control_usec) + " expected_us=" + str(expected_usec) + " callback_us=" + str(callback_usec) + " found=true player=" + str(player_index) + " item=" + str(item_id))
 
 
+func _apply_remote_empty_weapon_random(player_index: int) -> void:
+	var selection = _find_current_selection_node()
+	if selection == null or _get_selection_screen(selection) != SCREEN_WEAPON_SELECTION:
+		return
+	if player_index < 0 or player_index >= RunData.get_player_count():
+		return
+	if not selection.has_method("_get_all_possible_elements") or not selection.has_method("_get_inventories"):
+		return
+	# A delayed/forged empty-choice request must not bypass real selectable items.
+	var unlocked = _get_host_unlocked_lookup_for_selection(selection, player_index)
+	for item in selection._get_all_possible_elements(player_index):
+		if _is_live_ref(item) and _data_object_matches_lookup(item, unlocked):
+			return
+	var inventories = selection._get_inventories()
+	if typeof(inventories) != TYPE_ARRAY or inventories.empty():
+		return
+	var inventory = inventories[player_index % inventories.size()]
+	if not _is_live_ref(inventory):
+		return
+	for element in inventory.get_children():
+		if not bool(_safe_get(element, "is_random", false)):
+			continue
+		if element is BaseButton and element.disabled:
+			return
+		# Vanilla appends null when its random pool is empty, then marks ready.
+		# Completion skips that null and grants only the character's normal starts.
+		_select_weapon_element(selection, player_index, element)
+		return
+
+
 func apply_remote_select_by_item_id(player_index: int, item_id, expected_screen: String = "") -> void:
 	var total_start_usec = OS.get_ticks_usec()
 	var selection_start_usec = total_start_usec
@@ -10686,6 +10791,8 @@ func apply_remote_select_by_item_id(player_index: int, item_id, expected_screen:
 
 	if screen == SCREEN_CHARACTER_SELECTION:
 		var selected_item = _safe_get(element, "item", null)
+		if not _is_character_available_for_player(selected_item, player_index):
+			return
 		var missing_clients = _get_clients_missing_character(selected_item)
 		if not missing_clients.empty():
 			return
@@ -11480,11 +11587,17 @@ func reset_after_player_roster_change() -> void:
 	_invalidate_selection_element_cache()
 
 func _apply_host_content_configuration(config: Dictionary) -> void:
+	if _is_game_host():
+		return
 	var enabled = config.get("enabled_dlcs", ProgressData.available_dlc_ids)
 	var updates = config.get("active_update_data_ids", ProgressData.active_update_data)
 	if typeof(enabled) != TYPE_ARRAY or typeof(updates) != TYPE_ARRAY:
 		return
-	var changed = RunData.enabled_dlcs != enabled or ProgressData.active_update_data != updates
+	# Register before resolving character/weapon/item ids or deserializing PlayerRunData.
+	var registered = _session_content_catalog.apply(enabled, updates)
+	enabled = registered.enabled_dlcs
+	updates = registered.active_update_data_ids
+	var changed = bool(registered.changed) or RunData.enabled_dlcs != enabled or ProgressData.active_update_data != updates
 	RunData.enabled_dlcs = enabled.duplicate()
 	RunData.active_update_data_ids = updates.duplicate()
 	ProgressData.apply_run_update_data(RunData.active_update_data_ids)
@@ -11497,6 +11610,7 @@ func _restore_local_content_configuration() -> void:
 	if not _host_content_override_active:
 		return
 	_host_content_override_active = false
+	_session_content_catalog.restore()
 	# Rebuild from local preferences; never persist the Host's content selection.
 	ProgressData.refresh_active_update_data()
 	RunData.active_update_data_ids = ProgressData.active_update_data.duplicate()

@@ -1820,11 +1820,27 @@ func _would_shop_go_press_start_game(shop: Node, player_index: int, desired_pres
 	return true
 
 
+func _focus_missing_shop_weapon_choice(shop_item, player_index: int, steal: bool) -> bool:
+	if not _is_live_ref(shop_item) or not (shop_item.item_data is WeaponData) or not shop_item.item_data.is_meca or shop_item.effect_choice_selected >= 0:
+		return false
+	for effect in shop_item.item_data.effects:
+		if effect is EffectOption:
+			var container = shop_item.get_parent()
+			if _can_shop_buy_action_pass_local_rules(player_index, shop_item, container, steal):
+				shop_item.focus_mecha_effect_choice()
+			return true
+	return false
+
+
 func _on_client_shop_item_buy_button_pressed(shop_item, player_index: int) -> void:
+	if _focus_missing_shop_weapon_choice(shop_item, player_index, false):
+		return
 	_on_client_shop_item_bought(shop_item, player_index)
 
 
 func _on_client_shop_item_steal_button_pressed(shop_item, player_index: int) -> void:
+	if _focus_missing_shop_weapon_choice(shop_item, player_index, true):
+		return
 	_on_client_shop_item_stolen(shop_item, player_index)
 
 
@@ -3001,7 +3017,7 @@ func _apply_shop_delta_state_to_ui(shop: Node, state: Dictionary) -> bool:
 			_set_shop_player_items_array(shop, player_index, player_shop_items)
 			_last_applied_shop_slots_key_by_player[shop_player_key] = _build_shop_slots_state_key_from_entries(item_entries)
 			if _is_live_ref(container):
-				_apply_shop_state_entries_to_container(container, item_entries, player_index)
+				_apply_shop_state_entries_to_container(container, item_entries, player_index, state.get("delta_action", "") == "shop_reroll")
 		else:
 			if _is_live_ref(container):
 				_apply_shop_delta_entries_to_container(container, item_entries, player_index)
@@ -3142,6 +3158,17 @@ func _resolve_serialized_inventory_data_list(serialized_items) -> Array:
 	return result
 
 
+func _apply_synced_offer(slot, data, wave: int, preserve_choice: bool = true) -> void:
+	if not slot.has_method("set_shop_item"):
+		return
+	var selected = int(_safe_get(slot, "effect_choice_selected", -1))
+	var same_offer = preserve_choice and selected in [0, 1] and slot.active and slot.wave_value == wave and data is WeaponData and data.is_meca and slot.item_data is WeaponData and slot.item_data.is_meca and _get_shop_item_identity_key(slot.item_data) == _get_shop_item_identity_key(data)
+	slot.set_shop_item(data, wave)
+	if same_offer:
+		slot.effect_choice_selected = selected
+		slot.update_effect_choice_buttons_visuals()
+
+
 func _apply_shop_delta_entries_to_container(container, item_entries: Array, player_index: int) -> void:
 	if not _is_live_ref(container) or typeof(item_entries) != TYPE_ARRAY:
 		return
@@ -3166,8 +3193,7 @@ func _apply_shop_delta_entries_to_container(container, item_entries: Array, play
 			_deactivate_shop_item_visual_if_needed(shop_item_node)
 			continue
 		shop_item_node.item_steals = int(_safe_get(container, "item_steals", 0))
-		if shop_item_node.has_method("set_shop_item"):
-			shop_item_node.set_shop_item(item_data, int(entry.get("wave_value", RunData.current_wave)))
+		_apply_synced_offer(shop_item_node, item_data, int(entry.get("wave_value", RunData.current_wave)))
 		_apply_shop_item_lock_visual_only(shop_item_node, bool(entry.get("locked", false)))
 		_apply_shop_item_entry_button_state(container, entry)
 
@@ -4003,7 +4029,7 @@ func _count_active_shop_state_entries(item_entries: Array) -> int:
 	return count
 
 
-func _apply_shop_state_entries_to_container(container, item_entries: Array, player_index: int) -> void:
+func _apply_shop_state_entries_to_container(container, item_entries: Array, player_index: int, rerolled: bool = false) -> void:
 	if not _is_live_ref(container):
 		return
 	var shop_item_nodes = _safe_get(container, "_shop_items", [])
@@ -4039,8 +4065,7 @@ func _apply_shop_state_entries_to_container(container, item_entries: Array, play
 			_deactivate_shop_item_visual_if_needed(shop_item_node)
 			continue
 		shop_item_node.item_steals = int(_safe_get(container, "item_steals", 0))
-		if shop_item_node.has_method("set_shop_item"):
-			shop_item_node.set_shop_item(item_data, int(entry.get("wave_value", RunData.current_wave)))
+		_apply_synced_offer(shop_item_node, item_data, int(entry.get("wave_value", RunData.current_wave)), not rerolled or (shop_item_node.locked and bool(entry.get("locked", false))))
 		if bool(entry.get("locked", false)):
 			_apply_shop_item_lock_visual_only(shop_item_node, true)
 		else:

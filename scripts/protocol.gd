@@ -1,8 +1,7 @@
 extends Reference
 
-# Package and wire versions are independent. All transports require Brotato 1.2.
+# Package and wire versions are independent.
 const MOD_VERSION = "6.6.6"
-const GAME_VERSION = "1.2.0.0"
 const NETWORK_PROTOCOL_VERSION = "6.3.0"
 const LAN_PROTOCOL_VERSION = 4
 const DISCOVERY_PROTOCOL_VERSION = 2
@@ -13,7 +12,8 @@ static func get_game_version() -> String:
 
 
 static func is_compatible(protocol_version, game_version) -> bool:
-	return str(protocol_version) == NETWORK_PROTOCOL_VERSION and str(game_version) == GAME_VERSION and get_game_version() == GAME_VERSION
+	var local_version = get_game_version()
+	return local_version != "" and str(protocol_version) == NETWORK_PROTOCOL_VERSION and str(game_version) == local_version
 
 
 static func display_version(value, unknown: String) -> String:

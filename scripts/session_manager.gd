@@ -234,6 +234,7 @@ var _sent_client_game_scene_ready_start_id = 0
 var _local_run_page_action_seq = 0
 var _lobby_toggle_button = null
 var _lobby_toggle_panel = null
+var _awaiting_steam_versions = 0
 var _lobby_toggle_pending_create = false
 var _lobby_toggle_close_after_create = false
 var _lobby_toggle_signal_guard = false
@@ -788,7 +789,13 @@ func _broadcast_transport_session_id() -> void:
 		_lan_transport.send_packet(connection.get("peer", null), payload, P2P_CHANNEL_MENU, true)
 
 
+func _valid_steam_member_id(key: String) -> bool:
+	return key.is_valid_integer() and int(key) > 0
+
+
 func _remote_connection_rejection_reason(peer_key: String, transport: Node, peer) -> String:
+	if transport == _steam_transport and not _valid_steam_member_id(peer_key):
+		return "invalid_identity"
 	if _kicked_departing_peer_keys.has(peer_key):
 		return "room_full"
 	if peer_key == "" or peer_key == _self_steam_id:
@@ -1310,9 +1317,11 @@ func create_session(open_steam_overlay: bool = false) -> void:
 		return
 
 	if _session_active:
-		_lobby_toggle_pending_create = false
-		_lobby_toggle_close_after_create = false
-		_last_lobby_create_failed_result = 0
+		if open_steam_overlay and _is_game_host() and _lobby_id == 0:
+			if _lobby_toggle_pending_create:
+				_open_invite_overlay_after_create = true
+			elif not _start_steam_room(true):
+				_show_join_failure(_ui_text("join_failed_steam_unavailable"))
 		_update_lobby_toggle_button_state()
 		_update_character_invite_button_state()
 		_update_continue_invite_button_state()
@@ -1352,21 +1361,11 @@ func create_session(open_steam_overlay: bool = false) -> void:
 		if _lan_discovery != null and _lan_discovery.has_method("start_host_responder"):
 			_lan_discovery.start_host_responder()
 
-	var steam_ok = false
-	_open_invite_overlay_after_create = open_steam_overlay
-	if _steam_transport != null and _steam_transport.is_available():
-		var lobby_type = _get_steam_const("LOBBY_TYPE_PUBLIC", LOBBY_TYPE_PUBLIC_FALLBACK) if _get_public_lobby_enabled() else _get_steam_const("LOBBY_TYPE_FRIENDS_ONLY", LOBBY_TYPE_FRIENDS_ONLY_FALLBACK)
-		steam_ok = int(_steam_transport.start_host(lobby_type, MAX_LOBBY_MEMBERS)) == OK
-	elif _ensure_steam_ready() and _steam_has_method("createLobby"):
-		var fallback_lobby_type = _get_steam_const("LOBBY_TYPE_PUBLIC", LOBBY_TYPE_PUBLIC_FALLBACK) if _get_public_lobby_enabled() else _get_steam_const("LOBBY_TYPE_FRIENDS_ONLY", LOBBY_TYPE_FRIENDS_ONLY_FALLBACK)
-		_steam.createLobby(fallback_lobby_type, MAX_LOBBY_MEMBERS)
-		steam_ok = true
-
+	var steam_ok = _start_steam_room(open_steam_overlay)
 	if not lan_ok and not steam_ok:
 		_handle_host_session_creation_failed(-2)
 		return
 
-	_lobby_toggle_pending_create = steam_ok
 	_lobby_toggle_close_after_create = false
 	_last_lobby_create_failed_result = 0
 	_update_lobby_toggle_button_state()
@@ -1378,11 +1377,27 @@ func create_session(open_steam_overlay: bool = false) -> void:
 	_sync_host_coop_slots_from_lobby()
 
 
-func open_invite_overlay() -> void:
-	if not _ensure_steam_ready():
-		return
+func _start_steam_room(open_overlay: bool) -> bool:
+	_open_invite_overlay_after_create = open_overlay
+	_lobby_toggle_pending_create = true
+	var lobby_type = _get_steam_const("LOBBY_TYPE_PUBLIC", LOBBY_TYPE_PUBLIC_FALLBACK) if _get_public_lobby_enabled() else _get_steam_const("LOBBY_TYPE_FRIENDS_ONLY", LOBBY_TYPE_FRIENDS_ONLY_FALLBACK)
+	if _steam_transport != null and _steam_transport.is_available():
+		if _steam_transport.start_host(lobby_type, MAX_LOBBY_MEMBERS) == OK:
+			return true
+	elif _ensure_steam_ready() and _steam_has_method("createLobby"):
+		_steam.createLobby(lobby_type, MAX_LOBBY_MEMBERS)
+		return true
+	_lobby_toggle_pending_create = false
+	_open_invite_overlay_after_create = false
+	return false
 
-	if _lobby_id == 0:
+
+func open_invite_overlay() -> void:
+	if not _ensure_steam_ready() or _lobby_id == 0:
+		_show_join_failure(_ui_text("join_failed_steam_unavailable"))
+		return
+	if _steam_has_method("isOverlayEnabled") and not _steam.isOverlayEnabled():
+		_show_join_failure(_ui_text("overlay_unavailable"))
 		return
 
 	# Disabling Public closes the lobby immediately so stale public-browser rows
@@ -1394,7 +1409,7 @@ func open_invite_overlay() -> void:
 	if _steam_has_method("activateGameOverlayInviteDialog"):
 		_steam.activateGameOverlayInviteDialog(_lobby_id)
 	else:
-		pass
+		_show_join_failure(_ui_text("overlay_unavailable"))
 
 
 func join_lobby(lobby_id) -> void:
@@ -1438,6 +1453,8 @@ func join_steam_lobby(lobby_id) -> void:
 		leave_lobby()
 
 	_reset_transient_online_state_for_new_session("join_lobby")
+	if _awaiting_steam_versions != 0 and _awaiting_steam_versions != target_lobby_id:
+		_leave_pending_version_check()
 	_client_join_requested_lobby_id = target_lobby_id
 
 	if _steam_transport != null:
@@ -1562,6 +1579,7 @@ func _poll_host_disconnect_notice() -> void:
 
 
 func leave_lobby() -> void:
+	_leave_pending_version_check()
 	var identity = _get_identity_manager()
 	if identity != null:
 		identity.reset_online_session_state()
@@ -2021,6 +2039,10 @@ func _is_lobby_protocol_compatible(lobby_id) -> bool:
 
 
 func _on_lobby_joined(lobby_id = 0, permissions = 0, locked = false, response = 0) -> void:
+	# Steam also emits LobbyEnter for the owner. LobbyCreated owns host setup.
+	if _session_active and _online_role == "host" and _client_join_requested_lobby_id == 0:
+		if _lobby_toggle_pending_create or (_lobby_id != 0 and str(lobby_id) == str(_lobby_id)):
+			return
 	var response_code = int(response)
 	var join_succeeded = response_code == LOBBY_JOIN_SUCCESS_RESPONSE
 	# Compatibility with older GodotSteam builds that emitted only three signal
@@ -2031,7 +2053,13 @@ func _on_lobby_joined(lobby_id = 0, permissions = 0, locked = false, response = 
 		_clear_pending_join_request()
 		_show_join_failure(_get_lobby_join_failure_text(response_code))
 		return
-	# Also guard friend invites/direct joins, which bypass the lobby browser.
+	# For an explicit join Steam can deliver LobbyEnter before the metadata cache.
+	if _client_join_requested_lobby_id == lobby_id and _steam_has_method("requestLobbyData") and (str(_steam.getLobbyData(lobby_id, "mod_version")) == "" or str(_steam.getLobbyData(lobby_id, "game_version")) == ""):
+		if _awaiting_steam_versions != lobby_id:
+			_awaiting_steam_versions = lobby_id
+			_steam.requestLobbyData(lobby_id)
+		return
+	_awaiting_steam_versions = 0
 	if not _is_lobby_protocol_compatible(lobby_id):
 		# Read metadata before leaving; Steam may discard it after leaveLobby.
 		var version_message = {"mod_version": _steam.getLobbyData(lobby_id, "mod_version") if _steam != null else "", "game_version": _steam.getLobbyData(lobby_id, "game_version") if _steam != null else ""}
@@ -2107,7 +2135,15 @@ func _on_lobby_joined(lobby_id = 0, permissions = 0, locked = false, response = 
 		_send_client_hello_to_host()
 
 
+func _leave_pending_version_check() -> void:
+	var pending = _awaiting_steam_versions
+	_awaiting_steam_versions = 0
+	if pending != 0 and _steam_has_method("leaveLobby"):
+		_steam.leaveLobby(pending)
+
+
 func _clear_pending_join_request() -> void:
+	_leave_pending_version_check()
 	_startup_pending_join_lobby_id = 0
 	_pending_join_lobby_id = 0
 	_client_join_requested_lobby_id = 0
@@ -2187,6 +2223,10 @@ func _on_lobby_chat_update(lobby_id = 0, changed_id = 0, making_change_id = 0, c
 
 
 func _on_lobby_data_update(success = false, lobby_id = 0, member_id = 0) -> void:
+	if lobby_id != 0 and lobby_id == _awaiting_steam_versions and lobby_id == _client_join_requested_lobby_id:
+		if success:
+			_on_lobby_joined(lobby_id, 0, false, LOBBY_JOIN_SUCCESS_RESPONSE)
+		return
 	if _lobby_id == 0 or str(lobby_id) != str(_lobby_id):
 		return
 
@@ -2335,6 +2375,8 @@ func _refresh_lobby_members(force_slot_sync: bool = false) -> void:
 	var current_member_ids = []
 	for i in range(count):
 		var member_id = str(_steam.getLobbyMemberByIndex(_lobby_id, i))
+		if not _valid_steam_member_id(member_id) or current_member_ids.has(member_id):
+			continue
 		var member_name = member_id
 		if _steam_has_method("getFriendPersonaName"):
 			member_name = str(_steam.getFriendPersonaName(int(member_id)))
@@ -8869,7 +8911,7 @@ func _update_character_invite_button_state() -> void:
 	if _lobby_toggle_pending_create:
 		_character_invite_button.text = _ui_text("creating")
 		_character_invite_button.disabled = true
-	elif _session_active and _lobby_id == 0:
+	elif _session_active and _lobby_id == 0 and not _is_game_host():
 		_character_invite_button.text = _ui_text("lan_room_active")
 		_character_invite_button.disabled = true
 	else:
@@ -9006,15 +9048,15 @@ func _update_continue_invite_button_state() -> void:
 	_continue_invite_button.hint_tooltip = ""
 	var creating = _lobby_toggle_pending_create and not _lobby_toggle_close_after_create
 	_continue_invite_button.visible = true
-	if creating and not _session_active:
+	if creating:
 		_continue_invite_button.text = _ui_text("creating")
 		_continue_invite_button.disabled = true
 	elif _lobby_id != 0:
 		_continue_invite_button.text = _ui_text("invite_friend")
 		_continue_invite_button.disabled = false
 	elif _session_active:
-		_continue_invite_button.text = _ui_text("lan_room_active")
-		_continue_invite_button.disabled = true
+		_continue_invite_button.text = _ui_text("invite_friend") if _is_game_host() else _ui_text("lan_room_active")
+		_continue_invite_button.disabled = not _is_game_host()
 	elif _last_lobby_create_failed_result != 0:
 		_continue_invite_button.text = _ui_text("recreate_lobby")
 		_continue_invite_button.disabled = false

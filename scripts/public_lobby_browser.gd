@@ -9,7 +9,6 @@ const MOD_ID = "six666-BrotatoOnline"
 # Steam/LAN compatibility is negotiated independently from the package version.
 const NETWORK_PROTOCOL_VERSION = Protocol.NETWORK_PROTOCOL_VERSION
 const DEFAULT_LAN_PORT = 27462
-const GAME_VERSION = Protocol.GAME_VERSION
 const META_PUBLIC_LOBBY_ENABLED = "brotato_online_public_lobby_enabled"
 const SETTINGS_FILE_PATH = "user://brotato_online_settings.cfg"
 const SETTINGS_SECTION = "network"

@@ -27,6 +27,35 @@ func _enter_tree() -> void:
 	label.unique_name_in_owner = true
 
 
+func _online_shop_focus_emulator():
+	var tree = get_tree()
+	if tree == null or not RunData.is_coop_run or not tree.root.get_meta("brotato_online_session_active", false) or not is_instance_valid(tree.current_scene):
+		return null
+	return Utils.get_focus_emulator(player_index, tree.current_scene)
+
+
+func focus_mecha_effect_choice() -> void:
+	var emulator = _online_shop_focus_emulator()
+	if emulator == null:
+		.focus_mecha_effect_choice()
+		return
+	_effect_button_0.focus_mode = FOCUS_ALL
+	_effect_button_1.focus_mode = FOCUS_ALL
+	_effect_button_0.focus_neighbour_right = _effect_button_0.get_path_to(_effect_button_1)
+	_effect_button_1.focus_neighbour_left = _effect_button_1.get_path_to(_effect_button_0)
+	emulator.focused_control = _effect_button_0
+
+
+func focus_buy_button() -> void:
+	var emulator = _online_shop_focus_emulator()
+	if emulator == null:
+		.focus_buy_button()
+		return
+	if active:
+		_button.focus_mode = FOCUS_ALL
+		emulator.focused_control = _button
+
+
 func change_lock_status(button_pressed: bool) -> void:
 	var was_locked = bool(locked)
 	.change_lock_status(button_pressed)

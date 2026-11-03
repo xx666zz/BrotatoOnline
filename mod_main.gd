@@ -15,6 +15,7 @@ func _init() -> void:
 	_install_follow_target_safe_parent_extension()
 	_install_player_safe_room_cleanup_extension()
 	_install_player_projectile_safe_speed_extension()
+	ModLoaderMod.install_script_extension(mod_dir_path.plus_file("extensions/jellyshield_safe_owner.gd"))
 	_install_stats_manager_safe_queues_extension()
 	_install_focus_emulator_safe_disconnect_extension()
 	_install_shop_item_lock_event_extension()

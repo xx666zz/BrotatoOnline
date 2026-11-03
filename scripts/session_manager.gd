@@ -6843,7 +6843,10 @@ func _has_local_zone_id(zone_id: int) -> bool:
 		return false
 	if ZoneService.zones == null:
 		return false
-	return zone_id < ZoneService.zones.size() and ZoneService.zones[zone_id] != null
+	for zone in ZoneService.zones:
+		if zone != null and zone.my_id == zone_id:
+			return true
+	return false
 
 
 func _get_local_zone_id_for_host_zone(host_zone_id: int) -> int:
@@ -6922,12 +6925,13 @@ func _apply_zone_to_visible_character_selection_ui(local_zone_id: int, host_zone
 		return
 	var zone_index = _find_zone_button_index_for_id(zone_button, local_zone_id)
 	if zone_index < 0:
-		zone_index = 0
+		# The local ownership-filtered menu may omit a loadable Host map.
+		return
 	if zone_button.has_method("select"):
 		zone_button.select(zone_index)
 	else:
 		zone_button.set("selected", zone_index)
-	selection.call_deferred("_setup_zone", zone_index)
+	selection.call("_setup_zone", zone_index)
 	if not host_zone_available:
 		pass
 

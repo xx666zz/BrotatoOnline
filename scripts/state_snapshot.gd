@@ -496,7 +496,7 @@ func _find_runtime_spawn_data_for_entity(entity: Node, category: String, scene_p
 		if direct_path != "" or _is_spawn_data_cursed(direct_data):
 			return direct_data
 
-	if player_index < 0:
+	if player_index < 0 or player_index >= RunData.get_player_count():
 		return null
 
 	if category == "structure":

@@ -8,6 +8,25 @@ extends "res://ui/menus/shop/shop_item.gd"
 signal bo_lock_status_changed(button_pressed, shop_item)
 
 
+func _enter_tree() -> void:
+	# The coop scene omits the label that ShopItem resolves in its onready fields.
+	var button = get_node_or_null("%DismantleButton")
+	if button == null or get_node_or_null("%DismantlePartsLabel") != null:
+		return
+	var row = button.get_node_or_null("HBoxContainer")
+	if row == null:
+		return
+	var label = row.get_node_or_null("DismantlePartsLabel")
+	if label == null:
+		label = Label.new()
+		label.name = "DismantlePartsLabel"
+		label.visible = false
+		label.add_font_override("font", button.get_font("font"))
+		row.add_child(label)
+	label.owner = self
+	label.unique_name_in_owner = true
+
+
 func change_lock_status(button_pressed: bool) -> void:
 	var was_locked = bool(locked)
 	.change_lock_status(button_pressed)

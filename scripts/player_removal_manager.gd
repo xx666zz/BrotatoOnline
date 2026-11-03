@@ -3,7 +3,7 @@ extends Node
 # Player indices stay stable while Main still owns actors, projectiles and rewards.
 # Compact only after disposing that scene, then publish one authoritative roster.
 const SAVE_ARRAYS = ["players_data", "locked_shop_items", "tracked_item_effects", "shop_items", "reroll_count", "paid_reroll_count", "initial_free_rerolls", "free_rerolls", "item_steals"]
-const RUN_ARRAYS = ["locked_shop_items", "tracked_item_effects", "_players_die_args", "remove_speed_effect_cache", "items_nb_cache", "different_items_nb_cache", "duplicate_items_cache", "max_consumable_stats_gained_this_wave", "_are_player_stats_dirty", "current_charmed_enemies", "steps_taken_this_wave"]
+const RUN_ARRAYS = ["locked_shop_items", "tracked_item_effects", "_players_die_args", "remove_speed_effect_cache", "items_nb_cache", "different_items_nb_cache", "duplicate_items_cache", "max_consumable_stats_gained_this_wave", "_are_player_stats_dirty", "current_charmed_enemies", "steps_taken_this_wave", "dino_egg_destroyed"]
 const CONTROL_MESSAGES = ["player_kicked", "player_removed", "player_roster_commit"]
 
 var revision = 0

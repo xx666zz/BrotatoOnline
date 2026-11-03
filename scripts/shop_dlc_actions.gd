@@ -15,6 +15,14 @@ func wire_popup(shop: Node, player_index: int, intercept: bool) -> void:
 	var popup = shop._get_item_popup(player_index)
 	if popup == null:
 		return
+	# The coop scene also binds the button's own visual callbacks to the popup.
+	for button in [popup._effect_button_0, popup._effect_button_1]:
+		if not is_instance_valid(button):
+			continue
+		for event in ["focus_entered", "focus_exited", "mouse_entered", "mouse_exited", "pressed"]:
+			var method = "_on_ButtonWithIcon_" + event
+			if not popup.has_method(method) and button.is_connected(event, popup, method):
+				button.disconnect(event, popup, method)
 	if intercept:
 		if popup.is_connected("item_meca_upgrade_selected", shop, "_on_item_meca_upgrade_selected"):
 			popup.disconnect("item_meca_upgrade_selected", shop, "_on_item_meca_upgrade_selected")
@@ -130,7 +138,7 @@ func apply_client_state(shop: Node, state: Dictionary) -> void:
 	if typeof(preview) != TYPE_DICTIONARY or popup == null or not manager._shop_item_matches_stable_identity(manager._safe_get(popup, "_item_data", null), preview.get("source", {})):
 		return
 	var weapon = manager._resolve_item_parent_data(preview.get("weapon", {}), false)
-	if not (weapon is WeaponData):
+	if not (weapon is WeaponData) or not popup.has_meca_upgrade_ui() or popup._get_effect_options(weapon).size() != 2:
 		return
 	client_previews[index] = preview.duplicate(true)
 	popup._upgrade_preview_cache[popup._item_data.get_instance_id()] = weapon

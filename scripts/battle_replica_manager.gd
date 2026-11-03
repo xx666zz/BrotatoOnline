@@ -393,6 +393,7 @@ func receive_battle_reliable_events_from_host(message: Dictionary) -> void:
 	if typeof(removed) == TYPE_ARRAY:
 		for rid in removed:
 			var id = str(rid)
+			_pending_brachiosaurus_feet.erase(id)
 			if not _should_apply_host_removed_entity(id):
 				continue
 			_handle_host_removed_entity(id, now, "reliable_removed")
@@ -1013,6 +1014,7 @@ func _apply_latest_snapshot_if_needed() -> void:
 	if typeof(removed) == TYPE_ARRAY:
 		for rid in removed:
 			var id = str(rid)
+			_pending_brachiosaurus_feet.erase(id)
 			if not _should_apply_host_removed_entity(id):
 				continue
 			_handle_host_removed_entity(id, now, "removed")
@@ -1162,21 +1164,29 @@ func _get_or_create_host_entity(net_id: String, state: Dictionary) -> Node:
 			else:
 				data_path = ""
 				data_res = null
+		if category == "pet" and data_res == null and spawn_player_index >= 0 and spawn_player_index < RunData.get_player_count():
+			# DLC eggs share a scene across stages. Only use an unambiguous owner effect.
+			var pets = RunData.get_player_effect(Keys.stat_pets_hash, spawn_player_index)
+			if typeof(pets) == TYPE_ARRAY:
+				for effect in pets:
+					if effect is PetEffect and _get_spawn_data_scene_path(effect) == scene_path:
+						if data_res != null and data_res != effect:
+							data_res = null
+							break
+						data_res = effect
 		if data_res != null and typeof(spawn_data_state) == TYPE_DICTIONARY and not spawn_data_state.empty():
 			data_res = _duplicate_with_host_value_if_needed(data_res, spawn_data_state)
 		# Structures and pets must receive their original effect resource; otherwise
 		# vanilla set_data()/update_data() can crash or leave the entity inert.
 		# Continue/resume can expose already-existing nodes with no birth.data, so infer
 		# common vanilla mappings from scene_path when Host could not recover data_path.
-		if category == "structure" and data_res == null:
-			return null
-		if category == "pet" and data_res == null:
-			node = _spawn_display_only_entity(scene_path, pos, category, spawn_player_index)
-			if _is_valid_node(node):
-				node.set_meta("brotato_online_display_only_fallback", true)
-		else:
-			spawn_scene_path = _get_spawnable_combat_scene_path(scene_path, category)
-			node = _spawn_local_combat_entity(spawn_scene_path, entity_type, pos, spawn_player_index, data_res, state)
+		if category == "structure" or category == "pet":
+			if spawn_player_index < 0 or spawn_player_index >= RunData.get_player_count():
+				return null
+			if data_res == null or (category == "pet" and not (data_res is PetEffect)) or (category == "structure" and not (data_res is StructureEffect)):
+				return null
+		spawn_scene_path = _get_spawnable_combat_scene_path(scene_path, category)
+		node = _spawn_local_combat_entity(spawn_scene_path, entity_type, pos, spawn_player_index, data_res, state)
 		if _is_valid_node(node) and spawn_scene_path != scene_path:
 			node.set_meta("brotato_online_scene_fallback", true)
 			node.set_meta("brotato_online_original_scene_path", scene_path)
@@ -1206,7 +1216,7 @@ func _get_or_create_host_entity(net_id: String, state: Dictionary) -> Node:
 		node.disconnect("tree_exited", self, "_on_host_entity_tree_exited")
 	node.connect("tree_exited", self, "_on_host_entity_tree_exited", [node, net_id])
 
-	if _is_local_combat_category(category) and not _has_meta_true(node, "brotato_online_display_only_fallback"):
+	if _is_local_combat_category(category):
 		_configure_local_combat_entity(node, net_id, category, state)
 		_repair_zero_projectile_speed_for_node(node, category, "spawn:" + net_id)
 	else:
@@ -1374,24 +1384,8 @@ func _spawn_local_combat_entity_base(scene_path: String, entity_type: int, pos: 
 			if _is_valid_node(spawned):
 				return spawned
 
-	var node = packed.instance()
-	if node == null:
-		return null
-	var parent = _get_entities_parent()
-	if parent == null:
-		node.queue_free()
-		return null
-	_set_creation_player_index(node, spawn_player_index)
-	parent.add_child(node)
-	_init_fallback_local_combat_entity(node, spawner, entity_type, pos, spawn_player_index, data_res)
-	if node.get("_is_mutant") != null:
-		node.set("_is_mutant", bool(spawn_state.get("is_mutant", false)))
-	if node.get("_is_meca") != null:
-		node.set("_is_meca", bool(spawn_state.get("is_meca", false)))
-	if int(spawn_state.get("charmed_by", -1)) >= 0 and node.has_method("set_charmed"):
-		node.set_charmed(int(spawn_state.charmed_by))
-	_set_node_global_pos(node, pos)
-	return node
+	# Wait for the next authoritative spawn instead of creating an unregistered Unit.
+	return null
 
 
 func _spawn_display_only_entity(scene_path: String, pos: Vector2, category: String, player_index: int = -1) -> Node:
@@ -1413,31 +1407,6 @@ func _spawn_display_only_entity(scene_path: String, pos: Vector2, category: Stri
 	parent.add_child(node)
 	_set_node_global_pos(node, pos)
 	return node
-
-
-func _init_fallback_local_combat_entity(node: Node, spawner: Node, entity_type: int, pos: Vector2, player_index: int, data_res: Resource = null) -> void:
-	# If EntitySpawner.spawn_entity() could not be used, a raw PackedScene instance must still
-	# receive the vanilla Unit/Enemy init call. Otherwise MovementBehavior._parent stays null
-	# and follow_target_movement_behavior.gd crashes in get_target_position().
-	if not _is_valid_node(node):
-		return
-	if node.has_method("init") and spawner != null:
-		var zone_min = spawner.get("_zone_min_pos")
-		var zone_max = spawner.get("_zone_max_pos")
-		var players = spawner.get("_players")
-		if typeof(zone_min) != TYPE_VECTOR2:
-			zone_min = Vector2.ZERO
-		if typeof(zone_max) != TYPE_VECTOR2:
-			zone_max = Vector2.ZERO
-		if typeof(players) != TYPE_ARRAY:
-			players = []
-		node.call("init", zone_min, zone_max, players, spawner)
-	if data_res != null:
-		if node.has_method("set_data"):
-			node.call("set_data", data_res)
-		elif node.has_method("update_data"):
-			node.call("update_data", data_res)
-	_ensure_combat_behavior_parent_links(node)
 
 
 func _ensure_combat_behavior_parent_links(node: Node) -> void:
@@ -1660,7 +1629,7 @@ func _apply_host_spawn_data_state_to_existing_entity(node: Node, state: Dictiona
 	if data_path == "":
 		return
 	var data_res = _load_resource_from_path(data_path)
-	if data_res == null:
+	if data_res == null or (category == "pet" and not (data_res is PetEffect)) or (category == "structure" and not (data_res is StructureEffect)):
 		return
 	if (category == "structure" or category == "pet") and _is_spawn_data_scene_mismatch(data_res, scene_path):
 		return
@@ -3446,6 +3415,7 @@ func _schedule_or_remove_remote_death(id: String, source: String, now: int) -> v
 
 
 func _schedule_remote_death(id: String, category: String, pos: Vector2, remove_at_msec: int, source: String) -> void:
+	_pending_brachiosaurus_feet.erase(id)
 	if id == "":
 		return
 	if category == "":
@@ -3635,6 +3605,7 @@ func _prune_local_kill_ignores(now: int, active_ids: Dictionary) -> void:
 
 
 func _clear_all(reason: String) -> void:
+	_pending_brachiosaurus_feet.clear()
 	_sanitize_stats_manager_queues("clear_all_before:" + reason)
 	_latest_snapshot = {}
 	_latest_snapshot_tick = -1

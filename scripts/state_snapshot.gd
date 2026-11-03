@@ -428,6 +428,8 @@ func _build_dynamic_entity_state_from_net_id(entity: Node, net_id: String, categ
 		"armor": _safe_int_from_object(current_stats, "armor", -1),
 		"status_flags": _build_status_flags_for_entity(entity, category)
 	}
+	if entity is BrachiosaurusFoot:
+		result["source_net_id"] = _get_brachiosaurus_source_net_id(entity.dino_mom, _get_net_id_registry())
 	# Boss/elite charging attacks use this flag as a gameplay condition. Preserve
 	# its Host value in the reliable birth/resync payload as well as motion frames.
 	if category == "boss" and entity.get("_move_locked") != null:
@@ -829,6 +831,8 @@ func _build_birth_state(birth: Node, registry: Node, now_msec: int) -> Dictionar
 		"spawn_sync_mode": SYNC_MODE_HOST_MOTION if spawn_category == "enemy" and _is_looter_scene_path(scene_path) else _sync_mode_from_category(spawn_category),
 		"spawn_scene_path": scene_path
 	}
+	if scene_path == "res://entities/units/enemies/jungle/bosses/brachiosaurus/brachiosaurus_foot/brachiosaurus_foot.tscn":
+		result["source_net_id"] = _get_brachiosaurus_source_net_id(request.get("source"), registry)
 	if typeof(spawn_data_state) == TYPE_DICTIONARY and not spawn_data_state.empty():
 		result["spawn_data"] = spawn_data_state
 	return result
@@ -2557,3 +2561,9 @@ func _entity_type_boss() -> int:
 
 func _entity_type_pet() -> int:
 	return EntityType.PET
+
+
+func _get_brachiosaurus_source_net_id(source, registry) -> String:
+	if not _is_valid_node(source) or not (source is Brachiosaurus):
+		return ""
+	return _get_or_assign_entity_net_id(source, registry, "boss", EntityType.BOSS, "boss")

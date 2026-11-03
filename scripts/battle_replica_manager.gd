@@ -66,6 +66,10 @@ const CLIENT_QUIESCE_KIND_WAVE_TIMEOUT = "wave_timeout"
 const CLIENT_QUIESCE_KIND_ROOM_CLEANUP = "room_cleanup"
 const CLIENT_QUIESCE_KIND_FAILURE = "failure"
 
+const BRACHIOSAURUS_FOOT_SCENE = "res://entities/units/enemies/jungle/bosses/brachiosaurus/brachiosaurus_foot/brachiosaurus_foot.tscn"
+const BRACHIOSAURUS_OWNER_META = "brotato_online_brachiosaurus_owner"
+var _pending_brachiosaurus_feet = {}
+
 var _latest_snapshot = {}
 var _latest_snapshot_tick = -1
 var _last_applied_tick = -1
@@ -669,6 +673,7 @@ func intercept_client_room_cleanup(reason: String = "main_clean_up_room") -> boo
 
 
 func _reset_client_battle_lifecycle(active: bool, reason: String) -> void:
+	_pending_brachiosaurus_feet.clear()
 	_client_quiesce_token += 1
 	_client_battle_phase = CLIENT_BATTLE_PHASE_ACTIVE if active else CLIENT_BATTLE_PHASE_INACTIVE
 	_client_battle_terminal_cleanup_suspended = false
@@ -1181,7 +1186,8 @@ func _get_or_create_host_entity(net_id: String, state: Dictionary) -> Node:
 	if not _is_valid_node(node):
 		return null
 
-	node.name = _safe_node_name("BrotatoOnlineHostEntity_" + net_id)
+	if not (node is Brachiosaurus):
+		node.name = _safe_node_name("BrotatoOnlineHostEntity_" + net_id)
 	node.set_meta("brotato_online_host_entity", true)
 	node.set_meta("brotato_online_net_id", net_id)
 	node.set_meta("brotato_online_category", category)
@@ -1189,6 +1195,8 @@ func _get_or_create_host_entity(net_id: String, state: Dictionary) -> Node:
 		node.remove_meta("brotato_online_remote_death_applying")
 	node.pause_mode = Node.PAUSE_MODE_PROCESS
 	_host_entities[net_id] = node
+	if node is Brachiosaurus and not _pending_brachiosaurus_feet.empty():
+		call_deferred("_retry_pending_brachiosaurus_feet")
 	_host_entity_category[net_id] = category
 	_host_entity_scene_path[net_id] = scene_path
 	# died is not equivalent to despawn (e.g. Scapegoat can revive in-place).
@@ -1337,7 +1345,7 @@ func _prime_pooled_player_index_before_spawn(spawner: Node, packed: PackedScene,
 	_set_creation_player_index(candidate, player_index)
 
 
-func _spawn_local_combat_entity(scene_path: String, entity_type: int, pos: Vector2, player_index: int, data_res: Resource = null, spawn_state: Dictionary = {}) -> Node:
+func _spawn_local_combat_entity_base(scene_path: String, entity_type: int, pos: Vector2, player_index: int, data_res: Resource = null, spawn_state: Dictionary = {}) -> Node:
 	# Final lifecycle gate: no caller may create combat objects once the battle has begun
 	# quiescing or once every local mirrored Player is dead. This preserves vanilla's
 	# invariant that Enemy.init() always has at least one live target.
@@ -2051,6 +2059,9 @@ func _allows_client_entity_death_report(category: String, entity: Node = null, n
 func _on_host_local_entity_died(entity, _die_args, net_id: String, category: String) -> void:
 	if _is_game_host():
 		return
+	# These DLC subclasses dereference target/movement pointers before checking dead.
+	if _is_valid_node(entity) and (entity is Brachiosaurus or entity is Tyranosaurus):
+		entity.set_physics_process(false)
 	if net_id == "":
 		return
 
@@ -2376,6 +2387,7 @@ func _spawn_entity_from_birth_marker_state(birth_id: String, birth_state: Dictio
 		"sync_mode": str(birth_state.get("spawn_sync_mode", _get_entity_sync_mode(category, {}))),
 		"entity_type": int(birth_state.get("entity_type", -1)),
 		"scene_path": scene_path,
+		"source_net_id": str(birth_state.get("source_net_id", "")),
 		"data_path": str(birth_state.get("data_path", "")),
 		"spawn_data": birth_state.get("spawn_data", {}),
 		"is_mutant": bool(birth_state.get("is_mutant", false)),
@@ -2392,9 +2404,10 @@ func _spawn_entity_from_birth_marker_state(birth_id: String, birth_state: Dictio
 		"armor": -1,
 		"status_flags": {}
 	}
-	_spawned_from_birth_marker_entity_ids[entity_net_id] = true
 	_apply_reliable_entity_birth_state(entity_state, int(birth_state.get("server_time_msec", OS.get_ticks_msec())), OS.get_ticks_msec())
 	var spawned = _host_entities.has(entity_net_id)
+	if spawned:
+		_spawned_from_birth_marker_entity_ids[entity_net_id] = true
 	return spawned
 
 
@@ -4401,3 +4414,56 @@ func _array_size(value) -> int:
 	if typeof(value) == TYPE_DICTIONARY:
 		return value.size()
 	return 0
+
+
+func _find_brachiosaurus_owner(state: Dictionary, spawner):
+	var source_id = str(state.get("source_net_id", ""))
+	if source_id != "":
+		var source = _host_entities.get(source_id, null)
+		return source if _is_valid_node(source) and source is Brachiosaurus and not source.dead else null
+	# Compatibility fallback is limited to the existing Boss array, never the scene tree.
+	var found = null
+	if spawner != null:
+		for boss in spawner.bosses:
+			if _is_valid_node(boss) and boss is Brachiosaurus and not boss.dead:
+				if found != null:
+					return null
+				found = boss
+	return found
+
+func _spawn_local_combat_entity(scene_path: String, entity_type: int, pos: Vector2, player_index: int, data_res: Resource = null, spawn_state: Dictionary = {}) -> Node:
+	if scene_path != BRACHIOSAURUS_FOOT_SCENE:
+		return _spawn_local_combat_entity_base(scene_path, entity_type, pos, player_index, data_res, spawn_state)
+	if not _client_battle_accepts_combat_spawn_work("brachiosaurus_foot_dependency"):
+		return null
+	var locator = _get_runtime_locator()
+	var spawner = locator.get_entity_spawner() if locator != null else null
+	var main = spawner.get("_main") if _is_valid_node(spawner) else null
+	var owner = _find_brachiosaurus_owner(spawn_state, spawner)
+	if owner == null or not _is_valid_node(main):
+		var id = str(spawn_state.get("net_id", ""))
+		if id != "" and (_pending_brachiosaurus_feet.has(id) or _pending_brachiosaurus_feet.size() < 16):
+			_pending_brachiosaurus_feet[id] = {"state": spawn_state.duplicate(true), "time": OS.get_ticks_msec()}
+		return null
+	var had_previous = main.has_meta(BRACHIOSAURUS_OWNER_META)
+	var previous = main.get_meta(BRACHIOSAURUS_OWNER_META) if had_previous else null
+	main.set_meta(BRACHIOSAURUS_OWNER_META, owner)
+	var node = _spawn_local_combat_entity_base(scene_path, entity_type, pos, player_index, data_res, spawn_state)
+	if had_previous:
+		main.set_meta(BRACHIOSAURUS_OWNER_META, previous)
+	else:
+		main.remove_meta(BRACHIOSAURUS_OWNER_META)
+	if _is_valid_node(node):
+		_pending_brachiosaurus_feet.erase(str(spawn_state.get("net_id", "")))
+	return node
+
+func _retry_pending_brachiosaurus_feet() -> void:
+	if not _client_battle_accepts_combat_spawn_work("brachiosaurus_pending_retry"):
+		_pending_brachiosaurus_feet.clear()
+		return
+	var now = OS.get_ticks_msec()
+	for id in _pending_brachiosaurus_feet.keys():
+		var pending = _pending_brachiosaurus_feet[id]
+		_pending_brachiosaurus_feet.erase(id)
+		if now - int(pending.time) <= 5000 and not _host_entities.has(id):
+			_apply_reliable_entity_birth_state(pending.state, now, now)

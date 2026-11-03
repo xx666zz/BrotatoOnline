@@ -1,9 +1,9 @@
 extends Reference
 
 # Package and wire versions are independent. All transports require Brotato 1.2.
-const MOD_VERSION = "6.6.8"
+const MOD_VERSION = "6.6.6"
 const GAME_VERSION = "1.2.0.0"
-const NETWORK_PROTOCOL_VERSION = "6.1.0"
+const NETWORK_PROTOCOL_VERSION = "6.2.0"
 const LAN_PROTOCOL_VERSION = 4
 const DISCOVERY_PROTOCOL_VERSION = 2
 

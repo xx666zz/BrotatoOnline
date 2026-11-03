@@ -21,6 +21,10 @@ func _init() -> void:
 	_install_pause_menu_focus_safe_extension()
 	_install_utils_online_manual_aim_extension()
 	ModLoaderMod.install_script_extension(mod_dir_path.plus_file("extensions/progress_data_removed_players.gd"))
+	ModLoaderMod.install_script_extension(mod_dir_path.plus_file("extensions/brachiosaurus_foot_safe_parent.gd"))
+	ModLoaderMod.install_script_extension(mod_dir_path.plus_file("extensions/enemy_laser_safe_source.gd"))
+	ModLoaderMod.install_script_extension(mod_dir_path.plus_file("extensions/enemy_laser_follow_safe_source.gd"))
+
 
 
 

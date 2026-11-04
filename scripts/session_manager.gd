@@ -2860,6 +2860,10 @@ func _route_host_shop_buy_result(from_steam_id: String, request: Dictionary, res
 func _broadcast_run_page_action_sync(message: Dictionary, except_steam_id: String = "") -> void:
 	if not _is_game_host() or not _session_active:
 		return
+	# Receivers prefer host_state_after. Send the authoritative shelf only once.
+	if message.get("action_type", "") in ["shop_reroll", "shop_dismantle"] and message.has("host_state_after"):
+		message = message.duplicate()
+		message.erase("state_after")
 	for peer_key_value in _get_remote_ids_for_host_sync():
 		var steam_id = str(peer_key_value)
 		if steam_id == "" or steam_id == _self_steam_id:
@@ -3189,15 +3193,6 @@ func bo_api_get_battle_id() -> int:
 	if int(_client_expected_battle_start_id) > 0:
 		return int(_client_expected_battle_start_id)
 	return 0
-
-
-func bo_live_pickup_peers() -> Array:
-	var peers = []
-	var heartbeat = get_parent().get_node_or_null("BrotatoOnlineNetworkHeartbeat")
-	for peer in _get_remote_ids_for_host_sync():
-		if _connection_by_peer_key.has(peer) and (heartbeat == null or not heartbeat.is_peer_disconnected(peer)):
-			peers.append(peer)
-	return peers
 
 
 func bo_api_get_remote_member_steam_ids() -> Array:
@@ -3828,9 +3823,6 @@ func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 		if _extract_battle_start_id(message) != bo_api_get_battle_id() or int(message.get("wave", -1)) != RunData.current_wave:
 			return
 		if main == null or not main.has_method("bo_receive_pickups"):
-			# A peer can already be outside Main after a failed wave. It has no live outbox.
-			if not _is_game_host() and from_steam_id == _get_game_host_steam_id() and message.get("action", "") == "seal":
-				send_battle_message_to_host({"msg_type": "dlc_pickups", "wave": RunData.current_wave, "action": "sealed"}, true)
 			return
 		if _is_game_host():
 			var slot = bo_api_get_player_index_for_steam_id(from_steam_id)

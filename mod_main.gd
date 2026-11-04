@@ -24,6 +24,7 @@ func _init() -> void:
 	_install_stats_manager_safe_queues_extension()
 	_install_focus_emulator_safe_disconnect_extension()
 	_install_shop_item_lock_event_extension()
+	ModLoaderMod.install_script_extension(mod_dir_path.plus_file("extensions/coop_upgrade_focus.gd"))
 	_install_pause_menu_focus_safe_extension()
 	_install_utils_online_manual_aim_extension()
 	ModLoaderMod.install_script_extension(mod_dir_path.plus_file("extensions/progress_data_removed_players.gd"))

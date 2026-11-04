@@ -2794,7 +2794,7 @@ func _build_shop_action_delta_state_base(player_index: int, action_type: String,
 	var shop = _find_shop_node()
 	if not _is_valid_shop_node(shop) or player_index < 0:
 		return {}
-	if not applied:
+	if not applied and not action_type in ["shop_reroll", "shop_dismantle"]:
 		var correction = _build_shop_player_state(player_index, shop, true)
 		correction["full_snapshot"] = true
 		correction["delta_action"] = action_type
@@ -2805,14 +2805,18 @@ func _build_shop_action_delta_state_base(player_index: int, action_type: String,
 		"mode": "shop",
 		"shop_delta": true,
 		"delta_action": action_type,
-		"host_applied": true,
+		"host_applied": applied,
 		"player_index": player_index
 	}
 	_append_shop_scalar_state(state, shop, player_index)
 
-	if action_type == "shop_reroll":
+	if action_type in ["shop_reroll", "shop_dismantle"]:
 		state["shop_items"] = _build_shop_slot_entries_for_player(shop, player_index, -1)
 		state["shop_items_full"] = true
+		if action_type == "shop_dismantle":
+			var tracked = RunData.tracked_item_effects[player_index]
+			if tracked.has(Keys.item_titanium_excess_hash):
+				state["dismantle_savings"] = tracked[Keys.item_titanium_excess_hash]
 	elif action_type == "shop_buy":
 		var slot_index = int(message.get("resolved_shop_index", message.get("shop_index", -1)))
 		state["shop_items"] = _build_shop_slot_entries_for_player(shop, player_index, slot_index)
@@ -11762,7 +11766,7 @@ func _build_shop_action_delta_state(index: int, action: String, message: Diction
 		if applied and message.has("meca_upgrade_preview"):
 			state["meca_upgrade_preview"] = message.meca_upgrade_preview
 		return state
-	if _get_dlc_shop_actions().is_action(action):
+	if action == "shop_meca_upgrade":
 		var state = _build_shop_player_state(index, _find_shop_node(), true, false)
 		state["host_applied"] = applied
 		state["delta_action"] = action

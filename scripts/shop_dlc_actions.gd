@@ -128,14 +128,15 @@ func apply_client_state(shop: Node, state: Dictionary) -> void:
 		return
 	if state.has("meca_parts"):
 		var parts = int(state.meca_parts)
-		if RunData.players_data[index].meca_parts != parts:
-			RunData.players_data[index].meca_parts = parts
-			RunData.emit_signal("meca_parts_changed", parts, index)
+		RunData.players_data[index].meca_parts = parts
+		RunData.emit_signal("meca_parts_changed", parts, index)
+	if state.has("dismantle_savings"):
+		RunData.set_tracked_value(index, Keys.item_titanium_excess_hash, state.dismantle_savings)
 	if manager._is_game_host() or index != manager._get_local_client_player_index() or not state.has("meca_upgrade_preview"):
 		return
 	var preview = state.meca_upgrade_preview
 	var popup = shop._get_item_popup(index)
-	if typeof(preview) != TYPE_DICTIONARY or popup == null or not manager._shop_item_matches_stable_identity(manager._safe_get(popup, "_item_data", null), preview.get("source", {})):
+	if typeof(preview) != TYPE_DICTIONARY or popup == null or not popup._focused or not popup.is_visible_in_tree() or not manager._shop_item_matches_stable_identity(manager._safe_get(popup, "_item_data", null), preview.get("source", {})):
 		return
 	var weapon = manager._resolve_item_parent_data(preview.get("weapon", {}), false)
 	if not (weapon is WeaponData) or not popup.has_meca_upgrade_ui() or popup._get_effect_options(weapon).size() != 2:

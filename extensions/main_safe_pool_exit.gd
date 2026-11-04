@@ -389,10 +389,11 @@ func _brotato_online_discard_client_end_wave_pickups(reason: String) -> void:
 
 func clean_up_room() -> void:
 	if _brotato_online_is_online_session_active():
-		if _brotato_online_is_game_host() and "primal_dread" in ProgressData.active_update_data and not _bo_finish_peer_pickups():
-			return
-		if _brotato_online_is_online_client():
-			_bo_flush()
+		if _brotato_online_is_game_host() and "primal_dread" in ProgressData.active_update_data:
+			if _bo_closed:
+				return
+			_bo_closed = true
+		_bo_flush()
 	if _brotato_online_is_online_client():
 		var replica = _brotato_online_get_battle_replica_manager()
 		if replica != null and replica.has_method("intercept_client_room_cleanup"):
@@ -416,13 +417,23 @@ func on_gold_picked_up(gold: Node, player_index: int) -> void:
 
 
 func on_consumable_picked_up(consumable: Node, player_index: int) -> void:
+	if _brotato_online_is_online_session_active() and _bo_player_dead(player_index) and not consumable.already_picked_up:
+		var data = consumable.consumable_data
+		if data != null and (BO_SPECIALS.has(str(data.my_id)) or data.my_id_hash == Keys.consumable_fruit_hash or data.my_id_hash == Keys.consumable_poisoned_fruit_hash):
+			if consumable.has_meta("bo_pickup"):
+				var dropped_id = str(consumable.get_meta("bo_pickup"))
+				_bo_removed[dropped_id] = true
+				_bo_ground.erase(dropped_id)
+				consumable.remove_meta("bo_pickup")
+			despawn_consumable(consumable)
+			return
 	if consumable.has_meta("bo_pickup") and _brotato_online_is_online_session_active():
 		if consumable.already_picked_up:
 			return
 		var id = str(consumable.get_meta("bo_pickup"))
 		consumable.remove_meta("bo_pickup")
 		_bo_ground.erase(id)
-		if id.begins_with("dig:") or (_bo_sealed and not _cleaning_up) or (not _cleaning_up and not _brotato_online_get_slot_manager().get_local_player_indices().has(player_index)) or (_cleaning_up and _brotato_online_is_online_client()):
+		if id.begins_with("dig:") or (not _cleaning_up and not _brotato_online_get_slot_manager().get_local_player_indices().has(player_index)) or (_cleaning_up and _brotato_online_is_online_client()):
 			_bo_removed[id] = true
 			despawn_consumable(consumable)
 			return
@@ -1050,10 +1061,7 @@ var _bo_removed = {}
 var _bo_received = {}
 var _bo_outbox = []
 var _bo_flush_scheduled = false
-var _bo_sealed = false
-var _bo_closing = false
 var _bo_closed = false
-var _bo_waiting = {}
 var _bo_digs = []
 var _bo_layout_scanned = false
 
@@ -1206,58 +1214,48 @@ func _bo_flush() -> void:
 		msg["items"] = _bo_outbox.slice(0, n - 1)
 		if _brotato_online_is_game_host():
 			session.broadcast_message(msg)
-		elif not session.send_battle_message_to_host(msg, true):
-			if not _bo_flush_scheduled:
-				_bo_flush_scheduled = true
-				get_tree().create_timer(0.08).connect("timeout", self, "_bo_scheduled_flush", [], CONNECT_ONESHOT)
-			return
+		else:
+			session.send_battle_message_to_host(msg, true)
 		for _i in n:
 			_bo_outbox.pop_front()
 
 func bo_receive_pickups(msg: Dictionary, sender: int, peer: String) -> void:
 	var session = _brotato_online_get_session_manager()
-	match str(msg.get("action", "")):
-		"seal":
-			if sender >= 0:
-				return
-			_bo_sealed = true
-			_bo_flush()
-			if _bo_outbox.empty():
-				session.send_battle_message_to_host(_bo_packet("sealed"), true)
-		"sealed":
-			if sender >= 0:
-				_bo_waiting.erase(peer)
-		"items":
-			var rows = msg.get("items", [])
-			if typeof(rows) != TYPE_ARRAY or rows.size() > 32:
-				return
-			var accepted = []
-			for row in rows:
-				if typeof(row) != TYPE_ARRAY or row.size() != 5:
-					continue
-				var idx = int(row[2])
-				var id = str(row[0])
-				var kind = str(row[1])
-				if idx < 0 or idx >= RunData.get_player_count() or not BO_SPECIALS.has(kind):
-					continue
-				if sender >= 0 and (bool(row[4]) or idx != sender or _bo_known.get(id, "") != BO_SPECIALS[kind] or _bo_closed):
-					continue
-				var key = str(idx) + ":" + id
-				if _bo_received.has(key):
-					continue
-				_bo_received[key] = true
-				_bo_removed[id] = true
-				var ground = _bo_ground.get(id)
-				if is_instance_valid(ground):
-					despawn_consumable(ground)
-				_bo_ground.erase(id)
-				if bool(row[4]) or not _brotato_online_get_slot_manager().get_local_player_indices().has(idx):
-					_bo_apply_remote_reward(kind, idx, bool(row[3]))
-				accepted.append(row)
-			if sender >= 0 and not accepted.empty():
-				var relay = _bo_packet("items")
-				relay["items"] = accepted
-				session.broadcast_message(relay, peer)
+	if msg.get("action", "") != "items":
+		return
+	var rows = msg.get("items", [])
+	if typeof(rows) != TYPE_ARRAY or rows.size() > 32:
+		return
+	var accepted = []
+	for row in rows:
+		if typeof(row) != TYPE_ARRAY or row.size() != 5:
+			continue
+		var idx = int(row[2])
+		var id = str(row[0])
+		var kind = str(row[1])
+		if idx < 0 or idx >= RunData.get_player_count() or not BO_SPECIALS.has(kind):
+			continue
+		if sender >= 0 and (bool(row[4]) or idx != sender or _bo_known.get(id, "") != BO_SPECIALS[kind]):
+			continue
+		var key = str(idx) + ":" + id
+		if _bo_received.has(key):
+			continue
+		_bo_received[key] = true
+		_bo_removed[id] = true
+		var ground = _bo_ground.get(id)
+		if is_instance_valid(ground) and str(ground.get_meta("bo_pickup") if ground.has_meta("bo_pickup") else "") == id:
+			ground.remove_meta("bo_pickup")
+			despawn_consumable(ground)
+		_bo_ground.erase(id)
+		if _bo_player_dead(idx):
+			continue
+		if bool(row[4]) or not _brotato_online_get_slot_manager().get_local_player_indices().has(idx):
+			_bo_apply_remote_reward(kind, idx, bool(row[3]))
+		accepted.append(row)
+	if sender >= 0 and not accepted.empty():
+		var relay = _bo_packet("items")
+		relay["items"] = accepted
+		session.broadcast_message(relay, peer)
 
 func _bo_apply_remote_reward(kind: String, idx: int, full_hp: bool) -> void:
 	var data = ItemService.get_element_safe(ItemService.consumables, kind)
@@ -1291,30 +1289,5 @@ func _bo_apply_remote_reward(kind: String, idx: int, full_hp: bool) -> void:
 				RunData.add_tracked_value(idx, Keys.item_extra_stomach_hash, e[1])
 	RunData.apply_item_effects(data, idx)
 
-func _bo_finish_peer_pickups() -> bool:
-	if _bo_closed:
-		return true
-	if not _bo_closing:
-		_bo_closing = true
-		_bo_sealed = true
-		_bo_flush()
-		for peer in _brotato_online_get_session_manager().bo_live_pickup_peers():
-			_bo_waiting[str(peer)] = true
-	if _bo_waiting.empty():
-		_bo_closed = true
-		return true
-	if not has_meta("bo_seal_timer"):
-		set_meta("bo_seal_timer", true)
-		_brotato_online_get_session_manager().broadcast_message(_bo_packet("seal"))
-		get_tree().create_timer(0.25).connect("timeout", self, "_bo_retry_seal", [], CONNECT_ONESHOT)
-	return false
-
-func _bo_retry_seal() -> void:
-	remove_meta("bo_seal_timer")
-	var connected = _brotato_online_get_session_manager().bo_live_pickup_peers()
-	for peer in _bo_waiting.keys():
-		if not connected.has(peer):
-			_bo_waiting.erase(peer)
-	clean_up_room()
-
-
+func _bo_player_dead(idx: int) -> bool:
+	return idx >= 0 and idx < _players.size() and is_instance_valid(_players[idx]) and _players[idx].dead

@@ -433,7 +433,7 @@ func on_consumable_picked_up(consumable: Node, player_index: int) -> void:
 		var id = str(consumable.get_meta("bo_pickup"))
 		consumable.remove_meta("bo_pickup")
 		_bo_ground.erase(id)
-		if id.begins_with("dig:") or (not _cleaning_up and not _brotato_online_get_slot_manager().get_local_player_indices().has(player_index)) or (_cleaning_up and _brotato_online_is_online_client()):
+		if id.begins_with("dig:") or (not _cleaning_up and not _bo_owns_pickup_slot(player_index)) or (_cleaning_up and _brotato_online_is_online_client()):
 			_bo_removed[id] = true
 			despawn_consumable(consumable)
 			return
@@ -1249,7 +1249,7 @@ func bo_receive_pickups(msg: Dictionary, sender: int, peer: String) -> void:
 		_bo_ground.erase(id)
 		if _bo_player_dead(idx):
 			continue
-		if bool(row[4]) or not _brotato_online_get_slot_manager().get_local_player_indices().has(idx):
+		if sender >= 0 or bool(row[4]) or not _bo_owns_pickup_slot(idx):
 			_bo_apply_remote_reward(kind, idx, bool(row[3]))
 		accepted.append(row)
 	if sender >= 0 and not accepted.empty():
@@ -1288,6 +1288,12 @@ func _bo_apply_remote_reward(kind: String, idx: int, full_hp: bool) -> void:
 			if e[0] == Keys.stat_max_hp_hash:
 				RunData.add_tracked_value(idx, Keys.item_extra_stomach_hash, e[1])
 	RunData.apply_item_effects(data, idx)
+
+func _bo_owns_pickup_slot(idx: int) -> bool:
+	if _brotato_online_is_online_client():
+		return idx == _brotato_online_get_local_client_player_index()
+	var slots = _brotato_online_get_slot_manager()
+	return slots != null and slots.get_local_player_indices().has(idx)
 
 func _bo_player_dead(idx: int) -> bool:
 	return idx >= 0 and idx < _players.size() and is_instance_valid(_players[idx]) and _players[idx].dead

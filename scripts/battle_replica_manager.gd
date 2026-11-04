@@ -220,7 +220,7 @@ func _apply_owned_terminal_player_state_from_host(snapshot: Dictionary) -> void:
 		if int(state.get("player_index", -1)) != owned_index:
 			continue
 		var hp = int(state.get("health", state.get("hp", -1)))
-		var should_dead = bool(state.get("dead", false)) or (hp >= 0 and hp <= 0)
+		var should_dead = bool(state.get("dead", false)) or (hp == 0 and not RunData.bo_uses_material_life(owned_index))
 		if should_dead:
 			_force_owned_player_dead_from_host_terminal(hp)
 		return
@@ -271,7 +271,7 @@ func _local_all_players_dead_for_terminal() -> bool:
 		var current_stats = player.get("current_stats")
 		var hp = int(current_stats.health) if current_stats != null else -1
 		var dead = bool(player.get("dead")) if player.get("dead") != null else false
-		if not dead and not (hp >= 0 and hp <= 0):
+		if not dead and (hp != 0 or RunData.bo_uses_material_life(player.player_index)):
 			return false
 	# During main.tscn construction RuntimeLocator may briefly expose only invalid/stale
 	# player refs. Never mistake that scene-entry window for an all-player death.
@@ -1870,6 +1870,10 @@ func _apply_remote_player_states(snapshot: Dictionary, server_time_msec: int) ->
 		if typeof(p) != TYPE_DICTIONARY:
 			continue
 		var idx = int(p.get("player_index", -1))
+		if idx == owned_index and idx >= 0 and bool(p.get("dead", false)) and RunData.bo_uses_material_life(idx):
+			var owned = _get_owned_player_node()
+			if _is_valid_node(owned) and not owned.dead:
+				_force_owned_player_dead_from_host_terminal(0)
 		if idx < 0 or idx == owned_index:
 			continue
 		var pos = _dict_to_vec2(p.get("pos", {}))
@@ -1930,7 +1934,7 @@ func _apply_remote_player_runtime_state(player_index: int, state: Dictionary) ->
 	var remote_dead = false
 	if state.has("dead") and bool(state.get("dead", false)):
 		remote_dead = true
-	if host_hp >= 0 and host_hp <= 0:
+	if host_hp == 0 and not RunData.bo_uses_material_life(player_index):
 		# Host can be sampled with HP already zero before the vanilla dead flag is visible
 		# in the snapshot. Treat HP<=0 as remote death authority too.
 		remote_dead = true
@@ -2174,7 +2178,7 @@ func send_owned_player_terminal_state(player: Node = null, reason: String = "ter
 	var current_stats = player.get("current_stats")
 	var local_hp = int(current_stats.health) if current_stats != null else -1
 	var local_dead = bool(player.get("dead"))
-	if current_stats != null and local_hp <= 0:
+	if current_stats != null and local_hp <= 0 and not RunData.bo_uses_material_life(player.player_index):
 		local_dead = true
 	if not local_dead:
 		# Terminal cleanup can be triggered by scene/fail flow for reasons unrelated to
@@ -2199,7 +2203,7 @@ func _poll_and_send_player_state(force: bool) -> void:
 		var cached_stats = cached_player.get("current_stats")
 		var cached_hp = int(cached_stats.health) if cached_stats != null else -1
 		var cached_dead = bool(cached_player.get("dead"))
-		if cached_stats != null and cached_hp <= 0:
+		if cached_stats != null and cached_hp <= 0 and not RunData.bo_uses_material_life(cached_player.player_index):
 			cached_dead = true
 		if not cached_dead or _last_sent_player_dead_state:
 			return
@@ -2210,7 +2214,7 @@ func _poll_and_send_player_state(force: bool) -> void:
 	var current_stats = player.get("current_stats")
 	var local_hp = int(current_stats.health) if current_stats != null else -1
 	var local_dead = bool(player.get("dead"))
-	if current_stats != null and local_hp <= 0:
+	if current_stats != null and local_hp <= 0 and not RunData.bo_uses_material_life(player.player_index):
 		# Some death packets can be sampled while HP already reached zero but before / instead of
 		# the vanilla dead flag being visible to the autoload. Treat HP<=0 as death authority.
 		local_dead = true
@@ -2239,7 +2243,7 @@ func _send_owned_player_state_packet(player: Node, force_dead: bool, reason: Str
 	var local_hp = int(current_stats.health) if current_stats != null else -1
 	var local_dead = bool(player.get("dead"))
 	var local_hit_protection = int(_safe_node_get(player, "_hit_protection", 0))
-	if current_stats != null and local_hp <= 0:
+	if current_stats != null and local_hp <= 0 and not RunData.bo_uses_material_life(player.player_index):
 		local_dead = true
 	if force_dead:
 		local_dead = true
@@ -3235,7 +3239,7 @@ func _apply_host_hp_state_to_player(player_index: int, hp: int, max_hp: int) -> 
 	if current_stats != null and hp != -1:
 		current_stats.health = hp
 	if ENABLE_PLAYER_DEATH_SYNC:
-		if hp != -1 and hp <= 0:
+		if hp != -1 and hp <= 0 and not RunData.bo_uses_material_life(player_index):
 			_apply_remote_dead_display_to_player(player, true)
 		elif hp > 0:
 			_apply_remote_dead_display_to_player(player, false)

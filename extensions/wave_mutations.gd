@@ -27,3 +27,7 @@ func mutate_random_item(player_index: int):
 func advance_dino_eggs() -> void:
 	if not _bo_host_settles_mutations:
 		.advance_dino_eggs()
+
+# These players can remain alive at zero HP until material damage is settled.
+func bo_uses_material_life(index: int) -> bool:
+	return index >= 0 and index < get_player_count() and (get_player_effect(Keys.materials_as_health_hash, index) > 0 or get_player_effect(Keys.damage_taken_on_materials_hash, index) > 0)

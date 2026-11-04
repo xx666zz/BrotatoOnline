@@ -195,12 +195,10 @@ func _brotato_online_restore_remote_proxy_hp(preferred_hp: int = -1) -> void:
 	var restore_hp = preferred_hp if preferred_hp >= 0 else int(current_stats.health)
 	if preferred_hp < 0 and has_meta("brotato_online_last_host_hp"):
 		restore_hp = int(get_meta("brotato_online_last_host_hp"))
-	elif restore_hp <= 0:
-		restore_hp = 1
-	if restore_hp <= 0:
-		restore_hp = max(1, min(max_health, 1))
+	var floor_hp = 0 if RunData.bo_uses_material_life(player_index) else 1
+	restore_hp = max(floor_hp, restore_hp)
 	if max_health > 0:
-		restore_hp = clamp(restore_hp, 1, max_health)
+		restore_hp = min(restore_hp, max_health)
 	current_stats.health = restore_hp
 	if has_signal("health_updated"):
 		emit_signal("health_updated", self, current_stats.health, max_health)
@@ -211,6 +209,65 @@ func _brotato_online_is_remote_hurtbox_proxy() -> bool:
 		return false
 	return has_meta("brotato_online_remote_hurtbox_proxy") and bool(get_meta("brotato_online_remote_hurtbox_proxy"))
 
+
+var _bo_material_hit_sequence = 0
+var _bo_pending_material_hits = []
+var _bo_material_retry = false
+
+func _bo_report_material_hit(amount: int, mode: String) -> void:
+	var session = _brotato_online_get_session_manager()
+	_bo_material_hit_sequence += 1
+	_bo_pending_material_hits.append({"msg_type": "material_hit", "mode": mode, "amount": amount, "player_index": player_index, "seq": _bo_material_hit_sequence, "wave": RunData.current_wave, "battle_start_id": session.bo_api_get_battle_id()})
+	_bo_flush_material_hits()
+
+func _bo_flush_material_hits() -> void:
+	var session = _brotato_online_get_session_manager()
+	if session == null or not _brotato_online_is_owned_online_client_player():
+		_bo_pending_material_hits.clear()
+		return
+	while not _bo_pending_material_hits.empty():
+		var msg = _bo_pending_material_hits[0]
+		if msg.wave == RunData.current_wave and msg.battle_start_id == session.bo_api_get_battle_id():
+			if not session.send_battle_message_to_host(msg, true):
+				if not _bo_material_retry:
+					_bo_material_retry = true
+					get_tree().create_timer(0.1).connect("timeout", self, "_bo_retry_material_hits", [], CONNECT_ONESHOT)
+				return
+		_bo_pending_material_hits.pop_front()
+
+func _bo_retry_material_hits() -> void:
+	_bo_material_retry = false
+	_bo_flush_material_hits()
+
+func _bo_is_remote_material_proxy() -> bool:
+	if _brotato_online_is_remote_hurtbox_proxy() or _brotato_online_is_remote_online_proxy():
+		return true
+	# A host-side proxy can be hit before its first owner HP packet tags it.
+	if not _brotato_online_is_online_client():
+		var slots = _brotato_online_get_slot_manager()
+		return slots != null and slots.is_remote_player_index(player_index)
+	return false
+
+func _take_materials_damage(value: int) -> bool:
+	if not _brotato_online_is_online_session_active():
+		return ._take_materials_damage(value)
+	if _bo_is_remote_material_proxy():
+		return false
+	if _brotato_online_is_owned_online_client_player():
+		if value > 0:
+			_bo_report_material_hit(value, "health")
+		return false
+	return ._take_materials_damage(value)
+
+func absorb_lethal_damage_with_materials(overflow: int) -> bool:
+	if not _brotato_online_is_online_session_active() or RunData.get_player_effect(Keys.damage_taken_on_materials_hash, player_index) <= 0:
+		return .absorb_lethal_damage_with_materials(overflow)
+	if _bo_is_remote_material_proxy():
+		return true
+	if _brotato_online_is_owned_online_client_player():
+		_bo_report_material_hit(overflow, "overflow")
+		return true
+	return .absorb_lethal_damage_with_materials(overflow)
 
 func take_damage(value: int, args: TakeDamageArgs) -> Array:
 	# Remote online players are client-authoritative for HP/death, but their local Player

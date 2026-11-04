@@ -752,7 +752,7 @@ func _build_player_state(player: Node, fallback_index: int, registry: Node) -> D
 	var max_stats = player.get("max_stats")
 	var hp = _safe_int_from_object(current_stats, "health", -1)
 	var dead_state = _safe_bool_from_object(player, "dead", false)
-	if hp >= 0 and hp <= 0:
+	if hp == 0 and not RunData.bo_uses_material_life(player_index):
 		# A Player can be sampled after HP reached zero but before its vanilla dead flag is
 		# visible to this autoload. For network state, HP<=0 is already a death state.
 		dead_state = true
@@ -1379,7 +1379,7 @@ func _build_economy_state(locator: Node) -> Dictionary:
 		if RunData.has_method("get_player_gold"):
 			gold = int(RunData.get_player_gold(i))
 		var dead_state = false
-		if hp >= 0 and hp <= 0:
+		if hp == 0 and not RunData.bo_uses_material_life(i):
 			dead_state = true
 		elif typeof(player_nodes) == TYPE_ARRAY and i < player_nodes.size() and _is_valid_node(player_nodes[i]):
 			dead_state = _safe_bool_from_object(player_nodes[i], "dead", false)
@@ -1513,6 +1513,38 @@ func apply_pickup_claim(from_steam_id: String, message: Dictionary) -> void:
 	return
 
 
+func bo_apply_material_hit(idx: int, msg: Dictionary) -> void:
+	var main = _get_main_scene()
+	# After cleanup commits, a late hit cannot change the result of the finished wave.
+	if not is_instance_valid(main) or main._cleaning_up or main._bo_closed:
+		return
+	var locator = _get_runtime_locator()
+	if not _is_game_host() or locator == null or not RunData.bo_uses_material_life(idx):
+		return
+	var players = locator.get_players()
+	if idx >= players.size() or not _is_valid_node(players[idx]):
+		return
+	var player = players[idx]
+	var seq = int(msg.get("seq", 0))
+	var amount = int(msg.get("amount", -1))
+	if player.dead or seq <= int(player.get_meta("bo_last_material_hit", 0)) or amount < 0:
+		return
+	var mode = str(msg.get("mode", ""))
+	if mode == "health":
+		if amount == 0 or RunData.get_player_effect(Keys.materials_as_health_hash, idx) <= 0:
+			return
+	elif mode == "overflow":
+		if RunData.get_player_effect(Keys.damage_taken_on_materials_hash, idx) <= 0:
+			return
+	else:
+		return
+	player.set_meta("bo_last_material_hit", seq)
+	if amount > 0:
+		RunData.remove_gold(amount, idx)
+	if RunData.get_player_gold(idx) == 0:
+		_get_session_manager().broadcast_message({"msg_type":"material_death", "player_index":idx, "battle_start_id":msg.battle_start_id, "wave":msg.wave})
+		_apply_client_authoritative_remote_player_life_state(player, idx, 0, true)
+
 func apply_player_state(from_steam_id: String, message: Dictionary) -> void:
 	if not _is_game_host():
 		return
@@ -1555,7 +1587,7 @@ func apply_player_state(from_steam_id: String, message: Dictionary) -> void:
 	var max_stats = player.get("max_stats")
 	var incoming_hp = int(message.get("hp", -999999))
 	var incoming_dead = bool(message.get("dead", false))
-	if incoming_hp != -999999 and incoming_hp <= 0:
+	if incoming_hp != -999999 and incoming_hp <= 0 and not RunData.bo_uses_material_life(player_index):
 		# The client owns its current HP. If it reports HP<=0, treat that as an authoritative
 		# death even if the sampled vanilla dead flag has not flipped yet.
 		incoming_dead = true

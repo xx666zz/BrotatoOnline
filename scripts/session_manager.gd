@@ -2976,11 +2976,11 @@ func _annotate_online_session_message(message: Dictionary) -> Dictionary:
 
 
 func _is_battle_generation_message_type(msg_type: String) -> bool:
-	return msg_type == "battle_aim" or msg_type == "battle_snapshot" or msg_type == "battle_reliable_events" or msg_type == "battle_terminal_state" or msg_type == "battle_input" or msg_type == "damage_claim_batch" or msg_type == "player_hp_state" or msg_type == "player_state" or msg_type == "entity_kill_claim" or msg_type == "boss_damage_report" or msg_type == "dlc_pickups" or msg_type == "pickup_claim" or msg_type == "battle_entity_resync_request"
+	return msg_type == "battle_aim" or msg_type == "battle_snapshot" or msg_type == "battle_reliable_events" or msg_type == "battle_terminal_state" or msg_type == "battle_input" or msg_type == "damage_claim_batch" or msg_type == "player_hp_state" or msg_type == "player_state" or msg_type == "entity_kill_claim" or msg_type == "boss_damage_report" or msg_type == "material_hit" or msg_type == "material_death" or msg_type == "dlc_pickups" or msg_type == "pickup_claim" or msg_type == "battle_entity_resync_request"
 
 
 func _is_client_to_host_battle_message_type(msg_type: String) -> bool:
-	return msg_type == "battle_input" or msg_type == "damage_claim_batch" or msg_type == "player_hp_state" or msg_type == "player_state" or msg_type == "entity_kill_claim" or msg_type == "boss_damage_report" or msg_type == "dlc_pickups" or msg_type == "pickup_claim" or msg_type == "battle_entity_resync_request"
+	return msg_type == "battle_input" or msg_type == "damage_claim_batch" or msg_type == "player_hp_state" or msg_type == "player_state" or msg_type == "entity_kill_claim" or msg_type == "boss_damage_report" or msg_type == "material_hit" or msg_type == "dlc_pickups" or msg_type == "pickup_claim" or msg_type == "battle_entity_resync_request"
 
 
 func _annotate_battle_generation_fields(wire: Dictionary) -> void:
@@ -3092,7 +3092,7 @@ func _is_known_online_message_type(msg_type: String) -> bool:
 		return true
 	if msg_type == "heartbeat":
 		return true
-	return msg_type == "hello" or msg_type == "request_selection_state" or msg_type == "menu_focus" or msg_type == "select_character" or msg_type == "select_weapon" or msg_type == "select_difficulty" or msg_type == "select_zone" or msg_type == "host_character_setup" or msg_type == "host_weapon_setup" or msg_type == "game_start_prepare" or msg_type == "game_start_time_ack" or msg_type == "client_game_scene_ready" or msg_type == "game_start_commit" or msg_type == "retry_wave_confirm" or msg_type == "retry_wave_decline" or msg_type == "retry_wave_state" or msg_type == "retry_wave_end" or msg_type == "menu_scene_state" or msg_type == "run_page_action_sync" or msg_type == "quick_chat" or msg_type == "battle_reliable_events" or msg_type == "battle_snapshot" or msg_type == "battle_aim" or msg_type == "battle_terminal_state" or msg_type == "selection_state" or msg_type == "battle_input" or msg_type == "damage_claim_batch" or msg_type == "player_hp_state" or msg_type == "player_state" or msg_type == "entity_kill_claim" or msg_type == "boss_damage_report" or msg_type == "dlc_pickups" or msg_type == "pickup_claim" or msg_type == "battle_entity_resync_request" or msg_type == "bo_mod_message"
+	return msg_type == "hello" or msg_type == "request_selection_state" or msg_type == "menu_focus" or msg_type == "select_character" or msg_type == "select_weapon" or msg_type == "select_difficulty" or msg_type == "select_zone" or msg_type == "host_character_setup" or msg_type == "host_weapon_setup" or msg_type == "game_start_prepare" or msg_type == "game_start_time_ack" or msg_type == "client_game_scene_ready" or msg_type == "game_start_commit" or msg_type == "retry_wave_confirm" or msg_type == "retry_wave_decline" or msg_type == "retry_wave_state" or msg_type == "retry_wave_end" or msg_type == "menu_scene_state" or msg_type == "run_page_action_sync" or msg_type == "quick_chat" or msg_type == "battle_reliable_events" or msg_type == "battle_snapshot" or msg_type == "battle_aim" or msg_type == "battle_terminal_state" or msg_type == "selection_state" or msg_type == "battle_input" or msg_type == "damage_claim_batch" or msg_type == "player_hp_state" or msg_type == "player_state" or msg_type == "entity_kill_claim" or msg_type == "boss_damage_report" or msg_type == "material_hit" or msg_type == "material_death" or msg_type == "dlc_pickups" or msg_type == "pickup_claim" or msg_type == "battle_entity_resync_request" or msg_type == "bo_mod_message"
 
 
 func _is_host_authoritative_message_type(msg_type: String) -> bool:
@@ -3818,6 +3818,17 @@ func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 	if _should_drop_stale_client_battle_packet(from_steam_id, message):
 		return
 
+	if msg_type in ["material_hit", "material_death"]:
+		if _extract_battle_start_id(message) != bo_api_get_battle_id() or int(message.get("wave", -1)) != RunData.current_wave or not _is_in_game_scene():
+			return
+		var idx = int(message.get("player_index", -1))
+		if idx < 0 or idx >= RunData.get_player_count():
+			return
+		if _is_game_host() and msg_type == "material_hit" and bo_api_get_player_index_for_steam_id(from_steam_id) == idx and _get_remote_ids_for_host_sync().has(from_steam_id):
+			_get_state_snapshot_manager().bo_apply_material_hit(idx, message)
+		elif not _is_game_host() and msg_type == "material_death" and from_steam_id == _get_game_host_steam_id() and idx == _get_slot_manager().get_local_mirrored_player_index():
+			_get_battle_replica_manager()._force_owned_player_dead_from_host_terminal(0)
+		return
 	if msg_type == "dlc_pickups":
 		var main = get_tree().current_scene
 		if _extract_battle_start_id(message) != bo_api_get_battle_id() or int(message.get("wave", -1)) != RunData.current_wave:
@@ -7939,7 +7950,7 @@ func _steam_networking_result_name(result) -> String:
 func _get_p2p_channel_for_message_type(msg_type: String) -> int:
 	if msg_type == "lobby_ping_request" or msg_type == "lobby_ping_response":
 		return P2P_CHANNEL_LOBBY_BROWSER
-	if msg_type == "battle_input" or msg_type == "battle_aim" or msg_type == "battle_snapshot" or msg_type == "battle_reliable_events" or msg_type == "battle_terminal_state" or msg_type == "damage_claim_batch" or msg_type == "player_hp_state" or msg_type == "player_state" or msg_type == "entity_kill_claim" or msg_type == "boss_damage_report" or msg_type == "dlc_pickups" or msg_type == "pickup_claim" or msg_type == "battle_entity_resync_request":
+	if msg_type == "battle_input" or msg_type == "battle_aim" or msg_type == "battle_snapshot" or msg_type == "battle_reliable_events" or msg_type == "battle_terminal_state" or msg_type == "damage_claim_batch" or msg_type == "player_hp_state" or msg_type == "player_state" or msg_type == "entity_kill_claim" or msg_type == "boss_damage_report" or msg_type == "material_hit" or msg_type == "material_death" or msg_type == "dlc_pickups" or msg_type == "pickup_claim" or msg_type == "battle_entity_resync_request":
 		return P2P_CHANNEL_BATTLE
 	return P2P_CHANNEL_MENU
 

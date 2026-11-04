@@ -1,6 +1,6 @@
 extends Node
 
-const Protocol = preload("protocol.gd")
+const Protocol = preload("res://mods-unpacked/six666-BrotatoOnline/scripts/protocol.gd")
 
 signal lobby_found(entry)
 

@@ -1,11 +1,11 @@
 extends Node
 
-const ItemRuntimeState = preload("item_runtime_state.gd")
-const ShopDlcActions = preload("shop_dlc_actions.gd")
+const ItemRuntimeState = preload("res://mods-unpacked/six666-BrotatoOnline/scripts/item_runtime_state.gd")
+const ShopDlcActions = preload("res://mods-unpacked/six666-BrotatoOnline/scripts/shop_dlc_actions.gd")
 var _item_runtime_state = ItemRuntimeState.new()
 var _shop_dlc_actions = ShopDlcActions.new()
 
-const SessionContentCatalog = preload("session_content_catalog.gd")
+const SessionContentCatalog = preload("res://mods-unpacked/six666-BrotatoOnline/scripts/session_content_catalog.gd")
 var _session_content_catalog = SessionContentCatalog.new()
 
 
@@ -1938,6 +1938,7 @@ func _build_client_shop_item_action(action_type: String, shop_item, player_index
 		"screen": "shop",
 		"player_index": player_index,
 		"effect_choice": int(_safe_get(shop_item, "effect_choice_selected", -1)),
+		"chosen_effect": _meca_choice_descriptor(item_data, int(_safe_get(shop_item, "effect_choice_selected", -1))),
 		"target": "item_" + str(idx),
 		"shop_index": idx,
 		# Host already has the authoritative item in this shop slot. Sending the full
@@ -2316,6 +2317,22 @@ func _can_weapon_data_be_bought_for_player(player_index: int, weapon_data) -> bo
 	return weapon_slot_available
 
 
+func _meca_choice_descriptor(data, choice: int) -> Array:
+	if choice < 0 or choice > 1 or not (data is WeaponData) or not data.is_meca:
+		return []
+	var options = []
+	for effect in data.effects:
+		if effect is EffectOption:
+			options.append([str(effect.key), int(effect.value)])
+	return options[choice] if options.size() == 2 else []
+
+func _matches_meca_choice(data, choice: int, message: Dictionary) -> bool:
+	var actual = _meca_choice_descriptor(data, choice)
+	if actual.empty():
+		return false
+	var shown = message.get("chosen_effect", actual)
+	return typeof(shown) == TYPE_ARRAY and shown.size() == 2 and str(shown[0]) == actual[0] and int(shown[1]) == actual[1]
+
 func _apply_shop_buy_action(player_index: int, message: Dictionary) -> bool:
 	var shop = _find_shop_node()
 	if not _is_valid_shop_node(shop):
@@ -2332,7 +2349,7 @@ func _apply_shop_buy_action(player_index: int, message: Dictionary) -> bool:
 				options += 1
 		if options > 0:
 			var choice = int(message.get("effect_choice", -1))
-			if options != 2 or choice < 0 or choice > 1:
+			if options != 2 or not _matches_meca_choice(resolved_item_data, choice, message):
 				return false
 			shop_item.effect_choice_selected = choice
 	message["resolved_shop_index"] = _get_shop_item_index(shop_item, player_index)
@@ -4802,7 +4819,7 @@ func _duplicate_shop_sync_variant(value):
 
 
 func _build_shop_run_data_sync_state(player_index: int, force_full_snapshot: bool = false, held_items_mode: String = SHOP_HELD_ITEMS_SYNC_HASH_ONLY, force_full_held_items: bool = false) -> Dictionary:
-	if player_index >= 0 and player_index < RunData.get_player_count() and not RunData.players_data[player_index].recently_mutated.empty():
+	if player_index >= 0 and player_index < RunData.get_player_count() and (not RunData.players_data[player_index].recently_mutated.empty() or RunData.players_data[player_index].has_meta("bo_wave_inventory_changed")):
 		force_full_held_items = true
 	held_items_mode = _resolve_shop_held_items_sync_mode(held_items_mode, force_full_held_items)
 	var run_data_key = ""
@@ -4834,6 +4851,11 @@ func _build_shop_run_data_sync_state(player_index: int, force_full_snapshot: boo
 		# Client-side prediction keys still need a local full state snapshot.
 		run_data_key = _build_shop_run_data_sync_key(player_index)
 		include_full = true
+
+	if force_full_held_items and player_index >= 0 and player_index < RunData.get_player_count() and RunData.players_data[player_index].has_meta("bo_wave_inventory_changed"):
+		var suffix = ":inventory_after_wave:" + str(RunData.players_data[player_index].get_meta("bo_wave_inventory_changed"))
+		run_data_key = run_data_key.split(":inventory_after_wave:", true, 1)[0] + suffix
+		include_full = force_full or str(_host_shop_run_data_sent_key_by_player.get(player_index, "")) != run_data_key
 
 	if include_full and player_index >= 0 and player_index < RunData.players_data.size() and RunData.players_data[player_index] != null and RunData.players_data[player_index].has_method("serialize"):
 		if _is_game_host() and not force_full and _host_shop_run_data_cache_by_player.has(player_index) and typeof(_host_shop_run_data_cache_by_player.get(player_index, {})) == TYPE_DICTIONARY and str(_host_shop_run_data_cache_mode_by_player.get(player_index, "")) == held_items_mode and str(_host_shop_run_data_key_by_player.get(player_index, "")) == run_data_key and not bool(_host_shop_run_data_dirty_by_player.get(player_index, false)):
@@ -6519,7 +6541,8 @@ func _on_host_item_box_take_for_inventory_sync(item_data, consumable) -> void:
 		"screen": "progression_item_box",
 		"player_index": player_index,
 		"item": item_state,
-		"item_id_hash": int(item_state.get("my_id_hash", 0))
+		"item_id_hash": int(item_state.get("my_id_hash", 0)),
+		"consumable": _serialize_item_parent_data(consumable.consumable_data)
 	})
 
 
@@ -6537,7 +6560,13 @@ func _apply_item_box_item_added(player_index: int, message: Dictionary) -> bool:
 	var item_data = _resolve_item_parent_data(item_state)
 	if item_data == null:
 		return false
-	RunData.add_item(item_data, player_index)
+	var main = get_tree().current_scene
+	if not is_instance_valid(main) or not main.has_method("on_item_box_take_button_pressed"):
+		return false
+	var reward = UpgradesUI.ConsumableToProcess.new()
+	reward.player_index = player_index
+	reward.consumable_data = _resolve_item_parent_data(message.get("consumable", {}), false)
+	main.on_item_box_take_button_pressed(item_data, reward)
 	return true
 
 
@@ -6773,6 +6802,10 @@ func _get_default_progression_focus_control(container: Node):
 
 	var items_container = _safe_get(container, "_items_container", null)
 	if _is_canvas_visible(items_container):
+		if container.has_method("_needs_meca_effect_choice") and container.get("_item_data") != null and container._needs_meca_effect_choice() and int(container.get("_meca_effect_choice_selected")) < 0:
+			var first_choice = _safe_get(container, "_meca_effect_button_0", null)
+			if _is_live_ref(first_choice) and first_choice.is_visible_in_tree():
+				return first_choice
 		var take_button = _safe_get(container, "_take_button", null)
 		if _is_live_ref(take_button) and take_button is Control and take_button.is_visible_in_tree():
 			return take_button
@@ -6870,11 +6903,23 @@ func _queue_client_item_box_action(action_type: String, player_index: int) -> vo
 	var visible = _build_progression_visible_option(player_index)
 	if str(visible.get("mode", "")) != "item_box":
 		return
+	var container = _get_progression_player_container(_find_progression_ui(), player_index)
+	if not _is_live_ref(container) or not container.has_meta("bo_box_offer"):
+		return
+	var current = container._item_data
+	if not _shop_item_matches_stable_identity(current, container.get_meta("bo_box_identity")):
+		return
+	var choice = int(container._meca_effect_choice_selected)
+	if action_type == "item_box_take" and container._needs_meca_effect_choice() and not choice in [0, 1]:
+		return
 	_queue_local_run_page_action({
 		"msg_type": "run_page_action_sync",
 		"action_type": action_type,
 		"screen": "progression_item_box",
 		"player_index": player_index,
+		"chosen_effect": _meca_choice_descriptor(current, choice),
+		"offer_id": str(container.get_meta("bo_box_offer")),
+		"effect_choice": choice,
 		"item": visible.get("item_data", {}),
 		"consumable": visible.get("consumable_data", {}),
 		"item_id_hash": int(_get_dict_or_empty(visible.get("item_data", {})).get("my_id_hash", 0)),
@@ -7143,7 +7188,10 @@ func _apply_progression_item_box_action(player_index: int, message: Dictionary, 
 	var container = _get_progression_player_container(ui, player_index)
 	if not _is_live_ref(container):
 		return false
-	var current_mode = str(_build_progression_visible_option(player_index).get("mode", ""))
+	var offer = _build_progression_visible_option(player_index, ui)
+	var current_mode = str(offer.get("mode", ""))
+	if str(message.get("offer_id", "")) != "" and str(message.offer_id) != str(offer.get("offer_id", "")):
+		return false
 	if current_mode != "item_box":
 		return false
 	var current_item = _safe_get(container, "_item_data", null)
@@ -7151,6 +7199,11 @@ func _apply_progression_item_box_action(player_index: int, message: Dictionary, 
 	if wanted_hash != 0 and current_item != null and int(_safe_get(current_item, "my_id_hash", 0)) != wanted_hash:
 		return false
 	if kind == "take" and container.has_method("_on_TakeButton_pressed"):
+		if container._needs_meca_effect_choice():
+			var choice = int(message.get("effect_choice", -1))
+			if not choice in [0, 1] or not _matches_meca_choice(current_item, choice, message):
+				return false
+			container._meca_effect_choice_selected = choice
 		container._on_TakeButton_pressed()
 		return true
 	if kind == "discard" and container.has_method("_on_DiscardButton_pressed"):
@@ -7432,10 +7485,19 @@ func _apply_item_box_option_to_progression_container(container: Node, player_ind
 	var consumable_state = visible.get("consumable_data", {})
 	if typeof(consumable_state) == TYPE_DICTIONARY:
 		var consumable_data = _resolve_item_parent_data(consumable_state)
-		if consumable_data != null and container.get("_consumable_data") != null:
+		if consumable_data != null:
 			container.set("_consumable_data", consumable_data)
+	var token = str(visible.get("offer_id", ""))
+	var identity = _build_shop_item_stable_identity(item_data)
+	var same_offer = token != "" and token == str(container.get_meta("bo_box_offer", "")) and _shop_item_matches_stable_identity(container._item_data, identity)
+	var choice = int(container._meca_effect_choice_selected) if same_offer else -1
+	container.set_meta("bo_box_offer", token)
+	container.set_meta("bo_box_identity", identity)
 	if container.has_method("show_item"):
 		container.show_item(item_data)
+		if choice in [0, 1] and container._needs_meca_effect_choice():
+			container._meca_effect_choice_selected = choice
+			container.update_effect_choice_buttons_visuals()
 	else:
 		if container.get("_item_data") != null:
 			container.set("_item_data", item_data)
@@ -7532,6 +7594,7 @@ func _build_progression_visible_option(player_index: int, ui: Node = null) -> Di
 	if _is_canvas_visible(item_container):
 		return {
 			"mode": "item_box",
+			"offer_id": str(container._item_data.get_instance_id()) + ":" + str(ui._showing_option[player_index].get_instance_id()) if is_instance_valid(container._item_data) and is_instance_valid(ui._showing_option[player_index]) else "",
 			"player_index": player_index,
 			"item_data": _serialize_item_parent_data(container.get("_item_data")),
 			"consumable_data": _serialize_item_parent_data(container.get("_consumable_data"))
@@ -11841,9 +11904,11 @@ func _serialize_runtime_effect_state(data) -> Array:
 	if sync == null:
 		return []
 	var effects = sync.serialize_item_effect_state(data)
-	# Runtime copies have no resource path. Script identity is stable across peers.
+	# Named effect assets can supply nested weapons, scenes or stats that their
+	# script serializer omits. Runtime-only effects still use the script fallback.
 	for entry in effects:
-		entry.erase("resource_path")
+		if str(entry.get("resource_path", "")) == "":
+			entry.erase("resource_path")
 	return effects
 
 func _restore_inventory_effect_state(player, state: Dictionary) -> void:

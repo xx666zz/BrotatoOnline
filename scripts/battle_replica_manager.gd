@@ -129,7 +129,6 @@ var _seen_battle_event_ids = {}       # event_key -> true
 var _pending_remote_deaths = {}       # net_id -> {remove_at:int, category:String, pos:Vector2, source:String}
 var _sent_kill_claim_ids = {}         # net_id -> true, prevents duplicate local death reports
 var _spawned_from_birth_marker_entity_ids = {} # entity_net_id -> true, prevents marker-timeout duplicate spawns
-var _last_progression_apply_key_by_player = {} # player_index -> stable visible reward option key
 var _last_progression_queue_key_by_player = {} # player_index -> stable pending reward queue key
 var _last_remote_player_hurtbox_guard_msec = 0
 var _last_bullet_hell_phase_sync_msec = 0
@@ -1190,6 +1189,9 @@ func _get_or_create_host_entity(net_id: String, state: Dictionary) -> Node:
 				return null
 		spawn_scene_path = _get_spawnable_combat_scene_path(scene_path, category)
 		node = _spawn_local_combat_entity(spawn_scene_path, entity_type, pos, spawn_player_index, data_res, state)
+		if _is_valid_node(node) and category == "pet" and data_path != "" and not spawn_data_state.empty():
+			# spawn_entity has already passed this exact effect to Pet.update_data().
+			node.set_meta("brotato_online_spawn_data_signature", data_path + ":" + to_json(spawn_data_state))
 		if _is_valid_node(node) and spawn_scene_path != scene_path:
 			node.set_meta("brotato_online_scene_fallback", true)
 			node.set_meta("brotato_online_original_scene_path", scene_path)
@@ -3122,30 +3124,10 @@ func _apply_host_progression_player_state(ui: Node, player_state: Dictionary) ->
 	if not _is_valid_node(container):
 		return
 
-	var key = str(player_index) + ":" + to_json(visible)
-	var same_state = str(_last_progression_apply_key_by_player.get(player_index, "")) == key
-	# A menu-channel idle packet or vanilla finish() can hide/disable a container after
-	# this battle state was already cached. Reapply only when its expected panel is no
-	# longer visible; otherwise use repeated snapshots as a cheap input-route repair.
-	if same_state and _progression_container_is_showing_mode(container, mode):
-		_ensure_client_progression_interaction_ready(container, player_index, "battle_snapshot_repeat")
-		return
-
-	# Visible level-up choices are owned exclusively by MenuSyncManager's upgrade_state
-	# path. Battle snapshots must not rebuild UpgradeUI/set_upgrade(), because doing so
-	# creates a second writer that can race authoritative menu state and can reconstruct
-	# runtime UpgradeData with an incompatible Effect layout. Repeated snapshots may
-	# still repair the local input intercept if the authoritative upgrade page is visible.
-	if mode == "upgrade":
-		if _progression_container_is_showing_mode(container, mode):
-			_ensure_client_progression_interaction_ready(container, player_index, "battle_snapshot_upgrade_intercept")
-		return
-
-	_prepare_host_progression_ui(ui, container, player_index, visible)
-	var applied = _apply_host_item_box_option_to_container(container, player_index, visible)
-	if applied:
-		_last_progression_apply_key_by_player[player_index] = key
-		_ensure_client_progression_interaction_ready(container, player_index, "battle_snapshot_apply")
+	# Reliable menu state owns both reward panels. An older combat snapshot
+	# must not replace an offer or reset the selection on a visible card.
+	if _progression_container_is_showing_mode(container, mode):
+		_ensure_client_progression_interaction_ready(container, player_index, "battle_snapshot")
 
 
 func _progression_container_is_showing_mode(container: Node, mode: String) -> bool:
@@ -3161,55 +3143,6 @@ func _ensure_client_progression_interaction_ready(container: Node, player_index:
 	var menu_sync = _get_menu_sync_manager()
 	if menu_sync != null and menu_sync.has_method("ensure_client_progression_interaction_ready"):
 		menu_sync.ensure_client_progression_interaction_ready(container, player_index, reason)
-
-
-func _prepare_host_progression_ui(ui: Node, container: Node, player_index: int, visible: Dictionary) -> void:
-	if ui is CanvasItem:
-		ui.show()
-	var choosing = ui.get("_player_is_choosing")
-	if typeof(choosing) == TYPE_ARRAY and player_index >= 0 and player_index < choosing.size():
-		choosing[player_index] = true
-		ui.set("_player_is_choosing", choosing)
-	var showing = ui.get("_showing_option")
-	if typeof(showing) == TYPE_ARRAY and player_index >= 0 and player_index < showing.size():
-		var mode = str(visible.get("mode", "none"))
-		if mode == "upgrade":
-			var upgrade_to_process = UpgradesUI.UpgradeToProcess.new()
-			upgrade_to_process.level = int(visible.get("level", 0))
-			upgrade_to_process.player_index = player_index
-			showing[player_index] = upgrade_to_process
-		elif mode == "item_box":
-			var consumable_to_process = UpgradesUI.ConsumableToProcess.new()
-			consumable_to_process.player_index = player_index
-			var consumable_state = visible.get("consumable_data", {})
-			if typeof(consumable_state) == TYPE_DICTIONARY:
-				var consumable_data = _resolve_item_parent_data(consumable_state)
-				if consumable_data != null:
-					consumable_to_process.consumable_data = consumable_data
-			showing[player_index] = consumable_to_process
-		ui.set("_showing_option", showing)
-	if container.has_method("focus"):
-		container.call_deferred("focus")
-
-
-func _apply_host_item_box_option_to_container(container: Node, player_index: int, visible: Dictionary) -> bool:
-	var item_state = visible.get("item_data", {})
-	if typeof(item_state) != TYPE_DICTIONARY:
-		return false
-	var item_data = _resolve_item_parent_data(item_state)
-	if item_data == null:
-		return false
-	var consumable_state = visible.get("consumable_data", {})
-	if typeof(consumable_state) == TYPE_DICTIONARY:
-		var consumable_data = _resolve_item_parent_data(consumable_state)
-		if consumable_data != null and container.get("_consumable_data") != null:
-			container.set("_consumable_data", consumable_data)
-	if container.has_method("show_item"):
-		container.show_item(item_data)
-	else:
-		if container.get("_item_data") != null:
-			container.set("_item_data", item_data)
-	return true
 
 
 func _resolve_consumable_data_by_kind(consumable_kind: String):
@@ -3644,7 +3577,6 @@ func _clear_all(reason: String) -> void:
 	_last_entity_resync_request_msec_by_net_id.clear()
 	_pending_entity_resync_requests_by_net_id.clear()
 	_last_entity_resync_batch_send_msec = 0
-	_last_progression_apply_key_by_player.clear()
 	_last_progression_queue_key_by_player.clear()
 	_host_entity_samples.clear()
 	_host_clock_offset_initialized = false

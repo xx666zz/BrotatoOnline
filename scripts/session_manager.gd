@@ -1,6 +1,6 @@
 extends Node
 
-const Protocol = preload("protocol.gd")
+const Protocol = preload("res://mods-unpacked/six666-BrotatoOnline/scripts/protocol.gd")
 
 
 const BROTATO_APP_ID = 1942280
@@ -6825,7 +6825,11 @@ func _build_host_zone_sync_state() -> Dictionary:
 	# In vanilla random-zone mode, the concrete map is kept in settings.zone_selected
 	# until CharacterSelection._on_selections_completed() calls _setup_zone(). Network
 	# clients must receive the concrete map, not re-roll locally.
-	if zone_is_random:
+	if _is_in_active_online_run_scene() or _is_in_official_coop_resume_scene():
+		if _is_in_game_scene() and is_instance_valid(ZoneService.current_zone):
+			current_zone = ZoneService.current_zone.my_id
+		zone_selected = current_zone
+	elif zone_is_random:
 		current_zone = zone_selected
 	return {
 		"current_zone": current_zone,

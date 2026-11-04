@@ -58,6 +58,7 @@ func request(player_index: int, action: String, choice: int = -1) -> void:
 			return
 		message["preview_id"] = str(preview.get("preview_id", ""))
 		message["effect_choice"] = choice
+		message["chosen_effect"] = manager._meca_choice_descriptor(popup._pending_upgrade, choice)
 	manager._submit_local_shop_action(message, player_index, action)
 
 func _weapon(player_index: int, message: Dictionary):
@@ -114,6 +115,8 @@ func apply(player_index: int, action: String, message: Dictionary) -> bool:
 	var cached = previews.get(player_index, {})
 	var choice = int(message.get("effect_choice", -1))
 	if cached.empty() or choice < 0 or choice > 1 or str(message.get("preview_id", "")) != str(cached.preview_id) or int(cached.scene_id) != shop.get_instance_id() or cached.weapon != weapon or not manager._shop_item_matches_stable_identity(weapon, cached.source):
+		return false
+	if not manager._matches_meca_choice(cached.preview, choice, message):
 		return false
 	var upgraded = DLC2Data.change_effect_option_to_modular_effect(cached.preview, choice)
 	# Consume before the native mutation so duplicate confirmations cannot spend twice.

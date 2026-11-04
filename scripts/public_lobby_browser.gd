@@ -1,6 +1,6 @@
 extends Node
 
-const Protocol = preload("protocol.gd")
+const Protocol = preload("res://mods-unpacked/six666-BrotatoOnline/scripts/protocol.gd")
 
 # Steam and LAN discovery share one list; SessionManager remains the only owner
 # of join/leave and gameplay state.

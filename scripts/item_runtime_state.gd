@@ -10,6 +10,11 @@ func fingerprint(data) -> String:
 	var signature = str(data.is_cursed) + ":" + str(data.is_meca) + ":" + str(data.is_mutant) + ":" + str(hash(data.effects)) + ":" + str(data.value) + ":" + str(data.tier)
 	if data is WeaponData:
 		signature += ":" + str(data.meca_rank) + ":" + str(data.meca_power)
+		if data.is_meca:
+			# Array hashes use Resource identity. In-place option edits change what the player sees.
+			for effect in data.effects:
+				if effect is EffectOption:
+					signature += ":" + str(effect.key) + ":" + str(effect.value)
 	var cached = _fingerprints.get(id, {})
 	if not cached.empty() and cached.owner.get_ref() == data and str(cached.signature) == signature:
 		return str(cached.value)

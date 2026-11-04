@@ -1,10 +1,10 @@
 extends Node
 
-const Registry = preload("player_identity_registry.gd")
+const Registry = preload("res://mods-unpacked/six666-BrotatoOnline/scripts/player_identity_registry.gd")
 const STORAGE_DIR = "user://mod_data/six666-BrotatoOnline"
 const CLIENT_FILE = STORAGE_DIR + "/client_identity.cfg"
 const RUN_FILE = STORAGE_DIR + "/saved_identities.cfg"
-const ResumeBridge = preload("../extensions/coop_resume_player_identity.gd")
+const ResumeBridge = preload("res://mods-unpacked/six666-BrotatoOnline/extensions/coop_resume_player_identity.gd")
 var registry = Registry.new()
 var _credentials = ConfigFile.new()
 var _installation_id = ""

@@ -136,8 +136,8 @@ func _make_effect_copy_for_entry(base_effect, entry: Dictionary, properties: Dic
 	var wanted_resource_path = str(entry.get("resource_path", ""))
 	if wanted_resource_path != "" and ResourceLoader.exists(wanted_resource_path):
 		var loaded_effect = load(wanted_resource_path)
-		if loaded_effect != null:
-			return loaded_effect.duplicate() if loaded_effect.has_method("duplicate") else loaded_effect
+		if loaded_effect is Effect and str(entry.get("script_path", _get_script_path(loaded_effect))) == _get_script_path(loaded_effect):
+			return loaded_effect.duplicate()
 
 	var wanted_script_path = str(entry.get("script_path", ""))
 	if wanted_script_path != "":

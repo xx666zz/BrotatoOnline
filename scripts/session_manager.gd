@@ -2864,6 +2864,10 @@ func _broadcast_run_page_action_sync(message: Dictionary, except_steam_id: Strin
 	if message.get("action_type", "") in ["shop_reroll", "shop_dismantle"] and message.has("host_state_after"):
 		message = message.duplicate()
 		message.erase("state_after")
+	if message.has("host_states_after") and not message.host_states_after.empty() and not str(message.get("action_type", "")).begins_with("shop_"):
+		message = message.duplicate()
+		message.erase("host_state_after")
+		message.erase("state_after")
 	for peer_key_value in _get_remote_ids_for_host_sync():
 		var steam_id = str(peer_key_value)
 		if steam_id == "" or steam_id == _self_steam_id:
@@ -3865,6 +3869,8 @@ func _handle_p2p_message(from_steam_id: String, message: Dictionary) -> void:
 			client_content_changed = bool(menu_sync_for_capability.receive_client_content_capability_from_hello(from_steam_id, message))
 		capability_usec = OS.get_ticks_usec() - stage_start_usec
 		stage_start_usec = OS.get_ticks_usec()
+		if first_hello and _is_game_host() and _is_in_game_scene() and menu_sync_for_capability != null:
+			menu_sync_for_capability.refresh_progression_for_join()
 		if first_hello or _is_in_official_coop_resume_scene() or _is_in_game_scene() or _is_in_shop_scene():
 			_mark_full_item_list_scene_sync_required(from_steam_id, "hello")
 		mark_sync_usec = OS.get_ticks_usec() - stage_start_usec

@@ -29,6 +29,9 @@ func fingerprint(data) -> String:
 	_fingerprints[id] = {"owner": weakref(data), "signature": signature, "value": value}
 	return value
 
+func invalidate_resource(data) -> void:
+	_fingerprints.erase(data.get_instance_id())
+
 func invalidate_player(player_index: int) -> void:
 	if player_index < 0 or player_index >= RunData.get_player_count():
 		return

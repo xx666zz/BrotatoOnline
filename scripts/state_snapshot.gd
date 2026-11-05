@@ -1244,33 +1244,12 @@ func _build_visible_progression_option(main: Node, player_index: int) -> Diction
 		return {"mode": "none"}
 	var item_container = container.get("_items_container")
 	var upgrades_container = container.get("_upgrades_container")
+	# Battle snapshots use the panel mode for input repair. Reliable menu state
+	# carries the actual choices, including modded effect data.
 	if _is_canvas_visible(item_container):
-		return {
-			"mode": "item_box",
-			"player_index": player_index,
-			"item_data": _serialize_item_parent_data(container.get("_item_data")),
-			"consumable_data": _serialize_item_parent_data(container.get("_consumable_data"))
-		}
+		return {"mode": "item_box", "player_index": player_index}
 	if _is_canvas_visible(upgrades_container):
-		var upgrades = []
-		var upgrade_uis = []
-		if container.has_method("_get_upgrade_uis"):
-			upgrade_uis = container._get_upgrade_uis()
-		for upgrade_ui in upgrade_uis:
-			if not _is_valid_node(upgrade_ui):
-				continue
-			if upgrade_ui is CanvasItem and not upgrade_ui.visible:
-				continue
-			upgrades.append(_serialize_item_parent_data(upgrade_ui.get("upgrade_data")))
-		return {
-			"mode": "upgrade",
-			"player_index": player_index,
-			"level": int(_safe_get_from_object(container, "_level", 0)),
-			"reroll_price": int(_safe_get_from_object(container, "_reroll_price", 0)),
-			"reroll_count": int(_safe_get_from_object(container, "_reroll_count", 0)),
-			"reroll_discount": int(_safe_get_from_object(container, "_reroll_discount", 0)),
-			"upgrades": upgrades
-		}
+		return {"mode": "upgrade", "player_index": player_index}
 	return {"mode": "none"}
 
 

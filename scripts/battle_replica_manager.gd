@@ -1414,33 +1414,6 @@ func _spawn_display_only_entity(scene_path: String, pos: Vector2, category: Stri
 	return node
 
 
-func _ensure_combat_behavior_parent_links(node: Node) -> void:
-	if not _is_valid_node(node):
-		return
-	var stack = [node]
-	while stack.size() > 0:
-		var cur = stack.pop_back()
-		if not _is_valid_node(cur):
-			continue
-		for child in cur.get_children():
-			if _is_valid_node(child):
-				stack.append(child)
-		if cur == node:
-			continue
-		if not cur.has_method("init"):
-			continue
-		var script = cur.get_script()
-		var script_path = ""
-		if script != null and script is Resource:
-			script_path = str(script.resource_path)
-		var name_lower = str(cur.name).to_lower()
-		var looks_like_behavior = script_path.find("/behaviors/") != -1 or script_path.find("_behavior.gd") != -1 or name_lower.find("behavior") != -1
-		if not looks_like_behavior:
-			continue
-		# Re-init behavior children defensively. Behavior.init(parent) is idempotent for vanilla
-		# MovementBehavior/AttackBehavior/TargetBehavior subclasses and fixes pooled/fallback nodes.
-		cur.call("init", node)
-
 
 func _repair_zero_projectile_speed_for_node(node: Node, category: String, reason: String = "") -> void:
 	# Client-side replicated turrets/structure-like pets must never reach vanilla
@@ -1471,7 +1444,9 @@ func _repair_zero_projectile_speed_for_node(node: Node, category: String, reason
 func _configure_local_combat_entity(node: Node, net_id: String, category: String, state: Dictionary = {}) -> void:
 	if not _is_valid_node(node):
 		return
-	_ensure_combat_behavior_parent_links(node)
+	# Vanilla initializes each behavior with its actual owner. Recursively
+	# reinitializing descendants here binds pet weapon behaviors to the pet.
+	# Pool reuse preserves those owner links; keep them unchanged.
 	var host_motion = _get_entity_sync_mode(category, state) == SYNC_MODE_HOST_MOTION
 	# Enemy/tree/boss drops are local-only visuals on clients. Structures/pets must not spawn
 	# loot just because they now run local logic. Boss covers elites and bosses in Brotato.
@@ -3130,6 +3105,9 @@ func _apply_host_progression_player_state(ui: Node, player_state: Dictionary) ->
 
 	# Reliable menu state owns both reward panels. An older combat snapshot
 	# must not replace an offer or reset the selection on a visible card.
+	var menu = _get_menu_sync_manager()
+	if menu != null:
+		menu.request_missing_reward_state(ui, container, mode)
 	if _progression_container_is_showing_mode(container, mode):
 		_ensure_client_progression_interaction_ready(container, player_index, "battle_snapshot")
 

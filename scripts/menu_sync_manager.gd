@@ -134,6 +134,7 @@ var _pending_client_prime_screen = ""
 var _pending_client_prime_until_msec = 0
 var _last_local_run_page_focus_key = {}
 var _last_local_run_page_state_key_by_player = {}
+var _reward_resource_cache = {}
 var _client_progression_intercept_container_id = 0
 var _processed_run_page_action_ids = {}
 var _last_run_page_action_seq_by_origin = {}
@@ -490,6 +491,7 @@ func _reset_run_page_runtime_state_for_game_start(clear_queued_actions: bool = t
 	_client_progression_intercept_container_id = 0
 	_last_local_run_page_focus_key.clear()
 	_last_local_run_page_state_key_by_player.clear()
+	_reward_resource_cache.clear()
 	_last_progression_options_processed_key = ""
 
 
@@ -614,12 +616,8 @@ func _process(_delta: float) -> void:
 		_poll_shop_page_state_and_intercepts()
 		_bo_ui_diag_log_cost("shop_process_total", t_shop)
 	elif fast_screen == SCREEN_GAME:
-		# main.tscn can show the level-up / item-box overlay after a wave, but it must not
-		# scan selection/catalog/shop trees during battle. Those recursive scans were the
-		# measured 100ms+ client stalls.
-		var t_progression = OS.get_ticks_usec()
-		_poll_progression_page_focus_and_state()
-		_bo_ui_diag_log_cost("progression_process_total", t_progression)
+		# The send-drain timer already polls progression and returns button events immediately.
+		pass
 	else:
 		# Transition / unknown scene: only apply pending authoritative scene changes.
 		pass
@@ -968,7 +966,7 @@ func receive_run_page_action_sync(from_steam_id: String, message: Dictionary, se
 		_attach_progression_marker_state(host_state, player_index, ui)
 		var all_states = _build_all_progression_visible_options(ui, true)
 		if not host_state.empty():
-			_last_local_run_page_state_key_by_player[player_index] = str(player_index) + ":" + to_json(host_state)
+			_last_local_run_page_state_key_by_player[player_index] = _progression_state_key(host_state)
 			if not all_states.empty():
 				host_state["all_player_states"] = all_states
 		return host_state
@@ -6484,6 +6482,8 @@ func _poll_progression_page_focus_and_state() -> void:
 	var ui = _find_progression_ui(true)
 	if not _is_valid_progression_ui_visible(ui):
 		_client_progression_intercept_container_id = 0
+		_reward_resource_cache.clear()
+		_last_local_run_page_state_key_by_player.clear()
 		_last_local_run_page_focus_key.clear()
 		_last_progression_options_processed_key = ""
 		return
@@ -6493,9 +6493,7 @@ func _poll_progression_page_focus_and_state() -> void:
 		_configure_online_focus_emulator_input_owners(host_player_indices, "progression_host")
 		_ensure_host_progression_ban_button_connections(ui)
 		_ensure_host_item_box_take_sync_connection(ui)
-		var player_count = _get_run_player_count()
-		for player_index in range(player_count):
-			_queue_progression_state_if_changed(player_index, ui)
+		_queue_changed_progression_states(ui)
 		# Host-origin focus is emitted only for Host-local players. Remote player focus
 		# is received from that client; rebroadcasting it as Host-origin causes jitter.
 		for host_player_index in host_player_indices:
@@ -6593,33 +6591,47 @@ func _ensure_host_progression_ban_button_connections(ui: Node) -> void:
 			ban_button.connect("button_up", container, "_on_BanButton_button_up")
 
 
-func _queue_progression_state_if_changed(player_index: int, ui: Node = null) -> void:
-	var visible = _build_progression_visible_option(player_index, ui)
-	if visible.empty():
-		return
-	var mode = str(visible.get("mode", "none"))
-	if mode == "none":
-		return
-	# Marker state belongs to the progression page only. Keep it out of focus packets,
-	# but include it in the first option state and every later authoritative state change.
-	_attach_progression_marker_state(visible, player_index, ui)
-	var key = str(player_index) + ":" + to_json(visible)
-	if str(_last_local_run_page_state_key_by_player.get(player_index, "")) == key:
-		return
-	_last_local_run_page_state_key_by_player[player_index] = key
-	var msg = {
-		"msg_type": "run_page_action_sync",
-		"action_type": "upgrade_state",
-		"screen": "progression",
-		"player_index": player_index,
-		"state_after": visible,
-		"host_state_after": visible
-	}
-	var all_states = _build_all_progression_visible_options(ui, true)
-	if not all_states.empty():
-		msg["host_states_after"] = all_states
-	_queue_local_run_page_action(msg)
+func _queue_changed_progression_states(ui: Node) -> void:
+	var changed = []
+	for state in _build_all_progression_visible_options(ui, true):
+		if state.get("mode", "none") == "none":
+			continue
+		var idx = int(state.player_index)
+		var key = _progression_state_key(state)
+		if str(_last_local_run_page_state_key_by_player.get(idx, "")) != key:
+			_last_local_run_page_state_key_by_player[idx] = key
+			changed.append(state)
+	if not changed.empty():
+		_queue_local_run_page_action({"msg_type": "run_page_action_sync", "action_type": "upgrade_state", "screen": "progression", "player_index": changed[0].player_index, "host_states_after": changed})
 
+func refresh_progression_for_join() -> void:
+	_last_local_run_page_state_key_by_player.clear()
+
+# A rejoining client may receive the first reliable update before Main is ready.
+# The next visible-panel heartbeat requests the host's current choices, never an
+# old snapshot's choices. Throttle across all player panels on this UI.
+func request_missing_reward_state(ui: Node, container: Node, mode: String) -> void:
+	if str(container.get_meta("bo_confirmed_reward_mode", "")) == mode:
+		return
+	var idx = _get_local_client_player_index()
+	var now = OS.get_ticks_msec()
+	if idx < 0 or now - int(ui.get_meta("bo_reward_request_msec", -1000)) < 1000:
+		return
+	ui.set_meta("bo_reward_request_msec", now)
+	_queue_local_run_page_action({"msg_type": "run_page_action_sync", "action_type": "upgrade_state_request", "screen": "progression", "player_index": idx})
+
+func _progression_state_key(state: Dictionary) -> String:
+	var summary = state.duplicate()
+	for field in ["item_data", "consumable_data"]:
+		var resource = summary.get(field)
+		if typeof(resource) == TYPE_DICTIONARY and resource.has("bo_reward_key"):
+			summary[field] = resource.bo_reward_key
+	if summary.has("upgrades"):
+		var keys = []
+		for upgrade in summary.upgrades:
+			keys.append(upgrade.get("bo_reward_key", upgrade) if typeof(upgrade) == TYPE_DICTIONARY else upgrade)
+		summary.upgrades = keys
+	return to_json(summary)
 
 func _queue_progression_focus_if_changed(player_index: int, ui: Node = null) -> void:
 	if not _is_valid_progression_ui_visible(ui):
@@ -6633,7 +6645,8 @@ func _queue_progression_focus_if_changed(player_index: int, ui: Node = null) -> 
 	if target == "":
 		return
 	var visible = _build_progression_visible_option(player_index, ui)
-	var key = str(player_index) + ":" + target + ":" + to_json(visible)
+	var state_key = _progression_state_key(visible)
+	var key = str(player_index) + ":" + target + ":" + state_key
 	if key == str(_last_local_run_page_focus_key.get(player_index, "")):
 		return
 	_last_local_run_page_focus_key[player_index] = key
@@ -6643,7 +6656,7 @@ func _queue_progression_focus_if_changed(player_index: int, ui: Node = null) -> 
 		"screen": "progression_upgrade",
 		"player_index": player_index,
 		"target": target,
-		"state_key": to_json(visible)
+		"state_key": state_key
 	}
 	var upgrade_data = _get_upgrade_data_for_progression_target(container, target)
 	if upgrade_data != null:
@@ -6859,7 +6872,7 @@ func _on_client_upgrade_choose_button_pressed(upgrade_data: UpgradeData, player_
 		"upgrade_id_hash": int(_safe_get(upgrade_data, "upgrade_id_hash", _safe_get(upgrade_data, "my_id_hash", 0))),
 		"item_id_hash": int(_safe_get(upgrade_data, "my_id_hash", 0)),
 		"level": int(visible.get("level", 0)),
-		"state_key": to_json(visible)
+		"state_key": _progression_state_key(visible)
 	}
 	_queue_local_run_page_action(msg)
 	_mark_client_progression_button_pressed(player_index)
@@ -6879,7 +6892,7 @@ func _on_client_upgrade_reroll_pressed(player_index: int) -> void:
 		"player_index": player_index,
 		"level": int(visible.get("level", 0)),
 		"reroll_count": int(visible.get("reroll_count", 0)),
-		"state_key": to_json(visible)
+		"state_key": _progression_state_key(visible)
 	})
 
 
@@ -6920,10 +6933,9 @@ func _queue_client_item_box_action(action_type: String, player_index: int) -> vo
 		"chosen_effect": _meca_choice_descriptor(current, choice),
 		"offer_id": str(container.get_meta("bo_box_offer")),
 		"effect_choice": choice,
-		"item": visible.get("item_data", {}),
-		"consumable": visible.get("consumable_data", {}),
+		"item": _serialize_item_parent_identity_for_action(current),
 		"item_id_hash": int(_get_dict_or_empty(visible.get("item_data", {})).get("my_id_hash", 0)),
-		"state_key": to_json(visible)
+		"state_key": _progression_state_key(visible)
 	})
 	_mark_client_progression_button_pressed(player_index)
 	_client_reduce_local_progression_marker(player_index, "item_box", 0)
@@ -7359,16 +7371,21 @@ func _apply_progression_visible_option_to_ui(player_index: int, visible: Diction
 	if mode == "upgrade":
 		_prepare_progression_ui_for_state(ui, container, player_index, visible)
 		var ok = _apply_upgrade_options_to_progression_container(container, player_index, visible)
+		if ok:
+			container.set_meta("bo_confirmed_reward_mode", mode)
 		if ok and not _is_game_host() and player_index == _get_local_client_player_index():
 			ensure_client_progression_interaction_ready(container, player_index, "apply_upgrade_state")
 		return ok
 	elif mode == "item_box":
 		_prepare_progression_ui_for_state(ui, container, player_index, visible)
 		var item_ok = _apply_item_box_option_to_progression_container(container, player_index, visible)
+		if item_ok:
+			container.set_meta("bo_confirmed_reward_mode", mode)
 		if item_ok and not _is_game_host() and player_index == _get_local_client_player_index():
 			ensure_client_progression_interaction_ready(container, player_index, "apply_item_box_state")
 		return item_ok
 	elif mode == "hidden" or mode == "idle" or mode == "none":
+		container.set_meta("bo_confirmed_reward_mode", mode)
 		return _apply_progression_idle_state(ui, container, player_index)
 	return false
 
@@ -7576,6 +7593,38 @@ func _sanitize_current_main_pool(reason: String) -> void:
 		pass
 
 
+# Validate the native serialized fields plus exported effect properties. Mods can
+# edit a visible Resource in place without emitting Resource.changed.
+func _serialize_reward_resource(data) -> Dictionary:
+	if not (data is ItemParentData):
+		return _serialize_item_parent_data(data)
+	var id = data.get_instance_id()
+	var inputs = [data.serialize(), data.resource_path, data.my_id, data.my_id_hash, data.tier, data.value, data.is_cursed, data.curse_factor, data.is_mutant, data.is_meca, data.get_script().resource_path]
+	if data is WeaponData:
+		inputs.append([data.weapon_id, data.weapon_id_hash, data.dmg_dealt_last_wave, data.tracked_value, data.meca_rank, data.meca_power])
+	elif data is UpgradeData:
+		inputs.append([data.upgrade_id, data.upgrade_id_hash, data.name, _get_resource_path(data.icon)])
+	var sync = _get_upgrade_runtime_sync()
+	if sync != null:
+		for effect in data.effects:
+			if effect == null:
+				continue
+			inputs.append([sync._get_script_path(effect), effect.resource_path])
+			for prop in sync._get_syncable_effect_properties(effect):
+				inputs.append(effect.get(prop.name))
+	var stamp = var2bytes(inputs)
+	var cached = _reward_resource_cache.get(id, {})
+	if not cached.empty() and cached.owner.get_ref() == data and cached.stamp == stamp:
+		return cached.state
+	# An in-place edit may leave the general shop fingerprint's fast signature unchanged.
+	_item_runtime_state.invalidate_resource(data)
+	var state = _serialize_item_parent_data(data).duplicate(true)
+	state["bo_reward_key"] = to_json(state).sha256_text()
+	if _reward_resource_cache.size() >= 128:
+		_reward_resource_cache.clear()
+	_reward_resource_cache[id] = {"owner": weakref(data), "stamp": stamp, "state": state}
+	return state
+
 func _build_progression_visible_option(player_index: int, ui: Node = null) -> Dictionary:
 	if not _is_live_ref(ui):
 		ui = _find_progression_ui(true)
@@ -7596,8 +7645,8 @@ func _build_progression_visible_option(player_index: int, ui: Node = null) -> Di
 			"mode": "item_box",
 			"offer_id": str(container._item_data.get_instance_id()) + ":" + str(ui._showing_option[player_index].get_instance_id()) if is_instance_valid(container._item_data) and is_instance_valid(ui._showing_option[player_index]) else "",
 			"player_index": player_index,
-			"item_data": _serialize_item_parent_data(container.get("_item_data")),
-			"consumable_data": _serialize_item_parent_data(container.get("_consumable_data"))
+			"item_data": _serialize_reward_resource(container.get("_item_data")),
+			"consumable_data": _serialize_reward_resource(container.get("_consumable_data"))
 		}
 	if _is_canvas_visible(upgrades_container):
 		var upgrades = []
@@ -7609,7 +7658,7 @@ func _build_progression_visible_option(player_index: int, ui: Node = null) -> Di
 				continue
 			if upgrade_ui is CanvasItem and not bool(upgrade_ui.visible):
 				continue
-			upgrades.append(_serialize_item_parent_data(upgrade_ui.get("upgrade_data")))
+			upgrades.append(_serialize_reward_resource(upgrade_ui.get("upgrade_data")))
 		return {
 			"mode": "upgrade",
 			"player_index": player_index,

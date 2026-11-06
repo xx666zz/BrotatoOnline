@@ -577,6 +577,9 @@ func has_host_catalog_for_screen(screen: String) -> bool:
 
 
 func _ready() -> void:
+	# Shop UI and the session transport keep running while the tree is paused.
+	# Keep polling too, so entering a paused shop still installs purchase observers.
+	pause_mode = Node.PAUSE_MODE_PROCESS
 	set_process(true)
 
 func _process(_delta: float) -> void:

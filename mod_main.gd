@@ -11,7 +11,6 @@ func _init() -> void:
 	ModLoaderMod.install_script_extension(mod_dir_path.plus_file("extensions/item_service_session_content.gd"))
 	ModLoaderMod.install_script_extension(mod_dir_path.plus_file("extensions/gpe_layout.gd"))
 	ModLoaderMod.install_script_extension(mod_dir_path.plus_file("extensions/dig_sites.gd"))
-	ModLoaderMod.install_script_extension(mod_dir_path.plus_file("extensions/enemy_evolution.gd"))
 	ModLoaderMod.install_script_extension(mod_dir_path.plus_file("extensions/long_description_input.gd"))
 	ModLoaderMod.install_script_extension(mod_dir_path.plus_file("extensions/wave_mutations.gd"))
 	_install_player_local_outline_extension()
@@ -20,7 +19,6 @@ func _init() -> void:
 	_install_follow_target_safe_parent_extension()
 	_install_player_safe_room_cleanup_extension()
 	_install_player_projectile_safe_speed_extension()
-	ModLoaderMod.install_script_extension(mod_dir_path.plus_file("extensions/jellyshield_safe_owner.gd"))
 	_install_stats_manager_safe_queues_extension()
 	_install_focus_emulator_safe_disconnect_extension()
 	_install_shop_item_lock_event_extension()
@@ -131,6 +129,7 @@ func _install_player_local_outline_extension() -> void:
 		pass
 
 func _ready() -> void:
+	_install_enemy_evolution_extension()
 
 	# 子弹、命中、伤害跳字、死亡表现逐步改为 Host presentation event 驱动。
 	_add_i18n_manager()
@@ -157,6 +156,33 @@ func _ready() -> void:
 	_add_player_list_overlay_manager()
 	_add_pause_focus_alias_manager()
 
+
+
+func _install_enemy_evolution_extension() -> void:
+	# Wait until base extensions are installed: loading this earlier retains
+	# Enemy/Boss while ModLoader reloads their compiled inheritance chains.
+	var parent_path = "res://effect_behaviors/scenes/evolution_scene_effect_behavior.gd"
+	var original_script = load(parent_path)
+	ModLoaderMod.install_script_extension(mod_dir_path.plus_file("extensions/enemy_evolution.gd"))
+	var final_script = load(parent_path)
+
+	# Autoloads may already hold the scene. Update only its script reference,
+	# preserving exported values, child nodes and persistent connections.
+	# The native behavior still creates and owns its original signal connection.
+	for data in EffectBehaviorService.scene_effect_behaviors:
+		if data == null or not (data.scene is PackedScene):
+			continue
+		var scene = data.scene
+		var bundle = scene.get("_bundled").duplicate(true)
+		var variants = bundle.get("variants", [])
+		var changed = false
+		for i in variants.size():
+			if variants[i] is Script and variants[i] == original_script:
+				variants[i] = final_script
+				changed = true
+		if changed:
+			bundle["variants"] = variants
+			scene.set("_bundled", bundle)
 
 func _add_i18n_manager() -> void:
 	_add_script_node(

@@ -64,8 +64,7 @@ func request(player_index: int, action: String, choice: int = -1) -> void:
 func _weapon(player_index: int, message: Dictionary):
 	var weapons = RunData.get_player_weapons(player_index)
 	var index = int(message.get("weapon_slot_index", -1))
-	var identity = message.get("item_identity", {})
-	if index < 0 or index >= weapons.size() or not manager._shop_item_matches_stable_identity(weapons[index], identity):
+	if index < 0 or index >= weapons.size():
 		return null
 	return weapons[index]
 
@@ -98,7 +97,7 @@ func apply(player_index: int, action: String, message: Dictionary) -> bool:
 	var identity = manager._build_shop_item_stable_identity(weapon)
 	if action == "shop_meca_preview":
 		var cached = previews.get(player_index, {})
-		if cached.empty() or int(cached.get("scene_id", 0)) != shop.get_instance_id() or cached.get("weapon", null) != weapon or not manager._shop_item_matches_stable_identity(weapon, cached.get("source", {})):
+		if cached.empty() or int(cached.get("scene_id", 0)) != shop.get_instance_id() or cached.get("weapon", null) != weapon or int(cached.get("slot", -1)) != int(message.get("weapon_slot_index", -1)):
 			var preview = dlc.meca_item(weapon, player_index)
 			var option_count = 0
 			for effect in preview.effects:
@@ -106,7 +105,7 @@ func apply(player_index: int, action: String, message: Dictionary) -> bool:
 					option_count += 1
 			if option_count != 2:
 				return false
-			cached = {"scene_id": shop.get_instance_id(), "weapon": weapon, "source": identity, "preview": preview, "preview_id": str(shop.get_instance_id()) + ":" + str(OS.get_ticks_usec())}
+			cached = {"scene_id": shop.get_instance_id(), "slot": int(message.get("weapon_slot_index", -1)), "weapon": weapon, "source": identity, "preview": preview, "preview_id": str(shop.get_instance_id()) + ":" + str(OS.get_ticks_usec())}
 			previews[player_index] = cached
 		message["meca_upgrade_preview"] = {"source": cached.source, "preview_id": cached.preview_id, "weapon": manager._serialize_item_parent_data(cached.preview)}
 		return true
@@ -114,9 +113,7 @@ func apply(player_index: int, action: String, message: Dictionary) -> bool:
 		return false
 	var cached = previews.get(player_index, {})
 	var choice = int(message.get("effect_choice", -1))
-	if cached.empty() or choice < 0 or choice > 1 or str(message.get("preview_id", "")) != str(cached.preview_id) or int(cached.scene_id) != shop.get_instance_id() or cached.weapon != weapon or not manager._shop_item_matches_stable_identity(weapon, cached.source):
-		return false
-	if not manager._matches_meca_choice(cached.preview, choice, message):
+	if cached.empty() or choice < 0 or choice > 1 or str(message.get("preview_id", "")) != str(cached.preview_id) or int(cached.scene_id) != shop.get_instance_id() or cached.weapon != weapon or int(cached.get("slot", -1)) != int(message.get("weapon_slot_index", -1)):
 		return false
 	var upgraded = DLC2Data.change_effect_option_to_modular_effect(cached.preview, choice)
 	# Consume before the native mutation so duplicate confirmations cannot spend twice.

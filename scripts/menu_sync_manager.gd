@@ -2347,7 +2347,7 @@ func _apply_shop_buy_action(player_index: int, message: Dictionary) -> bool:
 				options += 1
 		if options > 0:
 			var choice = int(message.get("effect_choice", -1))
-			if options != 2 or not _matches_meca_choice(resolved_item_data, choice, message):
+			if options != 2 or not choice in [0, 1]:
 				return false
 			shop_item.effect_choice_selected = choice
 	message["resolved_shop_index"] = _get_shop_item_index(shop_item, player_index)
@@ -6799,7 +6799,8 @@ func _ensure_local_progression_focus(container: Node, player_index: int, reason:
 
 	var current = _safe_get(focus_emulator, "focused_control", null)
 	if _is_live_ref(current) and current is Control and current.is_visible_in_tree() and _safe_node_is_parent_of(container, current):
-		return
+		if not (current is BaseButton and current.disabled):
+			return
 
 	var target = _get_default_progression_focus_control(container)
 	if not _is_live_ref(target):
@@ -6820,7 +6821,7 @@ func _get_default_progression_focus_control(container: Node):
 			if _is_live_ref(first_choice) and first_choice.is_visible_in_tree():
 				return first_choice
 		var take_button = _safe_get(container, "_take_button", null)
-		if _is_live_ref(take_button) and take_button is Control and take_button.is_visible_in_tree():
+		if _is_live_ref(take_button) and take_button is Control and take_button.is_visible_in_tree() and not bool(_safe_get(take_button, "disabled", false)):
 			return take_button
 		var discard_button = _safe_get(container, "_discard_button", null)
 		if _is_live_ref(discard_button) and discard_button is Control and discard_button.is_visible_in_tree():
@@ -6917,11 +6918,9 @@ func _queue_client_item_box_action(action_type: String, player_index: int) -> vo
 	if str(visible.get("mode", "")) != "item_box":
 		return
 	var container = _get_progression_player_container(_find_progression_ui(), player_index)
-	if not _is_live_ref(container) or not container.has_meta("bo_box_offer"):
+	if not _is_live_ref(container):
 		return
 	var current = container._item_data
-	if not _shop_item_matches_stable_identity(current, container.get_meta("bo_box_identity")):
-		return
 	var choice = int(container._meca_effect_choice_selected)
 	if action_type == "item_box_take" and container._needs_meca_effect_choice() and not choice in [0, 1]:
 		return
@@ -6931,7 +6930,6 @@ func _queue_client_item_box_action(action_type: String, player_index: int) -> vo
 		"screen": "progression_item_box",
 		"player_index": player_index,
 		"chosen_effect": _meca_choice_descriptor(current, choice),
-		"offer_id": str(container.get_meta("bo_box_offer")),
 		"effect_choice": choice,
 		"item": _serialize_item_parent_identity_for_action(current),
 		"item_id_hash": int(_get_dict_or_empty(visible.get("item_data", {})).get("my_id_hash", 0)),
@@ -7202,8 +7200,6 @@ func _apply_progression_item_box_action(player_index: int, message: Dictionary, 
 		return false
 	var offer = _build_progression_visible_option(player_index, ui)
 	var current_mode = str(offer.get("mode", ""))
-	if str(message.get("offer_id", "")) != "" and str(message.offer_id) != str(offer.get("offer_id", "")):
-		return false
 	if current_mode != "item_box":
 		return false
 	var current_item = _safe_get(container, "_item_data", null)
@@ -7213,7 +7209,7 @@ func _apply_progression_item_box_action(player_index: int, message: Dictionary, 
 	if kind == "take" and container.has_method("_on_TakeButton_pressed"):
 		if container._needs_meca_effect_choice():
 			var choice = int(message.get("effect_choice", -1))
-			if not choice in [0, 1] or not _matches_meca_choice(current_item, choice, message):
+			if not choice in [0, 1]:
 				return false
 			container._meca_effect_choice_selected = choice
 		container._on_TakeButton_pressed()
@@ -11795,26 +11791,14 @@ func _get_shop_item_identity_key(data) -> String:
 
 
 func _shop_item_matches_stable_identity(data, identity) -> bool:
-	if not _shop_item_matches_stable_identity_base(data, identity):
-		return false
-	return not identity.has("runtime_key") or str(identity.runtime_key) == _item_runtime_state.fingerprint(data)
+	return _shop_item_matches_stable_identity_base(data, identity)
 
 
 func _shop_item_matches_action(node, message: Dictionary) -> bool:
-	var identity = message.get("item", {})
-	if typeof(identity) == TYPE_DICTIONARY and identity.has("runtime_key"):
-		if not _is_live_ref(node) or str(identity.runtime_key) != _item_runtime_state.fingerprint(_safe_get(node, "item_data", null)):
-			return false
 	return _shop_item_matches_action_base(node, message)
 
 
 func _find_player_weapon_for_shop_action(player_index: int, message: Dictionary):
-	var identity = message.get("weapon", {})
-	if typeof(identity) == TYPE_DICTIONARY and identity.has("runtime_key"):
-		for weapon in RunData.get_player_weapons(player_index):
-			if _shop_item_matches_stable_identity(weapon, identity):
-				return weapon
-		return null
 	return _find_player_weapon_for_shop_action_base(player_index, message)
 
 

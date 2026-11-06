@@ -1075,6 +1075,12 @@ func _ensure_shop_focus_event_wiring(shop: Node, player_index: int) -> bool:
 	var key = str(shop.get_instance_id()) + ":" + str(focus_emulator.get_instance_id())
 	if key == str(_shop_focus_wiring_key_by_player.get(player_index, "")):
 		return true
+	# Temporary DLC workaround: coop places mecha parts below the shop items.
+	# Keep any upward route supplied by a future game update or another mod.
+	if RunData.is_coop_run and shop.has_method("_get_meca_parts_ui"):
+		var parts = shop._get_meca_parts_ui(player_index)
+		if _is_live_ref(parts) and parts is Control and parts.focus_neighbour_top == NodePath("."):
+			parts.focus_neighbour_top = NodePath("")
 	if not focus_emulator.is_connected("bo_focused_control_changed", self, "_on_shop_focused_control_changed"):
 		focus_emulator.connect("bo_focused_control_changed", self, "_on_shop_focused_control_changed", [player_index])
 	_shop_focus_wiring_key_by_player[player_index] = key

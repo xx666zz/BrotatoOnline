@@ -4,8 +4,8 @@
 
 > 为《Brotato》提供远程联机与局域网联机支持，采用Host主导的混合同步方案。
 
-![Brotato](https://img.shields.io/badge/Brotato-1.1.15.4-6c5ce7)
-![ModLoader](https://img.shields.io/badge/ModLoader-6.2.0-0984e3)
+![Brotato](https://img.shields.io/badge/Brotato-1.2.0.1-6c5ce7)
+![ModLoader](https://img.shields.io/badge/ModLoader-6.3.0-0984e3)
 ![Players](https://img.shields.io/badge/Players-1--4-00b894)
 ![License](https://img.shields.io/badge/License-GPL--3.0-f39c12)
 

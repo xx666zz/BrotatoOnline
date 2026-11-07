@@ -182,6 +182,7 @@ var _run_page_game_start_guard_logged_key = ""
 var _client_scene_change_in_flight_screen = ""
 var _client_scene_change_in_flight_path = ""
 var _client_scene_change_in_flight_until_msec = 0
+var _client_last_applied_game_scene_start_id = 0
 var _client_scene_change_in_flight_logged_key = ""
 var _shop_inventory_custom_button_popup_key_by_player = {}
 var _shop_inventory_custom_button_connected_keys = {}
@@ -496,6 +497,7 @@ func _reset_run_page_runtime_state_for_game_start(clear_queued_actions: bool = t
 
 
 func reset_online_session_state(reason: String = "") -> void:
+	_client_last_applied_game_scene_start_id = 0
 	_restore_local_content_configuration()
 	# Full per-room cleanup. This intentionally does not modify the player's real save data;
 	# it only clears transient online mirrors, Host catalogs, pending authoritative states,
@@ -577,6 +579,9 @@ func has_host_catalog_for_screen(screen: String) -> bool:
 
 
 func _ready() -> void:
+	# Shop UI and the session transport keep running while the tree is paused.
+	# Keep polling too, so entering a paused shop still installs purchase observers.
+	pause_mode = Node.PAUSE_MODE_PROCESS
 	set_process(true)
 
 func _process(_delta: float) -> void:
@@ -8667,6 +8672,17 @@ func _apply_menu_scene_state_from_host(state: Dictionary) -> bool:
 	var run_config = state.get("run_config", {})
 	var run_config_key = target_screen + "|" + to_json(run_config)
 	var force_scene_reload = bool(state.get("force_scene_reload", false))
+	var game_start_sync = state.get("game_start_sync", {})
+	var scene_start_id = int(game_start_sync.get("start_id", 0)) if typeof(game_start_sync) == TYPE_DICTIONARY else 0
+	if scene_start_id <= 0 and typeof(run_config) == TYPE_DICTIONARY:
+		scene_start_id = int(run_config.get("retry_start_id", 0))
+	# RetryWave reloads the same path as the failed battle. A new generation must
+	# bypass the previous scene's in-flight window, but an already applied generation
+	# must remain idempotent even after that window expires. Ignore stale retries
+	# before applying their RunData as well as before reloading their scene.
+	if target_screen == SCREEN_GAME and force_scene_reload and scene_start_id > 0 and scene_start_id <= _client_last_applied_game_scene_start_id:
+		return true
+	var fresh_game_reload = target_screen == SCREEN_GAME and force_scene_reload and scene_start_id > _client_last_applied_game_scene_start_id
 	var current_screen = get_current_menu_screen()
 	var current_scene_path = _get_current_scene_resource_path()
 	var now = OS.get_ticks_msec()
@@ -8676,7 +8692,7 @@ func _apply_menu_scene_state_from_host(state: Dictionary) -> bool:
 	# while the first change_scene() is still in flight. This must be suppressed for
 	# shop as well as game: reloading CoopShop during reconnect can overwrite the
 	# authoritative Host shop_state that was just applied, making shop items diverge.
-	if _client_scene_change_in_flight_screen == target_screen and _client_scene_change_in_flight_path == target_scene_path and now < _client_scene_change_in_flight_until_msec:
+	if not fresh_game_reload and _client_scene_change_in_flight_screen == target_screen and _client_scene_change_in_flight_path == target_scene_path and now < _client_scene_change_in_flight_until_msec:
 		if typeof(run_config) == TYPE_DICTIONARY and run_config_key != _last_applied_run_config_key:
 			_apply_run_config_before_client_scene_change(run_config, target_screen)
 			_last_applied_run_config_key = run_config_key
@@ -8708,6 +8724,8 @@ func _apply_menu_scene_state_from_host(state: Dictionary) -> bool:
 		return true
 
 	var apply_key = target_screen + "|" + target_scene_path + "|" + to_json(run_config)
+	if target_screen == SCREEN_GAME and scene_start_id > 0:
+		apply_key += "|start_id=" + str(scene_start_id)
 	if apply_key == _last_client_scene_apply_key and now - _last_client_scene_apply_msec < MENU_SCENE_APPLY_DEBOUNCE_MSEC:
 		return false
 
@@ -8727,13 +8745,15 @@ func _apply_menu_scene_state_from_host(state: Dictionary) -> bool:
 	# focus_emulator.gd _disconnect_focused_control(null/invalid).
 	_clear_focus_emulators_before_client_scene_change(current_screen, target_screen)
 
+	var err = get_tree().change_scene(target_scene_path)
+	if err != OK:
+		return false
 	_client_scene_change_in_flight_screen = target_screen
 	_client_scene_change_in_flight_path = target_scene_path
 	_client_scene_change_in_flight_until_msec = now + MENU_SCENE_CHANGE_IN_FLIGHT_MSEC
 	_client_scene_change_in_flight_logged_key = ""
-	var err = get_tree().change_scene(target_scene_path)
-	if err != OK:
-		return false
+	if target_screen == SCREEN_GAME and scene_start_id > 0:
+		_client_last_applied_game_scene_start_id = max(_client_last_applied_game_scene_start_id, scene_start_id)
 
 	# 切完场景后，selection_state / availability / shop_state 可能已经先收到；保留 pending，让新场景 ready 后再套 UI 显示。
 	_queue_availability_from_menu_scene_state(state)

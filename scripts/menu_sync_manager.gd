@@ -8676,13 +8676,16 @@ func _apply_menu_scene_state_from_host(state: Dictionary) -> bool:
 	var scene_start_id = int(game_start_sync.get("start_id", 0)) if typeof(game_start_sync) == TYPE_DICTIONARY else 0
 	if scene_start_id <= 0 and typeof(run_config) == TYPE_DICTIONARY:
 		scene_start_id = int(run_config.get("retry_start_id", 0))
+	# Only local scene-recovery logic may retry an already applied generation.
+	# Older start IDs always remain stale, even if a recovery flag is present.
+	var scene_recovery_reload = target_screen == SCREEN_GAME and force_scene_reload and bool(state.get("scene_recovery_reload", false)) and scene_start_id > 0 and scene_start_id == _client_last_applied_game_scene_start_id
 	# RetryWave reloads the same path as the failed battle. A new generation must
 	# bypass the previous scene's in-flight window, but an already applied generation
 	# must remain idempotent even after that window expires. Ignore stale retries
 	# before applying their RunData as well as before reloading their scene.
-	if target_screen == SCREEN_GAME and force_scene_reload and scene_start_id > 0 and scene_start_id <= _client_last_applied_game_scene_start_id:
+	if target_screen == SCREEN_GAME and force_scene_reload and scene_start_id > 0 and scene_start_id <= _client_last_applied_game_scene_start_id and not scene_recovery_reload:
 		return true
-	var fresh_game_reload = target_screen == SCREEN_GAME and force_scene_reload and scene_start_id > _client_last_applied_game_scene_start_id
+	var fresh_game_reload = target_screen == SCREEN_GAME and force_scene_reload and (scene_start_id > _client_last_applied_game_scene_start_id or scene_recovery_reload)
 	var current_screen = get_current_menu_screen()
 	var current_scene_path = _get_current_scene_resource_path()
 	var now = OS.get_ticks_msec()

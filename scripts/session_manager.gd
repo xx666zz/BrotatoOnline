@@ -84,7 +84,13 @@ const CLIENT_STALE_MENU_GUARD_MSEC = 10000
 const GAME_START_ACK_TIMEOUT_MSEC = 1200
 const GAME_START_MAX_WAIT_MSEC = 2200
 const GAME_START_READY_TIMEOUT_MSEC = 4500
+# Back off unacknowledged commit resends without ever abandoning a connected peer.
 const GAME_START_RECOVERY_INTERVAL_MSEC = 1000
+const GAME_START_RECOVERY_MAX_INTERVAL_MSEC = 12000
+# A scene that did not finish creating its players can be reloaded at most twice.
+const CLIENT_GAME_SCENE_READY_RECOVERY_MSEC = 8000
+const CLIENT_GAME_SCENE_MAX_RECOVERY_RELOADS = 2
+const HOST_BATTLE_CATCHUP_RETRY_INTERVAL_MSEC = 750
 const CLIENT_BATTLE_SNAPSHOT_LOG_INTERVAL_MSEC = 5000
 const CLIENT_BATTLE_SNAPSHOT_LOG_FIRST_COUNT = 1
 const AUTO_CREATE_LOBBY_ON_OFFICIAL_COOP_CONTINUE = true
@@ -224,6 +230,7 @@ var _host_game_start_ack_by_steam_id = {}
 var _host_game_start_ready_by_steam_id = {}
 var _host_unconfirmed_game_start_by_peer = {}
 var _host_game_start_recovery_sent_msec = {}
+var _host_game_start_recovery_attempts_by_peer = {}
 var _host_pending_battle_catchup_by_peer = {}
 var _pending_client_game_start_commit = {}
 var _pending_client_game_start_apply_msec = 0
@@ -235,6 +242,10 @@ var _client_ignore_stale_menu_until_msec = 0
 var _client_last_game_scene_apply_msec = 0
 var _pending_client_game_scene_ready_start_id = 0
 var _sent_client_game_scene_ready_start_id = 0
+var _client_game_start_commit_for_scene_recovery = {}
+var _client_game_scene_ready_wait_since_msec = 0
+var _client_game_scene_recovery_reload_count = 0
+var _client_game_scene_recovery_exhausted_logged = false
 var _local_run_page_action_seq = 0
 var _lobby_toggle_button = null
 var _lobby_toggle_panel = null
@@ -2663,6 +2674,11 @@ func _poll_and_send_local_client_battle_input() -> void:
 
 	if input_manager == null or not input_manager.has_method("consume_local_battle_input_messages"):
 		return
+	# consume_local_battle_input_messages() updates its last-sent key/tick.
+	# Sampling before scene-ready would silently discard the first new-scene input.
+	# Do not buffer or replay old-scene movement; sample the current input on ready.
+	if _is_client_game_scene_start_pending():
+		return
 
 	var messages = input_manager.consume_local_battle_input_messages()
 	if typeof(messages) != TYPE_ARRAY:
@@ -2957,6 +2973,10 @@ func _reset_transient_online_state_for_new_session(reason: String = "") -> void:
 	_client_last_game_scene_apply_msec = 0
 	_pending_client_game_scene_ready_start_id = 0
 	_sent_client_game_scene_ready_start_id = 0
+	_client_game_start_commit_for_scene_recovery.clear()
+	_client_game_scene_ready_wait_since_msec = 0
+	_client_game_scene_recovery_reload_count = 0
+	_client_game_scene_recovery_exhausted_logged = false
 	var menu_sync = _get_menu_sync_manager()
 	if menu_sync != null and menu_sync.has_method("reset_online_session_state"):
 		menu_sync.reset_online_session_state(reason)
@@ -3067,9 +3087,20 @@ func _should_drop_stale_client_battle_packet(from_steam_id: String, message: Dic
 	if not _is_client_to_host_battle_message_type(msg_type):
 		return false
 	if _host_unconfirmed_game_start_by_peer.has(from_steam_id):
-		# A timed-out client may still report the previous failed scene. Its battle
-		# data is not valid until it confirms loading the new generation.
-		return true
+		# The scene-ready ACK travels on the menu channel and can lag behind battle
+		# input. A valid current-generation movement packet is independent evidence
+		# that this client's new battle scene has loaded. Never accept an old start_id,
+		# a wrong player slot, or input while Host is still loading its own scene.
+		var unconfirmed = _host_unconfirmed_game_start_by_peer[from_steam_id]
+		var start_id = int(unconfirmed.get("start_id", 0))
+		var can_confirm_from_input = msg_type == "battle_input" and start_id > 0 and _pending_host_game_start.empty() and start_id == _host_current_battle_start_id
+		if can_confirm_from_input and _is_in_game_scene() and not _is_host_main_terminal_or_retry_state() and _extract_battle_start_id(message) == start_id:
+			var player_index = bo_api_get_player_index_for_steam_id(from_steam_id)
+			var packet_context = str(message.get("battle_retry_context_key", ""))
+			if player_index >= 0 and player_index == int(message.get("player_index", -1)) and (_host_current_retry_context_key == "" or packet_context == _host_current_retry_context_key):
+				_handle_client_game_scene_ready(from_steam_id, {"start_id": start_id})
+		if _host_unconfirmed_game_start_by_peer.has(from_steam_id):
+			return true
 	if not _pending_host_game_start.empty() and str(_pending_host_game_start.get("start_kind", "")) == "retry_wave":
 		return true
 	if _host_retry_first_snapshot_needs_gate():
@@ -3257,19 +3288,24 @@ func send_menu_message_to_host(message: Dictionary) -> void:
 	_send_p2p_json(owner_id, message, true)
 
 
+func _is_client_game_scene_start_pending() -> bool:
+	if _pending_client_game_scene_ready_start_id > 0:
+		return true
+	if not _pending_client_game_start_commit.empty() or not _pending_client_game_start_deferred_commit.empty():
+		return true
+	return _client_expected_battle_start_id > 0 and _client_active_battle_start_id != _client_expected_battle_start_id
+
+
 func send_battle_message_to_host(message: Dictionary, reliable: bool = true) -> bool:
 	if not _session_active:
 		return false
 	if _is_game_host():
 		return false
-	if _pending_client_game_scene_ready_start_id > 0 or not _pending_client_game_start_commit.empty() or not _pending_client_game_start_deferred_commit.empty():
+	# Never stamp a previous scene's one-shot battle event with the new start_id.
+	# Only scene-ready activates the new generation. The latest movement sample is
+	# acquired after ready by _poll_and_send_local_client_battle_input().
+	if _is_client_game_scene_start_pending():
 		return false
-	var msg_type = str(message.get("msg_type", ""))
-	if _is_client_to_host_battle_message_type(msg_type) and int(_client_expected_battle_start_id) > 0 and int(_client_active_battle_start_id) != int(_client_expected_battle_start_id):
-		var now = OS.get_ticks_msec()
-		if now < _client_battle_start_fence_until_msec:
-			return false
-		_activate_client_battle_generation_for_send(_client_expected_battle_start_id, _client_expected_battle_start_kind, _client_expected_retry_context_key, "send_fence_expired")
 	var owner_id = _get_game_host_steam_id()
 	if owner_id == "":
 		return false
@@ -4246,7 +4282,14 @@ func _handle_battle_entity_resync_request(from_steam_id: String, message: Dictio
 func _reset_game_start_sync_state() -> void:
 	_host_unconfirmed_game_start_by_peer.clear()
 	_host_game_start_recovery_sent_msec.clear()
+	_host_game_start_recovery_attempts_by_peer.clear()
 	_host_pending_battle_catchup_by_peer.clear()
+	_client_game_start_commit_for_scene_recovery.clear()
+	_client_game_scene_ready_wait_since_msec = 0
+	_client_game_scene_recovery_reload_count = 0
+	_client_game_scene_recovery_exhausted_logged = false
+	_pending_client_game_scene_ready_start_id = 0
+	_sent_client_game_scene_ready_start_id = 0
 	_host_difficulty_intercept_selection_id = 0
 	_pending_host_game_start = {}
 	_host_game_start_ack_by_steam_id.clear()
@@ -5754,12 +5797,17 @@ func _handle_client_game_scene_ready(from_steam_id: String, message: Dictionary)
 		return
 	_host_unconfirmed_game_start_by_peer.erase(from_steam_id)
 	_host_game_start_recovery_sent_msec.erase(from_steam_id)
+	_host_game_start_recovery_attempts_by_peer.erase(from_steam_id)
 	if start_id == int(_pending_host_game_start.get("start_id", -1)):
 		_host_game_start_ready_by_steam_id[from_steam_id] = message.duplicate(true)
 	elif start_id == _host_current_battle_start_id:
 		# The host may already be fighting after its scene-ready timeout. Late clients
 		# need existing birth-only enemies too, not just future spawn events.
-		_host_pending_battle_catchup_by_peer[from_steam_id] = start_id
+		_host_pending_battle_catchup_by_peer[from_steam_id] = {
+			"start_id": start_id,
+			"reliable_queued": false,
+			"next_retry_msec": 0
+		}
 
 
 func _poll_host_game_start_recovery() -> void:
@@ -5775,37 +5823,52 @@ func _poll_host_game_start_recovery() -> void:
 		if int(commit.get("start_id", 0)) != current_id:
 			_host_unconfirmed_game_start_by_peer.erase(peer)
 			_host_game_start_recovery_sent_msec.erase(peer)
+			_host_game_start_recovery_attempts_by_peer.erase(peer)
 			continue
 		if not _connection_by_peer_key.has(peer):
 			continue
-		if now - int(_host_game_start_recovery_sent_msec.get(peer, 0)) < GAME_START_RECOVERY_INTERVAL_MSEC:
+		var attempts = int(_host_game_start_recovery_attempts_by_peer.get(peer, 0))
+		var interval = int(min(GAME_START_RECOVERY_MAX_INTERVAL_MSEC, GAME_START_RECOVERY_INTERVAL_MSEC * pow(2.0, float(min(attempts, 4)))))
+		if now - int(_host_game_start_recovery_sent_msec.get(peer, 0)) < interval:
 			continue
-		# Do not enqueue another large start config while the previous one is queued.
+		# Do not enqueue another large start config while a menu command is queued.
 		if _has_pending_p2p_send_for_target_channel(peer, _get_p2p_channel_for_message_type("game_start_commit")):
 			continue
 		_host_game_start_recovery_sent_msec[peer] = now
-		_send_p2p_json(peer, commit, true)
+		if _send_p2p_json(peer, commit, true):
+			_host_game_start_recovery_attempts_by_peer[peer] = min(attempts + 1, 4)
 	if pending_id > 0 or _is_host_retry_battle_send_warmup_blocked():
 		return
 	for peer in _host_pending_battle_catchup_by_peer.keys():
-		if int(_host_pending_battle_catchup_by_peer[peer]) != current_id:
+		var catchup = _host_pending_battle_catchup_by_peer[peer]
+		if typeof(catchup) != TYPE_DICTIONARY or int(catchup.get("start_id", 0)) != current_id:
 			_host_pending_battle_catchup_by_peer.erase(peer)
 			continue
-		if _connection_by_peer_key.has(peer) and _send_current_battle_catchup(peer):
+		if not _connection_by_peer_key.has(peer) or now < int(catchup.get("next_retry_msec", 0)):
+			continue
+		catchup["next_retry_msec"] = now + HOST_BATTLE_CATCHUP_RETRY_INTERVAL_MSEC
+		if _send_current_battle_catchup(peer, catchup):
 			_host_pending_battle_catchup_by_peer.erase(peer)
 
 
-func _send_current_battle_catchup(peer: String) -> bool:
+func _send_current_battle_catchup(peer: String, catchup: Dictionary) -> bool:
 	var snapshot_manager = _get_state_snapshot_manager()
 	if snapshot_manager == null:
 		return false
 	var snapshot = snapshot_manager.force_fresh_snapshot_message()
 	if snapshot.empty() or not _host_retry_allow_first_fresh_snapshot(snapshot):
 		return false
-	var payload = snapshot_manager.build_battle_entity_resync_payload(snapshot.get("active_entity_ids", []))
-	var events = _make_battle_reliable_events_message(snapshot, payload)
-	if not _battle_reliable_events_empty(events) and not _send_p2p_json(peer, events, true):
-		return false
+	# Reliable entity births may be chunked/queued. Once the send API accepts the
+	# batch, the existing reliable queue owns delivery; do not enqueue duplicates
+	# when the following replaceable snapshot cannot be sent yet.
+	if not bool(catchup.get("reliable_queued", false)):
+		var payload = snapshot_manager.build_battle_entity_resync_payload(snapshot.get("active_entity_ids", []))
+		var events = _make_battle_reliable_events_message(snapshot, payload)
+		if not _battle_reliable_events_empty(events) and not _send_p2p_json(peer, events, true):
+			return false
+		catchup["reliable_queued"] = true
+	# Always use a fresh latest-only snapshot on a retry; an old snapshot is never
+	# useful once the reliable birth batch has already been queued.
 	return _send_p2p_json(peer, _make_battle_snapshot_wire_message(snapshot), false)
 
 
@@ -5850,6 +5913,7 @@ func _commit_host_game_start(reason: String) -> void:
 		return
 	_host_unconfirmed_game_start_by_peer.clear()
 	_host_game_start_recovery_sent_msec.clear()
+	_host_game_start_recovery_attempts_by_peer.clear()
 	_host_pending_battle_catchup_by_peer.clear()
 	_notify_menu_sync_game_start_guard(int(_pending_host_game_start.get("start_id", 0)), "host_commit:" + reason)
 	var now = OS.get_ticks_msec()
@@ -5910,6 +5974,7 @@ func _commit_host_game_start(reason: String) -> void:
 		}
 		_host_unconfirmed_game_start_by_peer[steam_id] = commit.duplicate(true)
 		_host_game_start_recovery_sent_msec[steam_id] = now
+		_host_game_start_recovery_attempts_by_peer[steam_id] = 0
 		var commit_send_ok = _send_p2p_json(steam_id, commit, true)
 		if commit_send_ok and bool(run_config.get("full_item_list_for_scene_sync", false)):
 			_clear_full_item_list_scene_sync_requirement_for_client(steam_id)
@@ -5957,6 +6022,11 @@ func _handle_game_start_commit_from_host(message: Dictionary) -> void:
 	if apply_msec < now:
 		apply_msec = now
 	_last_client_game_start_commit_id = int(message.get("start_id", _last_client_game_start_commit_id))
+	# Keep only the current commit for a bounded local scene-loading retry.
+	_client_game_start_commit_for_scene_recovery = message.duplicate(true)
+	_client_game_scene_ready_wait_since_msec = 0
+	_client_game_scene_recovery_reload_count = 0
+	_client_game_scene_recovery_exhausted_logged = false
 	_client_ignore_stale_menu_until_msec = now + CLIENT_STALE_MENU_GUARD_MSEC
 	_notify_menu_sync_game_start_guard(_last_client_game_start_commit_id, "client_commit")
 	_pending_client_game_start_commit = message.duplicate(true)
@@ -5991,7 +6061,7 @@ func _apply_queued_client_game_start_commit() -> void:
 	_apply_client_game_start_commit_now(commit)
 
 
-func _apply_client_game_start_commit_now(commit: Dictionary) -> void:
+func _apply_client_game_start_commit_now(commit: Dictionary, scene_recovery: bool = false) -> void:
 	var menu_sync = _get_menu_sync_manager()
 	if menu_sync == null or not menu_sync.has_method("receive_menu_scene_state_from_host"):
 		return
@@ -6000,7 +6070,8 @@ func _apply_client_game_start_commit_now(commit: Dictionary) -> void:
 		"screen": "game",
 		"scene_path": str(commit.get("scene_path", MenuData.game_scene)),
 		"run_config": commit.get("run_config", {}),
-		"force_scene_reload": bool(commit.get("force_scene_reload", false)),
+		"force_scene_reload": bool(commit.get("force_scene_reload", false)) or scene_recovery,
+		"scene_recovery_reload": scene_recovery,
 		"game_start_sync": {
 			"mode": str(commit.get("start_kind", "difficulty")) + "_commit",
 			"start_id": int(commit.get("start_id", 0)),
@@ -6014,38 +6085,76 @@ func _apply_client_game_start_commit_now(commit: Dictionary) -> void:
 	_apply_host_zone_sync_for_client(state, "client_apply_commit_state")
 	_client_last_game_scene_apply_msec = OS.get_ticks_msec()
 	var old_scene = get_tree().current_scene
-	_pending_client_game_scene_ready_requires_new_scene = bool(commit.get("force_scene_reload", false))
+	_pending_client_game_scene_ready_requires_new_scene = bool(state.get("force_scene_reload", false))
 	_pending_client_game_scene_ready_old_scene_id = old_scene.get_instance_id() if _is_live_node(old_scene) else 0
 	_notify_menu_sync_game_start_guard(int(commit.get("start_id", _last_client_game_start_commit_id)), "client_apply_commit")
-	if bool(commit.get("force_scene_reload", false)):
-		_reset_battle_transient_caches_for_scene_restart("client_force_game_reload")
+	if bool(state.get("force_scene_reload", false)):
+		_reset_battle_transient_caches_for_scene_restart("client_scene_recovery" if scene_recovery else "client_force_game_reload")
 	# The mirrored slot layout is already authoritative from lobby/selection staging.
 	# Re-applying it here emits connected_players_updated during scene creation and can
 	# recreate FocusEmulator/input ownership several times in one wave transition.
 	menu_sync.receive_menu_scene_state_from_host(state, _self_steam_id, _get_game_host_steam_id())
 	_pending_client_game_scene_ready_start_id = int(commit.get("start_id", 0))
+	_client_game_scene_ready_wait_since_msec = OS.get_ticks_msec()
+
+
+func _retry_client_game_scene_if_stuck() -> void:
+	var start_id = _pending_client_game_scene_ready_start_id
+	if start_id <= 0 or start_id != _client_expected_battle_start_id:
+		return
+	if _client_game_scene_ready_wait_since_msec <= 0 or OS.get_ticks_msec() - _client_game_scene_ready_wait_since_msec < CLIENT_GAME_SCENE_READY_RECOVERY_MSEC:
+		return
+	if _client_game_scene_recovery_reload_count >= CLIENT_GAME_SCENE_MAX_RECOVERY_RELOADS:
+		if not _client_game_scene_recovery_exhausted_logged:
+			_client_game_scene_recovery_exhausted_logged = true
+			printerr("[BrotatoOnline] Client scene was not ready after recovery attempts; start_id=" + str(start_id))
+		return
+	var commit = _client_game_start_commit_for_scene_recovery
+	if int(commit.get("start_id", 0)) != start_id:
+		return
+	_client_game_scene_recovery_reload_count += 1
+	_client_game_scene_ready_wait_since_msec = OS.get_ticks_msec()
+	print("[BrotatoOnline] Retrying stalled client battle scene start_id=" + str(start_id) + " attempt=" + str(_client_game_scene_recovery_reload_count))
+	_apply_client_game_start_commit_now(commit, true)
 
 
 func _poll_client_game_scene_ready() -> void:
 	if _is_game_host() or _pending_client_game_scene_ready_start_id <= 0:
 		return
+	# A newer Prepare can supersede a partially loaded older scene. Never ACK or
+	# retry the older generation after we have learned about a newer start.
+	if _pending_client_game_scene_ready_start_id != _client_expected_battle_start_id:
+		_pending_client_game_scene_ready_start_id = 0
+		_pending_client_game_scene_ready_requires_new_scene = false
+		_pending_client_game_scene_ready_old_scene_id = 0
+		_client_game_start_commit_for_scene_recovery.clear()
+		_client_game_scene_ready_wait_since_msec = 0
+		_client_game_scene_recovery_reload_count = 0
+		_client_game_scene_recovery_exhausted_logged = false
+		return
 	if _sent_client_game_scene_ready_start_id == _pending_client_game_scene_ready_start_id:
 		_pending_client_game_scene_ready_start_id = 0
 		_pending_client_game_scene_ready_requires_new_scene = false
 		_pending_client_game_scene_ready_old_scene_id = 0
+		_client_game_start_commit_for_scene_recovery.clear()
+		_client_game_scene_ready_wait_since_msec = 0
 		return
 	if not _is_in_game_scene():
+		_retry_client_game_scene_if_stuck()
 		return
 	if _pending_client_game_scene_ready_requires_new_scene:
 		var current_scene = get_tree().current_scene
 		var current_scene_id = current_scene.get_instance_id() if _is_live_node(current_scene) else 0
 		if current_scene_id == _pending_client_game_scene_ready_old_scene_id:
+			_retry_client_game_scene_if_stuck()
 			return
 	var players = get_tree().current_scene.get("_players")
 	if typeof(players) != TYPE_ARRAY or players.size() < RunData.get_player_count():
+		_retry_client_game_scene_if_stuck()
 		return
 	for player in players:
 		if not _is_live_node(player):
+			_retry_client_game_scene_if_stuck()
 			return
 	_activate_client_battle_generation_for_send(_pending_client_game_scene_ready_start_id, _client_expected_battle_start_kind, _client_expected_retry_context_key, "scene_ready")
 	_pending_client_game_scene_ready_requires_new_scene = false
@@ -6053,6 +6162,10 @@ func _poll_client_game_scene_ready() -> void:
 	var ready_start_id = _pending_client_game_scene_ready_start_id
 	_sent_client_game_scene_ready_start_id = ready_start_id
 	_pending_client_game_scene_ready_start_id = 0
+	_client_game_start_commit_for_scene_recovery.clear()
+	_client_game_scene_ready_wait_since_msec = 0
+	_client_game_scene_recovery_reload_count = 0
+	_client_game_scene_recovery_exhausted_logged = false
 	_send_client_game_scene_ready_ack(ready_start_id)
 
 
@@ -9856,6 +9969,7 @@ func detach_kicked_peer(peer_key: String, rejection: Dictionary = {}) -> void:
 		return
 	_host_unconfirmed_game_start_by_peer.erase(peer_key)
 	_host_game_start_recovery_sent_msec.erase(peer_key)
+	_host_game_start_recovery_attempts_by_peer.erase(peer_key)
 	_host_pending_battle_catchup_by_peer.erase(peer_key)
 	_drop_pending_p2p_sends_for_target(peer_key)
 	var notice = rejection.duplicate()

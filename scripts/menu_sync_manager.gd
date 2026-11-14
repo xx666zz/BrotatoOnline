@@ -1,5 +1,14 @@
 extends Node
 
+var _inventory_barrier_reply = {}
+var _crate_inventory = preload("res://mods-unpacked/six666-BrotatoOnline/scripts/progression_inventory.gd").new()
+# Inventory replacement replies must arrive before later optimistic purchases.
+# Otherwise the old reply deletes purchases whose success replies are ack-only.
+var _shop_inventory_pending = ""
+var _shop_inventory_queued = []
+var _shop_inventory_sequence = 0
+var _shop_inventory_scene_id = 0
+
 const ItemRuntimeState = preload("res://mods-unpacked/six666-BrotatoOnline/scripts/item_runtime_state.gd")
 const ShopDlcActions = preload("res://mods-unpacked/six666-BrotatoOnline/scripts/shop_dlc_actions.gd")
 var _item_runtime_state = ItemRuntimeState.new()
@@ -461,6 +470,8 @@ func should_accept_page_state_during_game_start_guard(kind: String, value: Strin
 
 
 func _reset_run_page_runtime_state_for_game_start(clear_queued_actions: bool = true) -> void:
+	_reset_shop_inventory_barrier()
+	_inventory_barrier_reply = {}
 	if clear_queued_actions:
 		_queued_local_run_page_action_messages.clear()
 	_pending_shop_states_from_host.clear()
@@ -840,6 +851,10 @@ func receive_run_page_action_sync(from_steam_id: String, message: Dictionary, se
 			applied = _apply_progression_item_box_action(player_index, message, "take")
 		else:
 			applied = true
+	elif action_type in ["item_box_weapon_combine", "item_box_weapon_discard"]:
+		applied = _get_crate_inventory().apply(player_index, message) if _is_game_host() else true
+	elif action_type == "item_box_inventory_state":
+		applied = not _is_game_host()
 	elif action_type == "item_box_item_added":
 		applied = _apply_item_box_item_added(player_index, message)
 	elif action_type == "item_box_discard":
@@ -970,6 +985,11 @@ func receive_run_page_action_sync(from_steam_id: String, message: Dictionary, se
 		var host_state = _build_progression_visible_option(player_index, ui)
 		_attach_progression_marker_state(host_state, player_index, ui)
 		var all_states = _build_all_progression_visible_options(ui, true)
+		if action_type in ["item_box_weapon_combine", "item_box_weapon_discard"]:
+			_get_crate_inventory().attach(host_state, player_index)
+			for entry in all_states:
+				if int(entry.get("player_index", -1)) == player_index:
+					entry["crate_inventory_run_data"] = host_state.get("crate_inventory_run_data", {})
 		if not host_state.empty():
 			_last_local_run_page_state_key_by_player[player_index] = _progression_state_key(host_state)
 			if not all_states.empty():
@@ -992,6 +1012,9 @@ func receive_run_page_action_sync(from_steam_id: String, message: Dictionary, se
 				_apply_or_queue_shop_states([shop_state_after], message)
 		if action_type in ["shop_combine_weapon", "shop_discard_weapon", "shop_meca_upgrade"]:
 			_close_shop_popup_for_player(_find_shop_node(), player_index, message)
+		if origin_steam_id == self_steam_id and message.has("bo_inventory_barrier"):
+			_inventory_barrier_reply = message
+			_try_release_inventory_barrier()
 		return {}
 
 	var applied_any_state = false
@@ -1967,12 +1990,18 @@ func _submit_local_shop_action(message: Dictionary, player_index: int, label: St
 		_apply_host_local_shop_action(message, label)
 		return
 
+	var shop = _find_shop_node()
+	if not _is_valid_shop_node(shop):
+		return
+	if _defer_shop_inventory_action(message, player_index, label, shop.get_instance_id()):
+		return
 	var action_type = str(message.get("action_type", ""))
 	if action_type == "shop_buy":
 		if not _apply_client_local_shop_purchase(message, player_index):
 			return
 	else:
 		_apply_client_local_shop_prediction(message, player_index, label)
+	_begin_shop_inventory_barrier(message)
 	var outbound = _build_client_shop_action_outbound_message(message)
 	_queue_local_run_page_action(outbound)
 
@@ -2732,6 +2761,7 @@ func _try_apply_pending_shop_state() -> void:
 		return
 	if _apply_all_shop_states_to_ui(_pending_shop_states_from_host, {}):
 		_pending_shop_states_from_host = []
+		_try_release_inventory_barrier()
 
 
 func _apply_all_shop_states_to_ui(states: Array, _context: Dictionary = {}) -> bool:
@@ -6504,6 +6534,8 @@ func _poll_progression_page_focus_and_state() -> void:
 		_configure_online_focus_emulator_input_owners(host_player_indices, "progression_host")
 		_ensure_host_progression_ban_button_connections(ui)
 		_ensure_host_item_box_take_sync_connection(ui)
+		for index in _get_run_player_count():
+			_get_crate_inventory().wire(ui, index)
 		_queue_changed_progression_states(ui)
 		# Host-origin focus is emitted only for Host-local players. Remote player focus
 		# is received from that client; rebroadcasting it as Host-origin causes jitter.
@@ -6706,6 +6738,7 @@ func _install_client_progression_press_intercept(container: Node, player_index: 
 		return
 	if not _is_live_ref(container):
 		return
+	_get_crate_inventory().wire(_find_progression_ui(), player_index)
 	var container_id = container.get_instance_id()
 	if _client_progression_intercept_container_id == container_id:
 		return
@@ -7373,6 +7406,12 @@ func _apply_progression_visible_option_to_ui(player_index: int, visible: Diction
 	var container = _get_progression_player_container(ui, player_index)
 	if not _is_live_ref(container):
 		return false
+	if visible.has("crate_inventory_run_data") and not _is_game_host():
+		_apply_one_serialized_player_run_data(player_index, visible.crate_inventory_run_data)
+		LinkedStats.reset_player(player_index)
+		container.update_inventory()
+		if ui.has_method("_update_player_stats"):
+			ui._update_player_stats(player_index)
 	_apply_progression_marker_state_to_container(container, visible)
 	var mode = str(visible.get("mode", "none"))
 	if mode == "upgrade":
@@ -7386,6 +7425,8 @@ func _apply_progression_visible_option_to_ui(player_index: int, visible: Diction
 	elif mode == "item_box":
 		_prepare_progression_ui_for_state(ui, container, player_index, visible)
 		var item_ok = _apply_item_box_option_to_progression_container(container, player_index, visible)
+		if item_ok and ui.has_method("_refresh_weapons_inventory"):
+			ui._refresh_weapons_inventory(player_index)
 		if item_ok:
 			container.set_meta("bo_confirmed_reward_mode", mode)
 		if item_ok and not _is_game_host() and player_index == _get_local_client_player_index():
@@ -8094,6 +8135,9 @@ func _is_mutating_run_page_action(action_type: String) -> bool:
 		"upgrade_reroll",
 		"item_box_take",
 		"item_box_item_added",
+		"item_box_weapon_combine",
+		"item_box_weapon_discard",
+		"item_box_inventory_state",
 		"item_box_discard",
 		"item_box_ban",
 		"shop_buy",
@@ -12008,3 +12052,51 @@ func _on_host_meca_upgrade_observed(_source, _upgraded, index: int) -> void:
 		return
 	_mark_host_shop_run_data_dirty(index)
 	_schedule_host_local_shop_state_sync(index, "shop_meca_upgrade", "host_meca_upgrade")
+
+
+func _get_crate_inventory():
+	_crate_inventory.manager = self
+	return _crate_inventory
+
+func _try_release_inventory_barrier() -> void:
+	if not _pending_shop_states_from_host.empty() or _inventory_barrier_reply.empty():
+		return
+	if _acknowledge_shop_inventory_barrier(_inventory_barrier_reply):
+		call_deferred("_flush_inventory_barrier_actions")
+	_inventory_barrier_reply = {}
+
+func _flush_inventory_barrier_actions() -> void:
+	var shop = _find_shop_node()
+	if not _is_valid_shop_node(shop) or shop.get_instance_id() != _shop_inventory_scene_id:
+		_reset_shop_inventory_barrier()
+		return
+	while _shop_inventory_pending == "" and not _shop_inventory_queued.empty():
+		var request = _shop_inventory_queued.pop_front()
+		_submit_local_shop_action(request.message, request.index, request.label)
+
+
+func _reset_shop_inventory_barrier() -> void:
+	_shop_inventory_pending = ""
+	_shop_inventory_queued.clear()
+	_shop_inventory_scene_id = 0
+
+func _defer_shop_inventory_action(message: Dictionary, index: int, label: String, current_scene: int) -> bool:
+	if _shop_inventory_scene_id != current_scene:
+		_reset_shop_inventory_barrier()
+		_shop_inventory_scene_id = current_scene
+	if _shop_inventory_pending == "":
+		return false
+	_shop_inventory_queued.append({"message": message.duplicate(true), "index": index, "label": label})
+	return true
+
+func _begin_shop_inventory_barrier(message: Dictionary) -> void:
+	if message.get("action_type", "") in ["shop_discard_weapon", "shop_combine_weapon", "shop_meca_upgrade", "shop_reroll", "shop_dismantle"]:
+		_shop_inventory_sequence += 1
+		_shop_inventory_pending = str(_shop_inventory_sequence)
+		message["bo_inventory_barrier"] = _shop_inventory_pending
+
+func _acknowledge_shop_inventory_barrier(message: Dictionary) -> bool:
+	if _shop_inventory_pending == "" or str(message.get("bo_inventory_barrier", "")) != _shop_inventory_pending:
+		return false
+	_shop_inventory_pending = ""
+	return true

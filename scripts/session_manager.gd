@@ -2799,7 +2799,7 @@ func _handle_run_page_action_sync(from_steam_id: String, message: Dictionary) ->
 	# item_box_item_added is a Host-generated inventory delta. Never accept or relay
 	# a Client-origin packet of this type; Host-local queued actions bypass this handler
 	# and are broadcast directly by _poll_and_send_local_run_page_actions().
-	if _is_game_host() and incoming_action_type == "item_box_item_added":
+	if _is_game_host() and incoming_action_type in ["item_box_item_added", "item_box_inventory_state"]:
 		return
 	if _is_game_host() and not _pending_host_game_start.empty() and _is_run_page_action_guarded_by_game_start(incoming_action_type):
 		return

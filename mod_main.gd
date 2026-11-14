@@ -155,6 +155,7 @@ func _ready() -> void:
 	_add_script_node("BrotatoOnlinePlayerRemovalManager", "scripts/player_removal_manager.gd", true)
 	_add_player_list_overlay_manager()
 	_add_pause_focus_alias_manager()
+	_add_script_node("BrotatoOnlineMousePointer", "scripts/online_mouse_pointer.gd", true)
 
 
 

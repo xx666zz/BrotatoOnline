@@ -33,6 +33,8 @@ func _brotato_online_get_current_drop_wave() -> int:
 func _brotato_online_clear_drop_meta(node: Node, reason: String = "") -> void:
 	if node == null or not is_instance_valid(node):
 		return
+	if node.has_meta("bo_evolution_kind"):
+		node.remove_meta("bo_evolution_kind")
 	if node.has_meta("brotato_online_drop_result"):
 		node.remove_meta("brotato_online_drop_result")
 
@@ -998,63 +1000,21 @@ func _brotato_online_is_action_just_released_safe(action_name: String) -> bool:
 	return Input.is_action_just_released(action_name)
 
 
-# Brotato's InputService hides the OS cursor for co-op when there are 2+ players.
-# For online keyboard/mouse manual aiming, render the vanilla crosshair Sprite
-# at the actual mouse position instead. Do not call set_mouse_mode() or install
-# another OS cursor here: InputService and CursorManager would override it on
-# every input event, making the crosshair flash and appear incorrectly sized.
-# Offline / local co-op preserve vanilla behavior untouched.
+# Online pointer is drawn in screen space by OnlineMousePointer, including menus.
 func _handle_manual_aim_visuals() -> void:
 	if not RunData.is_coop_run or not _brotato_online_is_online_session_active():
 		._handle_manual_aim_visuals()
 		return
-
 	if _crosshair_cursor_active:
 		_set_crosshair_cursor(false)
-	if _cleaning_up:
-		_crosshair.hide()
-		return
+	_crosshair.hide()
 
-	var slot_manager = _brotato_online_get_slot_manager()
-	var local_indices = []
-	if slot_manager != null and slot_manager.has_method("get_local_mirrored_player_index"):
-		var mirrored_index = int(slot_manager.get_local_mirrored_player_index())
-		if mirrored_index >= 0:
-			local_indices.append(mirrored_index)
-	if local_indices.empty() and slot_manager != null and slot_manager.has_method("get_local_player_indices"):
-		local_indices = slot_manager.get_local_player_indices()
 
-	var keyboard_mouse_aim = false
-	for index_value in local_indices:
-		var index = int(index_value)
-		if index < 0 or index >= RunData.get_player_count() or Utils.is_player_using_gamepad(index):
-			continue
-		if Utils.is_manual_aim(index) or (ProgressData.settings.manual_aim and ProgressData.settings.manual_aim_on_mouse_press):
-			keyboard_mouse_aim = true
-			break
-	if not keyboard_mouse_aim:
-		_crosshair.hide()
-		return
-
-	# Crosshair is a world-space Sprite. Convert the viewport mouse position
-	# through the canvas transform so it stays under the pointer as the camera
-	# follows players, zooms, or shakes. Leave the original crosshair size unchanged.
-	if _crosshair.texture == null:
-		_crosshair.texture = load("res://ui/manual_cursor.png")
-	if _crosshair.texture == null:
-		_crosshair.texture = load("res://ui/custom_cursor.png")
-	if _crosshair.texture == null:
-		_crosshair.hide()
-		return
-	_crosshair.global_position = get_viewport().get_canvas_transform().affine_inverse().xform(get_viewport().get_mouse_position())
-	if not _crosshair.visible:
-		_crosshair.show()
-
-# Scene-owned state: a retry gets a new ledger even when the wave number repeats.
 const BO_SPECIALS = {
 	"meca_consumable_fruit": "evolution", "mutant_consumable_fruit": "evolution",
 	"mutation_consumable_fruit": "mutation", "meca_parts_consumable": "parts"
 }
+var _bo_evolution_synced = {}
 var _bo_known = {}
 var _bo_ground = {}
 var _bo_removed = {}
@@ -1132,7 +1092,14 @@ func spawn_evolution_fruit(unit: Unit, args: Entity.DieArgs) -> void:
 	elif not RunData.is_dual_evolution(player_index) and abs(evolution) > ItemService.EVOLUTION_CAMP_LOCK_THRESHOLD:
 		data = dlc.meca_fruit if evolution > 0 else dlc.mutant_fruit
 	else:
-		data = Utils.get_rand_element([dlc.meca_fruit, dlc.mutant_fruit])
+		# Only the unrestricted branch may follow another player's fruit choice.
+		var kind = str(unit.get_meta("bo_evolution_kind")) if unit.has_meta("bo_evolution_kind") else ""
+		if kind == "meca_consumable_fruit":
+			data = dlc.meca_fruit
+		elif kind == "mutant_consumable_fruit":
+			data = dlc.mutant_fruit
+		else:
+			data = Utils.get_rand_element([dlc.meca_fruit, dlc.mutant_fruit])
 	_bo_drop(unit, roll, data)
 
 func spawn_mutation_fruit(unit: Unit) -> void:
@@ -1177,6 +1144,50 @@ func _bo_spawn_pickup(id: String, data, dest: Vector2, pos: Vector2) -> void:
 	node.drop(dest, 0, pos)
 	_consumables.push_back(node)
 	_bo_ground[id] = node
+	_bo_sync_evolution_drop(id, str(data.my_id))
+
+# Notify only after the fruit exists; received choices never spawn or kill anything.
+func _bo_sync_evolution_drop(id: String, kind: String) -> void:
+	if BO_SPECIALS.get(kind, "") != "evolution" or id.begins_with("fallback_") or _bo_closed:
+		return
+	if _bo_evolution_synced.has(id):
+		return
+	_bo_evolution_synced[id] = true
+	var msg = _bo_packet("evolution_drop")
+	msg["drop_id"] = id
+	msg["kind"] = kind
+	var session = _brotato_online_get_session_manager()
+	if _brotato_online_is_game_host():
+		session.broadcast_message(msg)
+	else:
+		session.send_battle_message_to_host(msg, true)
+
+func _bo_receive_evolution_drop(msg: Dictionary, sender: int, peer: String) -> void:
+	if _bo_closed or _cleaning_up:
+		return
+	var id = str(msg.get("drop_id", ""))
+	var kind = str(msg.get("kind", ""))
+	if id == "" or id.begins_with("fallback_") or BO_SPECIALS.get(kind, "") != "evolution":
+		return
+	if sender >= 0 and _bo_known.get(id, "") != "evolution":
+		return
+	if _bo_evolution_synced.has(id):
+		return
+	_bo_evolution_synced[id] = true
+	if is_instance_valid(_entity_spawner):
+		for enemy in _entity_spawner.get_all_enemies():
+			if not is_instance_valid(enemy) or enemy.dead or enemy.is_queued_for_deletion():
+				continue
+			var roll = _brotato_online_get_valid_drop_meta(enemy)
+			if str(roll.get("drop_id", "")) == id and roll.get("special", "") == "evolution":
+				enemy.set_meta("bo_evolution_kind", kind)
+				break
+	# Relay even if the Host already killed this enemy: another peer may still have it.
+	if sender >= 0:
+		var relay = _bo_packet("evolution_drop")
+		relay["drop_id"] = id
+		relay["kind"] = kind
+		_brotato_online_get_session_manager().broadcast_message(relay, peer)
 
 func _bo_record_pickup(id: String, kind: String, idx: int, full_hp: bool) -> void:
 	_bo_removed[id] = true
@@ -1220,6 +1231,9 @@ func _bo_flush() -> void:
 			_bo_outbox.pop_front()
 
 func bo_receive_pickups(msg: Dictionary, sender: int, peer: String) -> void:
+	if msg.get("action", "") == "evolution_drop":
+		_bo_receive_evolution_drop(msg, sender, peer)
+		return
 	var session = _brotato_online_get_session_manager()
 	if msg.get("action", "") != "items":
 		return

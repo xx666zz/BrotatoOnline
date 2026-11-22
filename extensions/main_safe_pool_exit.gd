@@ -777,9 +777,12 @@ func _brotato_online_resolve_consumable_from_drop_result(drop_result: Dictionary
 	if consumable_data == null:
 		return null
 	var copy = consumable_data.duplicate()
-	var cur_zone: Resource = ZoneService.get_zone_data(RunData.current_zone)
-	if cur_zone != null and copy.get("icon") != null:
-		copy.icon = cur_zone.get_zone_consumable_sprite(copy)
+	# Since 1.2.0.3 consumable skins belong to the active background, not ZoneData.
+	var background: Resource = RunData.current_background
+	if background != null:
+		var texture = background.get_zone_consumable_sprite(copy)
+		if texture != null:
+			copy.icon = texture
 	return copy
 
 

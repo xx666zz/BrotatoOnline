@@ -6660,8 +6660,15 @@ func _compact_host_motion_entities(snapshot: Dictionary) -> Array:
 			continue
 		var sync_mode = str(entity.get("sync_mode", ""))
 		var category = str(entity.get("category", ""))
-		# Birth-only entity creation is reliable and one-shot. Keep unreliable state for
-		# boss/elite and pet motion only. Structures are static birth-only.
+		# A gobbler needs only its destination and absolute swallow totals.
+		if sync_mode == "host_target" and entity.has("gobbler"):
+			var gobbler = entity.gobbler
+			var target_row = [str(entity.net_id), int(gobbler.gold), int(gobbler.stage), int(gobbler.seq)]
+			if gobbler.has("target"):
+				target_row.append(gobbler.target.x)
+				target_row.append(gobbler.target.y)
+			result.append(target_row)
+			continue
 		if sync_mode != "host_motion" and category != "boss" and category != "pet":
 			continue
 		var pos = _dict_to_xy(entity.get("pos", {}))
@@ -6804,6 +6811,9 @@ func _make_wire_entity_state(entity: Dictionary, legacy_enemy: bool) -> Dictiona
 	if str(entity.get("category", "")) == "boss" and entity.has("move_locked"):
 		result["move_locked"] = bool(entity.get("move_locked"))
 	if not legacy_enemy:
+		for key in ["gobbler", "loot_handoff", "loot_release"]:
+			if entity.has(key):
+				result[key] = entity[key]
 		result["category"] = str(entity.get("category", ""))
 		result["sync_mode"] = str(entity.get("sync_mode", ""))
 		result["entity_type"] = int(entity.get("entity_type", -1))
@@ -6885,6 +6895,12 @@ func _expand_compact_battle_snapshot(message: Dictionary) -> Dictionary:
 	var packed_entities = message.get("e", [])
 	if typeof(packed_entities) == TYPE_ARRAY:
 		for row in packed_entities:
+			if typeof(row) == TYPE_ARRAY and row.size() in [4, 6]:
+				var gobbler = {"gold": int(row[1]), "stage": int(row[2]), "seq": int(row[3])}
+				if row.size() == 6:
+					gobbler["target"] = _xy_to_dict(row[4], row[5])
+				expanded.entities.append({"net_id": str(row[0]), "category": "enemy", "sync_mode": "host_target", "gobbler": gobbler})
+				continue
 			if typeof(row) != TYPE_ARRAY or row.size() < 15:
 				continue
 			var category = _compact_id_to_category(int(row[1]))

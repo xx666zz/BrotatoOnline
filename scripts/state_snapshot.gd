@@ -1,8 +1,7 @@
 extends Node
 
 const REMOTE_DEAD_DISPLAY_HP = -999
-const LOOTER_ENEMY_ID = "looter"
-const LOOTER_SCENE_PATH = "res://entities/units/enemies/crash_zone/basic/looter/looter.tscn"
+const Protocol = preload("res://mods-unpacked/six666-BrotatoOnline/scripts/protocol.gd")
 
 # Host-side snapshot collector for battle sync.
 # Birth-only entities are announced once through reliable battle events; host-motion
@@ -12,6 +11,7 @@ const LOOTER_SCENE_PATH = "res://entities/units/enemies/crash_zone/basic/looter/
 const SNAPSHOT_INTERVAL_MSEC = 120
 const SYNC_MODE_BIRTH_ONLY = "birth_only"
 const SYNC_MODE_HOST_MOTION = "host_motion"
+const SYNC_MODE_HOST_TARGET = "host_target"
 const SUMMARY_PRINT_INTERVAL_MSEC = 5000
 const MAX_SUMMARY_ENTITY_SAMPLES = 3
 const MAX_EVENTS_PER_SNAPSHOT = 64
@@ -64,6 +64,7 @@ var _last_entity_category_by_net_id = {}
 var _last_entity_cursed_by_net_id = {}
 var _structure_curse_data_signature_by_net_id = {}
 var _host_entity_by_net_id = {}
+var _loot_enemy_births = {} # Retain the original birth through wave end for a late handoff/resync.
 var _host_entity_by_short_id = {}
 var _host_pickup_by_net_id = {}
 var _host_pickup_kind_by_net_id = {}
@@ -191,14 +192,8 @@ func build_snapshot() -> Dictionary:
 			var removed_id = str(removed_id_value)
 			var removed_category = str(_last_entity_category_by_net_id.get(removed_id, ""))
 			var should_sync_removed = ENABLE_REMOVED_SYNC or (ENABLE_BOSS_ELITE_REMOVED_SYNC and _is_boss_elite_category(removed_category))
-			_birth_only_announced_net_ids.erase(removed_id)
-			_birth_only_first_seen_msec.erase(removed_id)
-			_birth_marker_announced_net_ids.erase(removed_id)
-			_last_entity_pos_by_net_id.erase(removed_id)
-			_last_entity_category_by_net_id.erase(removed_id)
-			_structure_curse_data_signature_by_net_id.erase(removed_id)
-			_host_entity_by_net_id.erase(removed_id)
-			_host_entity_by_short_id.erase(str(_net_short_id(removed_id)))
+			_release_loot_enemy(removed_id)
+			_forget_live_entity(removed_id)
 			if should_sync_removed:
 				removed.append(removed_id)
 				_queue_pending_reliable_removed(removed_id)
@@ -297,8 +292,11 @@ func _append_dynamic_entity_states(locator: Node, registry: Node, method_name: S
 func _append_dynamic_node_state(node, registry: Node, category: String, entity_type: int, prefix: String, sync_mode: String, now_msec: int, entities_out: Array, active_dynamic_net_ids: Dictionary, emitted_dynamic_net_ids: Dictionary) -> void:
 	if not _is_valid_node(node):
 		return
-	if category == "enemy" and _is_looter_entity(node):
-		sync_mode = SYNC_MODE_HOST_MOTION
+	var loot_enemy = category == "enemy" and (node is Looter or node is EvilMob)
+	if loot_enemy:
+		if node.dead:
+			return
+		sync_mode = SYNC_MODE_HOST_MOTION if node is Looter else SYNC_MODE_HOST_TARGET
 
 	var net_id = _get_or_assign_entity_net_id(node, registry, category, entity_type, prefix)
 	if net_id == "":
@@ -315,6 +313,11 @@ func _append_dynamic_node_state(node, registry: Node, category: String, entity_t
 		var full_state = _build_dynamic_entity_state_from_net_id(node, net_id, category, entity_type)
 		if not full_state.empty():
 			full_state["sync_mode"] = sync_mode
+			if loot_enemy:
+				_loot_enemy_births[net_id] = full_state.duplicate(true)
+				if node.is_connected("died", self, "_on_loot_enemy_died"):
+					node.disconnect("died", self, "_on_loot_enemy_died")
+				node.connect("died", self, "_on_loot_enemy_died", [net_id], CONNECT_ONESHOT)
 			_queue_pending_reliable_birth_entity(full_state)
 			_store_structure_curse_data_signature_if_present(net_id, full_state)
 			_birth_only_announced_net_ids[net_id] = true
@@ -335,6 +338,14 @@ func _append_dynamic_node_state(node, registry: Node, category: String, entity_t
 
 	if category == "structure":
 		_maybe_append_structure_curse_data_update(node, net_id, category, entity_type, sync_mode)
+
+	if sync_mode == SYNC_MODE_HOST_TARGET:
+		if not emitted_dynamic_net_ids.has(net_id):
+			var gobbler = node.bo_get_gobbler_state()
+			_loot_enemy_births[net_id]["last_gobbler"] = gobbler
+			entities_out.append({"net_id": net_id, "category": category, "sync_mode": sync_mode, "gobbler": gobbler})
+			emitted_dynamic_net_ids[net_id] = true
+		return
 
 	if sync_mode != SYNC_MODE_HOST_MOTION:
 		# Known regular enemies/trees/structures are now only touched for liveness and
@@ -397,6 +408,8 @@ func _build_dynamic_entity_state_from_net_id(entity: Node, net_id: String, categ
 	var type_path = _get_script_path(entity)
 	var scene_path = _get_scene_path(entity)
 	var stats_path = _get_resource_path(entity.get("stats"))
+	if entity is EvilMob and entity.bo_base_stats != null:
+		stats_path = _get_resource_path(entity.bo_base_stats)
 	var player_index = _safe_int_from_object(entity, "player_index", -1)
 	var spawn_data = _find_runtime_spawn_data_for_entity(entity, category, scene_path, player_index)
 	var data_path = _get_valid_spawn_data_path(spawn_data, scene_path, category + ":entity:" + str(entity.name))
@@ -431,6 +444,10 @@ func _build_dynamic_entity_state_from_net_id(entity: Node, net_id: String, categ
 	}
 	if entity is BrachiosaurusFoot:
 		result["source_net_id"] = _get_brachiosaurus_source_net_id(entity.dino_mom, _get_net_id_registry())
+	if entity is EvilMob:
+		result["gobbler"] = entity.bo_get_gobbler_state()
+	elif entity is Looter:
+		result["loot_handoff"] = true
 	# Boss/elite charging attacks use this flag as a gameplay condition. Preserve
 	# its Host value in the reliable birth/resync payload as well as motion frames.
 	if category == "boss" and entity.get("_move_locked") != null:
@@ -652,10 +669,17 @@ func _connect_spawner_signal_if_exists(spawner: Node, signal_name: String, metho
 
 
 func _on_spawner_enemy_spawned(entity) -> void:
-	_queue_signal_spawn_node(entity, "")
+	if not (entity is Looter or entity is EvilMob):
+		_queue_signal_spawn_node(entity, "")
 
 
 func _on_spawner_enemy_respawned(entity) -> void:
+	if entity is Looter or entity is EvilMob:
+		# This signal runs after placement, even for a new instance. Capture the birth
+		# before it can die or return to the pool between two snapshots.
+		if _is_game_host() and _is_online_session_active():
+			_append_dynamic_node_state(entity, _get_net_id_registry(), "enemy", _entity_type_enemy(), "enemy", SYNC_MODE_BIRTH_ONLY, OS.get_ticks_msec(), [], {}, {})
+		return
 	_queue_signal_spawn_node(entity, "enemy")
 
 
@@ -829,7 +853,7 @@ func _build_birth_state(birth: Node, registry: Node, now_msec: int) -> Dictionar
 		"spawn_net_id": spawn_net_id,
 		"entity_net_id": spawn_net_id,
 		"spawn_category": spawn_category,
-		"spawn_sync_mode": SYNC_MODE_HOST_MOTION if spawn_category == "enemy" and _is_looter_scene_path(scene_path) else _sync_mode_from_category(spawn_category),
+		"spawn_sync_mode": Protocol.LOOT_ENEMY_SYNC_MODES.get(scene_path, _sync_mode_from_category(spawn_category)),
 		"spawn_scene_path": scene_path
 	}
 	if scene_path == "res://entities/units/enemies/jungle/bosses/brachiosaurus/brachiosaurus_foot/brachiosaurus_foot.tscn":
@@ -978,15 +1002,42 @@ func _prefix_from_category(category: String) -> String:
 	return category
 
 
-func _is_looter_entity(entity) -> bool:
-	if not _is_valid_node(entity):
-		return false
-	var enemy_id = entity.get("enemy_id")
-	return enemy_id != null and str(enemy_id).to_lower() == LOOTER_ENEMY_ID
+func _on_loot_enemy_died(entity, _args, net_id: String) -> void:
+	if _host_entity_by_net_id.get(net_id) != entity:
+		return
+	_release_loot_enemy(net_id)
+	# A pooled instance can respawn before the next registry sweep.
+	var registry = _get_net_id_registry()
+	if registry != null:
+		registry.forget_net_id(net_id)
+	_forget_live_entity(net_id)
 
 
-func _is_looter_scene_path(scene_path: String) -> bool:
-	return scene_path == LOOTER_SCENE_PATH
+func _release_loot_enemy(net_id: String) -> void:
+	if not _loot_enemy_births.has(net_id):
+		return
+	var birth = _loot_enemy_births[net_id]
+	if birth.has("loot_release"):
+		return
+	var node = _host_entity_by_net_id.get(net_id)
+	var final_state = birth.get("last_gobbler", birth.get("gobbler", {}))
+	if is_instance_valid(node) and node is EvilMob:
+		final_state = node.bo_get_gobbler_state()
+	birth.erase("last_gobbler")
+	birth["loot_release"] = final_state
+	_queue_pending_reliable_birth_entity(birth)
+
+
+func _forget_live_entity(net_id: String) -> void:
+	_birth_only_announced_net_ids.erase(net_id)
+	_birth_only_first_seen_msec.erase(net_id)
+	_birth_marker_announced_net_ids.erase(net_id)
+	_last_entity_pos_by_net_id.erase(net_id)
+	_last_entity_category_by_net_id.erase(net_id)
+	_last_entity_cursed_by_net_id.erase(net_id)
+	_structure_curse_data_signature_by_net_id.erase(net_id)
+	_host_entity_by_net_id.erase(net_id)
+	_host_entity_by_short_id.erase(str(_net_short_id(net_id)))
 
 
 func _sync_mode_from_category(category: String) -> String:
@@ -1392,7 +1443,7 @@ func apply_entity_kill_claim(from_steam_id: String, message: Dictionary) -> void
 		return
 	var category = str(_last_entity_category_by_net_id.get(net_id, message.get("category", "")))
 	var allow_boss_elite = ENABLE_BOSS_ELITE_DEATH_REPORT_APPLY and (category == "boss" or category == "elite")
-	var allow_looter = ENABLE_LOOTER_DEATH_REPORT_APPLY and category == "enemy" and _is_looter_entity(target)
+	var allow_looter = ENABLE_LOOTER_DEATH_REPORT_APPLY and category == "enemy" and target is Looter
 	if not ENABLE_DEATH_REPORT_APPLY and not allow_boss_elite and not allow_looter:
 		return
 	var player_index = int(message.get("player_index", -1))
@@ -1692,6 +1743,9 @@ func build_battle_entity_resync_payload(net_ids: Array) -> Dictionary:
 		if net_id == "" or seen.has(net_id):
 			continue
 		seen[net_id] = true
+		if _loot_enemy_births.has(net_id) and _loot_enemy_births[net_id].has("loot_release"):
+			entities.append(_loot_enemy_births[net_id].duplicate(true))
+			continue
 		var entity = _host_entity_by_net_id.get(net_id, null)
 		if not _is_valid_node(entity):
 			continue
@@ -1704,7 +1758,7 @@ func build_battle_entity_resync_payload(net_ids: Array) -> Dictionary:
 		var state = _build_dynamic_entity_state_from_net_id(entity, net_id, category, entity_type)
 		if state.empty():
 			continue
-		state["sync_mode"] = SYNC_MODE_HOST_MOTION if category == "enemy" and _is_looter_entity(entity) else _sync_mode_from_category(category)
+		state["sync_mode"] = _loot_enemy_births[net_id].sync_mode if _loot_enemy_births.has(net_id) else _sync_mode_from_category(category)
 		entities.append(state.duplicate(true))
 	return {
 		"entities": entities,
@@ -2260,6 +2314,7 @@ func _ensure_current_game_scene_registered(reason: String, locator: Node, is_hos
 		_last_entity_cursed_by_net_id.clear()
 		_structure_curse_data_signature_by_net_id.clear()
 		_host_entity_by_net_id.clear()
+		_loot_enemy_births.clear()
 		_host_entity_by_short_id.clear()
 		_host_pickup_by_net_id.clear()
 		_host_pickup_kind_by_net_id.clear()
@@ -2296,6 +2351,7 @@ func _on_left_game_scene() -> void:
 	_last_entity_cursed_by_net_id.clear()
 	_structure_curse_data_signature_by_net_id.clear()
 	_host_entity_by_net_id.clear()
+	_loot_enemy_births.clear()
 	_host_entity_by_short_id.clear()
 	_host_pickup_by_net_id.clear()
 	_host_pickup_kind_by_net_id.clear()

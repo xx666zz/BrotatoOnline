@@ -6,8 +6,7 @@ extends Node
 
 
 const PHASE = "B12_delayed_death_sync"
-const LOOTER_ENEMY_ID = "looter"
-const LOOTER_SCENE_PATH = "res://entities/units/enemies/crash_zone/basic/looter/looter.tscn"
+const Protocol = preload("res://mods-unpacked/six666-BrotatoOnline/scripts/protocol.gd")
 const LOCAL_SUPPRESS_INTERVAL_MSEC = 700
 const PLAYER_STATE_SEND_INTERVAL_MSEC = 80
 const BOSS_DAMAGE_SEND_INTERVAL_MSEC = 120
@@ -20,6 +19,7 @@ const INTERPOLATION_BUFFER_KEEP_MSEC = 900
 const CLOCK_OFFSET_SMOOTHING = 0.10
 const SYNC_MODE_BIRTH_ONLY = "birth_only"
 const SYNC_MODE_HOST_MOTION = "host_motion"
+const SYNC_MODE_HOST_TARGET = "host_target"
 const LOCAL_KILL_IGNORE_MSEC = 1600
 const ENABLE_BIRTH_MARKERS = true
 const WAVE_TIMER_SYNC_INTERVAL_MSEC = 160
@@ -107,6 +107,8 @@ var _host_entity_samples = {}           # net_id -> [{t:int host_msec, pos:Vecto
 var _host_clock_offset_msec = 0.0       # local_ticks - host_ticks, smoothed
 var _host_clock_offset_initialized = false
 var _locally_killed_until = {}          # net_id -> local msec; prevents immediate resurrection while Host processes claim
+var _closed_loot_enemy_ids = {}         # Local kill or host handoff, for this battle only.
+var _loot_enemy_rx_msec = {}
 var _connected_died_ids = {}
 var _connected_damage_ids = {}
 var _pending_boss_damage = {}           # net_id -> damage sum
@@ -403,29 +405,58 @@ func receive_battle_reliable_events_from_host(message: Dictionary) -> void:
 func _apply_reliable_entity_birth_state(state: Dictionary, server_time_msec: int, now: int) -> void:
 	if not _client_battle_accepts_combat_spawn_work("reliable_entity_birth"):
 		return
+	_apply_battle_entity(state, server_time_msec, now)
+
+
+func _apply_battle_entity(state: Dictionary, server_time_msec: int, now: int, from_snapshot: bool = false) -> bool:
 	var net_id = str(state.get("net_id", ""))
-	if net_id == "" or _locally_killed_until.has(net_id):
-		return
+	if net_id == "" or _closed_loot_enemy_ids.has(net_id):
+		return false
 	var category = str(state.get("category", _host_entity_category.get(net_id, "")))
-	if _host_state_marks_synced_entity_dead(state, category):
-		_schedule_remote_death(net_id, category, _dict_to_vec2(state.get("pos", {})), now + DEATH_VISUAL_DELAY_MSEC, "reliable_state_dead")
-		return
-	var sync_mode = _get_entity_sync_mode(category, state)
-	var pos = _dict_to_vec2(state.get("pos", {}))
-	var vel = _dict_to_vec2(state.get("vel", {}))
+	var locally_killed = _locally_killed_until.has(net_id)
+	if (from_snapshot or not locally_killed) and _host_state_marks_synced_entity_dead(state, category):
+		_schedule_remote_death(net_id, category, _dict_to_vec2(state.get("pos", {})), now + DEATH_VISUAL_DELAY_MSEC, "state_dead")
+		return false
+	if locally_killed:
+		return false
 	var was_known = _host_entities.has(net_id) and _is_valid_node(_host_entities[net_id])
+	if not was_known and from_snapshot and _unknown_entity_state_needs_reliable_resync(state):
+		_request_unknown_entity_resync(net_id, category, "missing_birth")
+		return false
 	var node = _get_or_create_host_entity(net_id, state)
 	if not _is_valid_node(node):
-		_request_unknown_entity_resync(net_id, category, "reliable_spawn_failed")
-		return
-	_apply_host_entity_state(node, state)
+		_request_unknown_entity_resync(net_id, category, "spawn_failed")
+		return false
+	var released = state.has("loot_release") and (node is Looter or node is EvilMob)
+	if state.has("gobbler") or state.has("loot_handoff") or _loot_enemy_rx_msec.has(net_id):
+		_loot_enemy_rx_msec[net_id] = now
+	if not was_known and (node is Looter or node is EvilMob):
+		_pending_entity_resync_requests_by_net_id.erase(net_id)
+	if state.has("gobbler") and node is EvilMob and (not released or not was_known):
+		node.bo_apply_gobbler_state(state.gobbler)
+	if state.has("gobbler") and not state.has("pos"):
+		return true
+	var pos = _dict_to_vec2(state.get("pos", {}))
+	if not released or not was_known:
+		_apply_host_entity_state(node, state, not was_known)
 	if not was_known or not _node_has_valid_position(node):
 		_set_node_global_pos(node, pos)
-	if sync_mode == SYNC_MODE_HOST_MOTION:
+	if released:
+		_close_loot_enemy_sync(net_id)
+		if node is EvilMob:
+			node.bo_apply_gobbler_state(state.loot_release, true)
+		elif not node.dead:
+			node._can_move = true
+			node._move_locked = false
+	elif _get_entity_sync_mode(category, state) == SYNC_MODE_HOST_MOTION:
+		if was_known and node is Looter and not from_snapshot:
+			return true # A retried birth may predate the latest motion sample.
+		var vel = _dict_to_vec2(state.get("vel", {}))
 		_host_entity_targets[net_id] = pos
 		_host_entity_velocities[net_id] = vel
 		_host_entity_rx_msec[net_id] = now
 		_append_entity_sample(net_id, server_time_msec, pos, vel)
+	return true
 
 
 func _process(delta: float) -> void:
@@ -966,42 +997,13 @@ func _apply_latest_snapshot_if_needed() -> void:
 	_prune_local_kill_ignores(now, active_ids)
 
 	for state in entities:
-		if typeof(state) != TYPE_DICTIONARY:
-			continue
-		var net_id = str(state.get("net_id", ""))
-		if net_id == "":
-			continue
-		var category = str(state.get("category", _host_entity_category.get(net_id, "")))
-		if _host_state_marks_synced_entity_dead(state, category):
-			_schedule_remote_death(net_id, category, _dict_to_vec2(state.get("pos", {})), now + DEATH_VISUAL_DELAY_MSEC, "state_dead")
-			continue
-		if _locally_killed_until.has(net_id):
-			continue
-		active_ids[net_id] = true
-
-		var sync_mode = _get_entity_sync_mode(category, state)
-		var pos = _dict_to_vec2(state.get("pos", {}))
-		var vel = _dict_to_vec2(state.get("vel", {}))
-		var was_known = _host_entities.has(net_id) and _is_valid_node(_host_entities[net_id])
-		if not was_known and _unknown_entity_state_needs_reliable_resync(state):
-			_request_unknown_entity_resync(net_id, category, "snapshot_unknown_missing_birth")
-			continue
-		var node = _get_or_create_host_entity(net_id, state)
-		if not _is_valid_node(node):
-			_request_unknown_entity_resync(net_id, category, "snapshot_spawn_failed")
-			continue
-
-		_apply_host_entity_state(node, state)
-		if not was_known or not _node_has_valid_position(node):
-			_set_node_global_pos(node, pos)
-
-		# Regular enemies/trees are birth-only on clients: after creation, their local
-		# movement/knockback/physics are not corrected by Host snapshots.
-		if sync_mode == SYNC_MODE_HOST_MOTION:
-			_host_entity_targets[net_id] = pos
-			_host_entity_velocities[net_id] = vel
-			_host_entity_rx_msec[net_id] = now
-			_append_entity_sample(net_id, server_time_msec, pos, vel)
+		if typeof(state) == TYPE_DICTIONARY and _apply_battle_entity(state, server_time_msec, now, true):
+			active_ids[str(state.net_id)] = true
+	# The host is still sending battle frames. Recover a missing handoff from its
+	# reliable state cache without treating gaps in the motion stream as a kill.
+	for loot_id in _loot_enemy_rx_msec:
+		if now - int(_loot_enemy_rx_msec[loot_id]) >= UNKNOWN_ENTITY_RESYNC_REQUEST_INTERVAL_MSEC:
+			_request_unknown_entity_resync(str(loot_id), "enemy", "missing_loot_update")
 
 	_apply_remote_player_states(snapshot, server_time_msec)
 	var main = get_tree().current_scene
@@ -1453,7 +1455,11 @@ func _configure_local_combat_entity(node: Node, net_id: String, category: String
 	node.set("can_drop_loot", category == "enemy" or category == "neutral" or category == "boss")
 	node.set("is_loot", false)
 
-	if host_motion:
+	if host_motion and node is Looter:
+		# Interpolation supplies movement. Keep the native sprite, hitboxes and death animation.
+		node._can_move = false
+		node._move_locked = false
+	elif host_motion:
 		_configure_host_motion_combat_entity(node, category)
 	else:
 		# Regular enemies/neutral entities must keep their local movement, attack,
@@ -1545,7 +1551,7 @@ func _configure_display_only_entity(node: Node) -> void:
 	_disable_collision_tree(node)
 
 
-func _apply_host_entity_state(node: Node, state: Dictionary) -> void:
+func _apply_host_entity_state(node: Node, state: Dictionary, new_entity: bool) -> void:
 	if not _is_valid_node(node):
 		return
 	var current_stats = node.get("current_stats")
@@ -1559,11 +1565,14 @@ func _apply_host_entity_state(node: Node, state: Dictionary) -> void:
 	# Apply max first, then current. Cursed enemies are born with boosted max/current
 	# health on the Host; regular birth-only enemies must receive that initial
 	# health too, not just bosses.
-	if max_stats != null and max_health >= 0:
+	var sync_health = new_entity or not (node is Looter or node is EvilMob)
+	if sync_health and max_stats != null and max_health >= 0:
 		max_stats.health = max_health
 	if current_stats != null:
-		if health >= 0:
+		if sync_health and health >= 0:
 			current_stats.health = health
+			if node is EvilMob and node.evolution > 0:
+				node.on_health_updated(node, health, max_stats.health)
 		if damage >= 0:
 			current_stats.damage = damage
 			_apply_entity_runtime_damage(node, damage)
@@ -1832,6 +1841,8 @@ func _update_host_entity_positions(delta: float) -> void:
 			node.set("_can_move", false)
 		var sample = _sample_position(_host_entity_samples.get(id, []), target_time, _host_entity_targets.get(id, _get_node_global_pos(node)), _host_entity_velocities.get(id, Vector2.ZERO))
 		var display_target = sample[0]
+		if node is Looter:
+			node.update_animation(sample[1])
 		var current = _get_node_global_pos(node)
 		_set_node_global_pos(node, current.linear_interpolate(display_target, alpha))
 
@@ -2032,6 +2043,9 @@ func _on_host_local_entity_died(entity, _die_args, net_id: String, category: Str
 	# A reused pooled node may have an old death-signal binding. Only the currently
 	# tracked instance is allowed to report a kill for this network id.
 	if not _host_entities.has(net_id) or _host_entities[net_id] != entity:
+		return
+	if entity is Looter or entity is EvilMob:
+		_close_loot_enemy_sync(net_id)
 		return
 
 	# Host-confirmed deaths and vanilla room cleanup must never be reflected back as
@@ -2289,6 +2303,14 @@ func _apply_reliable_birth_marker_state(birth_state: Dictionary, server_time_mse
 	var id = str(birth_state.get("net_id", ""))
 	if id == "":
 		return
+	if _closed_loot_enemy_ids.has(str(birth_state.get("spawn_net_id", birth_state.get("entity_net_id", "")))):
+		var all_closed = true
+		for member in birth_state.get("spawn_net_ids", []):
+			if not _closed_loot_enemy_ids.has(str(member)):
+				all_closed = false
+				break
+		if all_closed:
+			return
 	var state_copy = birth_state.duplicate(true)
 	state_copy["snapshot_server_time_msec"] = server_time_msec
 	if str(state_copy.get("spawn_category", "")) == "":
@@ -2322,7 +2344,7 @@ func _spawn_entity_from_birth_marker_state(birth_id: String, birth_state: Dictio
 			spawned_any = _spawn_entity_from_birth_marker_state(birth_id, member_state) or spawned_any
 		return spawned_any
 	var entity_net_id = str(birth_state.get("spawn_net_id", birth_state.get("entity_net_id", "")))
-	if entity_net_id == "" or _spawned_from_birth_marker_entity_ids.has(entity_net_id):
+	if entity_net_id == "" or _closed_loot_enemy_ids.has(entity_net_id) or _spawned_from_birth_marker_entity_ids.has(entity_net_id):
 		return false
 	if _host_entities.has(entity_net_id) and _is_valid_node(_host_entities[entity_net_id]):
 		_spawned_from_birth_marker_entity_ids[entity_net_id] = true
@@ -2332,10 +2354,14 @@ func _spawn_entity_from_birth_marker_state(birth_id: String, birth_state: Dictio
 		category = _category_from_entity_type(int(birth_state.get("entity_type", -1)))
 	if category == "":
 		return false
+	var scene_path = str(birth_state.get("spawn_scene_path", birth_state.get("scene_path", "")))
+	# Wait for the actual birth so even an immediate local kill has its drop roll and HP.
+	if Protocol.LOOT_ENEMY_SYNC_MODES.has(scene_path):
+		_request_unknown_entity_resync(entity_net_id, category, "loot_birth_timeout")
+		return false
 	# Warnings precede the native evolution roll. Use the final reliable entity birth.
 	if category in ["enemy", "boss"] and RunData.enabled_dlcs.has("primal_dread"):
 		return false
-	var scene_path = str(birth_state.get("spawn_scene_path", birth_state.get("scene_path", "")))
 	if scene_path == "":
 		return false
 	var pos = birth_state.get("pos", {})
@@ -3443,6 +3469,8 @@ func _on_host_entity_tree_exited(node: Node, net_id: String) -> void:
 	# callback to clear a newer binding for the same id or another entity.
 	if not _host_entities.has(net_id) or _host_entities[net_id] != node:
 		return
+	if (node is Looter or node is EvilMob) and node.dead:
+		_close_loot_enemy_sync(net_id)
 	_cleanup_host_entity_tracking(net_id)
 	_pending_remote_deaths.erase(net_id)
 	if node != null and is_instance_valid(node):
@@ -3461,12 +3489,24 @@ func _cleanup_host_entity_tracking(id: String) -> void:
 	_host_entities.erase(id)
 	_host_entity_category.erase(id)
 	_host_entity_scene_path.erase(id)
+	_clear_entity_motion(id)
+	_connected_died_ids.erase(id)
+	_connected_damage_ids.erase(id)
+
+
+func _close_loot_enemy_sync(id: String) -> void:
+	_closed_loot_enemy_ids[id] = true
+	_clear_entity_motion(id)
+	_pending_entity_resync_requests_by_net_id.erase(id)
+	_last_entity_resync_request_msec_by_net_id.erase(id)
+
+
+func _clear_entity_motion(id: String) -> void:
+	_loot_enemy_rx_msec.erase(id)
 	_host_entity_targets.erase(id)
 	_host_entity_velocities.erase(id)
 	_host_entity_rx_msec.erase(id)
 	_host_entity_samples.erase(id)
-	_connected_died_ids.erase(id)
-	_connected_damage_ids.erase(id)
 
 
 func _remove_birth_marker(id: String) -> void:
@@ -3550,6 +3590,8 @@ func _clear_all(reason: String) -> void:
 	_remote_player_rx_msec.clear()
 	_remote_player_samples.clear()
 	_locally_killed_until.clear()
+	_closed_loot_enemy_ids.clear()
+	_loot_enemy_rx_msec.clear()
 	_pending_boss_damage.clear()
 	_pending_boss_one_shots.clear()
 	_pending_remote_deaths.clear()
@@ -3809,16 +3851,13 @@ func _is_boss_elite_category(category: String) -> bool:
 
 
 func _is_looter_entity(entity) -> bool:
-	if not _is_valid_node(entity):
-		return false
-	var enemy_id = entity.get("enemy_id")
-	return enemy_id != null and str(enemy_id).to_lower() == LOOTER_ENEMY_ID
+	return _is_valid_node(entity) and entity is Looter
 
 
 func _is_looter_net_id(net_id: String) -> bool:
 	if net_id == "":
 		return false
-	if str(_host_entity_scene_path.get(net_id, "")) == LOOTER_SCENE_PATH:
+	if Protocol.LOOT_ENEMY_SYNC_MODES.get(_host_entity_scene_path.get(net_id, ""), "") == SYNC_MODE_HOST_MOTION:
 		return true
 	return _is_looter_entity(_host_entities.get(net_id, null))
 
@@ -3864,14 +3903,14 @@ func _should_apply_host_removed_entity(net_id: String) -> bool:
 
 func _get_entity_sync_mode(category: String, state: Dictionary) -> String:
 	var explicit_mode = str(state.get("sync_mode", "")) if typeof(state) == TYPE_DICTIONARY else ""
-	if explicit_mode == SYNC_MODE_BIRTH_ONLY or explicit_mode == SYNC_MODE_HOST_MOTION:
+	if explicit_mode in [SYNC_MODE_BIRTH_ONLY, SYNC_MODE_HOST_MOTION, SYNC_MODE_HOST_TARGET]:
 		return explicit_mode
 	# Regular enemies, neutral trees and structures are birth-only. Boss covers
 	# elites/bosses in Brotato; pets and the random-moving Looter use Host motion.
 	if category == "boss" or category == "pet":
 		return SYNC_MODE_HOST_MOTION
-	if category == "enemy" and str(state.get("scene_path", "")) == LOOTER_SCENE_PATH:
-		return SYNC_MODE_HOST_MOTION
+	if category == "enemy":
+		return Protocol.LOOT_ENEMY_SYNC_MODES.get(str(state.get("scene_path", "")), SYNC_MODE_BIRTH_ONLY)
 	return SYNC_MODE_BIRTH_ONLY
 
 

@@ -6,6 +6,16 @@ const NETWORK_PROTOCOL_VERSION = "6.3.0"
 const LAN_PROTOCOL_VERSION = 4
 const DISCOVERY_PROTOCOL_VERSION = 2
 
+# Birth markers have a scene path before the spawner has a live Looter or EvilMob.
+const LOOT_ENEMY_SYNC_MODES = {
+	"res://entities/units/enemies/crash_zone/basic/looter/looter.tscn": "host_motion",
+	"res://entities/units/enemies/abyss/basic/looting_pig/looting_pig.tscn": "host_motion",
+	"res://entities/units/enemies/jungle/basic/harpymimus_looter/harpymimus_looter.tscn": "host_motion",
+	"res://entities/units/enemies/crash_zone/basic/evil_mob/evil_mob.tscn": "host_target",
+	"res://entities/units/enemies/abyss/basic/evil_mob_swimmer/evil_mob_swimmer.tscn": "host_target",
+	"res://entities/units/enemies/jungle/basic/evil_mob_jungle/evil_mob_jungle.tscn": "host_target"
+}
+
 
 static func get_game_version() -> String:
 	return str(ProgressData.VERSION)

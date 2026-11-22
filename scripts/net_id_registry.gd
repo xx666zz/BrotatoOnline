@@ -96,13 +96,17 @@ func purge_missing(active_net_ids: Dictionary) -> Array:
 			continue
 
 		removed.append(net_id)
-		var instance_key = str(_instance_by_net_id[net_id])
-		_instance_by_net_id.erase(net_id)
-		_prefix_by_net_id.erase(net_id)
-		_last_seen_msec_by_net_id.erase(net_id)
-		_net_id_by_instance.erase(instance_key)
+		forget_net_id(net_id)
 
 	return removed
+
+
+func forget_net_id(net_id: String) -> void:
+	if _instance_by_net_id.has(net_id):
+		_net_id_by_instance.erase(str(_instance_by_net_id[net_id]))
+	_instance_by_net_id.erase(net_id)
+	_prefix_by_net_id.erase(net_id)
+	_last_seen_msec_by_net_id.erase(net_id)
 
 
 func reset() -> void:

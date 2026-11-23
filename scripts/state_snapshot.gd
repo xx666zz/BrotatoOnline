@@ -71,7 +71,7 @@ var _host_pickup_kind_by_net_id = {}
 var _birth_only_announced_net_ids = {}
 var _birth_only_first_seen_msec = {}
 var _announced_death_net_ids = {}
-var _birth_marker_announced_net_ids = {}
+var _announced_birth_positions = {}
 var _reserved_spawn_by_birth_id = {}
 var _reserved_birth_id_by_spawn_net_id = {}
 var _pending_signal_spawn_nodes = []
@@ -176,8 +176,9 @@ func build_snapshot() -> Dictionary:
 			if not birth_state.empty():
 				var birth_id = str(birth_state.get("net_id", ""))
 				active_dynamic_net_ids[birth_id] = true
-				if birth_id != "" and not _birth_marker_announced_net_ids.has(birth_id):
-					_birth_marker_announced_net_ids[birth_id] = true
+				var pos = _get_global_pos(birth)
+				if not _announced_birth_positions.has(birth_id) or _announced_birth_positions[birth_id] != pos:
+					_announced_birth_positions[birth_id] = pos
 					_queue_pending_reliable_birth_marker(birth_state)
 
 
@@ -802,16 +803,12 @@ func _build_player_state(player: Node, fallback_index: int, registry: Node) -> D
 
 
 func _build_birth_state(birth: Node, registry: Node, now_msec: int) -> Dictionary:
-	var net_id = ""
-	if registry != null and registry.has_method("get_or_assign_net_id"):
-		net_id = str(registry.get_or_assign_net_id(birth, "birth"))
-		registry.mark_seen(net_id)
-
-	if net_id == "":
-		return {}
-
 	var request = birth.get("request")
-	if request == null:
+	if request == null or registry == null:
+		return {}
+	# The spawner can recycle the same EntityBirth between snapshots. Each queued spawn has its own request.
+	var net_id = registry.get_or_assign_net_id(request, "birth")
+	if net_id == "":
 		return {}
 	var scene_path = ""
 	var scene = request.scene
@@ -889,7 +886,6 @@ func _get_or_create_reserved_spawn_net_id(birth_net_id: String, registry: Node, 
 		"entity_type": entity_type,
 		"scene_path": scene_path,
 		"pos": pos,
-		"created_msec": now_msec,
 		"updated_msec": now_msec
 	}
 	_reserved_spawn_by_birth_id[birth_net_id] = info
@@ -910,7 +906,7 @@ func _match_reserved_spawn_for_entity(entity: Node, category: String, entity_typ
 		var info = _reserved_spawn_by_birth_id[birth_id]
 		if typeof(info) != TYPE_DICTIONARY:
 			continue
-		if now_msec - int(info.get("created_msec", now_msec)) > RESERVED_BIRTH_TTL_MSEC:
+		if now_msec - int(info.get("updated_msec", now_msec)) > RESERVED_BIRTH_TTL_MSEC:
 			continue
 		if str(info.get("category", "")) != category:
 			continue
@@ -1031,7 +1027,7 @@ func _release_loot_enemy(net_id: String) -> void:
 func _forget_live_entity(net_id: String) -> void:
 	_birth_only_announced_net_ids.erase(net_id)
 	_birth_only_first_seen_msec.erase(net_id)
-	_birth_marker_announced_net_ids.erase(net_id)
+	_announced_birth_positions.erase(net_id)
 	_last_entity_pos_by_net_id.erase(net_id)
 	_last_entity_category_by_net_id.erase(net_id)
 	_last_entity_cursed_by_net_id.erase(net_id)
@@ -2142,7 +2138,8 @@ func mark_battle_reliable_events_sent(message: Dictionary) -> void:
 			if typeof(birth) != TYPE_DICTIONARY:
 				continue
 			var birth_id = str(birth.get("net_id", ""))
-			if birth_id == "":
+			var pending = _pending_reliable_birth_markers_by_net_id.get(birth_id)
+			if pending == null or pending.get("server_time_msec", -1) != birth.get("server_time_msec", -1):
 				continue
 			_pending_reliable_birth_markers_by_net_id.erase(birth_id)
 			_pending_reliable_birth_marker_order.erase(birth_id)
@@ -2321,7 +2318,7 @@ func _ensure_current_game_scene_registered(reason: String, locator: Node, is_hos
 		_birth_only_announced_net_ids.clear()
 		_birth_only_first_seen_msec.clear()
 		_announced_death_net_ids.clear()
-		_birth_marker_announced_net_ids.clear()
+		_announced_birth_positions.clear()
 		_reserved_spawn_by_birth_id.clear()
 		_reserved_birth_id_by_spawn_net_id.clear()
 		_pending_signal_spawn_nodes.clear()
@@ -2358,7 +2355,7 @@ func _on_left_game_scene() -> void:
 	_birth_only_announced_net_ids.clear()
 	_birth_only_first_seen_msec.clear()
 	_announced_death_net_ids.clear()
-	_birth_marker_announced_net_ids.clear()
+	_announced_birth_positions.clear()
 	_reserved_spawn_by_birth_id.clear()
 	_reserved_birth_id_by_spawn_net_id.clear()
 	_pending_signal_spawn_nodes.clear()

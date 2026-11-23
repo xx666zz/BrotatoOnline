@@ -1,7 +1,7 @@
 extends Node
 
 # Host-side stable net_id assignment for active runtime entities.
-# Important: get_instance_id() is only used locally to remember a currently active node.
+# Important: get_instance_id() is only used locally to track a live node or spawn request.
 # Network messages must use the assigned net_id, not get_instance_id().
 
 
@@ -16,11 +16,11 @@ func get_player_net_id(player_index: int) -> String:
 	return "player_%s" % str(player_index)
 
 
-func get_or_assign_net_id(node: Node, prefix: String) -> String:
-	if node == null or not is_instance_valid(node):
+func get_or_assign_net_id(instance: Object, prefix: String) -> String:
+	if not is_instance_valid(instance):
 		return ""
 
-	var instance_key = str(node.get_instance_id())
+	var instance_key = str(instance.get_instance_id())
 	if _net_id_by_instance.has(instance_key):
 		var existing_id = str(_net_id_by_instance[instance_key])
 		_last_seen_msec_by_net_id[existing_id] = OS.get_ticks_msec()
@@ -47,10 +47,10 @@ func reserve_net_id(prefix: String) -> String:
 	return net_id
 
 
-func get_existing_net_id(node: Node) -> String:
-	if node == null or not is_instance_valid(node):
+func get_existing_net_id(instance: Object) -> String:
+	if not is_instance_valid(instance):
 		return ""
-	var instance_key = str(node.get_instance_id())
+	var instance_key = str(instance.get_instance_id())
 	if _net_id_by_instance.has(instance_key):
 		var existing_id = str(_net_id_by_instance[instance_key])
 		_last_seen_msec_by_net_id[existing_id] = OS.get_ticks_msec()

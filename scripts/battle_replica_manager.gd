@@ -121,6 +121,7 @@ var _remote_player_samples = {}         # player_index -> [{t:int host_msec, pos
 
 var _birth_markers = {}
 var _birth_marker_states = {}
+var _last_birth_marker_sample_msec = {}
 var _latest_wave_timer_state = {}
 var _pickup_markers = {}                # pickup_net_id -> Node2D marker
 var _pickup_targets = {}
@@ -2283,8 +2284,7 @@ func _snapshot_allows_birth_markers(snapshot: Dictionary) -> bool:
 
 
 func _clear_birth_markers(reason: String) -> void:
-	if _birth_markers.empty() and _birth_marker_states.empty():
-		return
+	_last_birth_marker_sample_msec.clear()
 	for id_value in _birth_markers.keys():
 		var marker = _birth_markers[id_value]
 		if _is_valid_node(marker):
@@ -2311,17 +2311,25 @@ func _apply_reliable_birth_marker_state(birth_state: Dictionary, server_time_mse
 				break
 		if all_closed:
 			return
+	# A retried reliable batch can carry an earlier sample, even after its marker expired.
+	var sample_msec = int(birth_state.get("server_time_msec", server_time_msec))
+	if sample_msec <= int(_last_birth_marker_sample_msec.get(id, -1)):
+		return
 	var state_copy = birth_state.duplicate(true)
-	state_copy["snapshot_server_time_msec"] = server_time_msec
+	state_copy["snapshot_server_time_msec"] = sample_msec
 	if str(state_copy.get("spawn_category", "")) == "":
 		state_copy["spawn_category"] = _category_from_entity_type(int(state_copy.get("entity_type", -1)))
 	if str(state_copy.get("spawn_sync_mode", "")) == "":
 		state_copy["spawn_sync_mode"] = _get_entity_sync_mode(str(state_copy.get("spawn_category", "")), {})
 	if str(state_copy.get("spawn_scene_path", "")) == "":
 		state_copy["spawn_scene_path"] = str(state_copy.get("scene_path", ""))
+	var previous = _birth_marker_states.get(id)
+	if previous != null and _dict_to_vec2(previous.get("pos", {})) != _dict_to_vec2(state_copy.get("pos", {})):
+		_remove_birth_marker(id)
 	_birth_marker_states[id] = state_copy
 	var marker = _get_or_create_birth_marker(id, state_copy)
 	if _is_valid_node(marker):
+		_last_birth_marker_sample_msec[id] = sample_msec
 		_sync_birth_marker_runtime(marker, state_copy)
 		marker.set_meta("brotato_online_birth_state", state_copy)
 
@@ -2331,6 +2339,18 @@ func _spawn_entity_from_birth_marker_state(birth_id: String, birth_state: Dictio
 		return false
 	if birth_id == "" or typeof(birth_state) != TYPE_DICTIONARY or birth_state.empty():
 		return false
+	var category = str(birth_state.get("spawn_category", ""))
+	if category == "":
+		category = _category_from_entity_type(int(birth_state.get("entity_type", -1)))
+	var scene_path = str(birth_state.get("spawn_scene_path", birth_state.get("scene_path", "")))
+	if category == "" or scene_path == "":
+		return false
+	var loot_enemy = Protocol.LOOT_ENEMY_SYNC_MODES.has(scene_path)
+	# Wait for the host's final position. Loot enemies can also request their birth state below.
+	if category == "enemy" and not loot_enemy:
+		return false
+	if category == "boss" and RunData.enabled_dlcs.has("primal_dread"):
+		return false # The host rolls the evolution on spawn.
 	if int(birth_state.get("group_count", -1)) > 0:
 		var spawned_any = false
 		var member_ids = birth_state.get("spawn_net_ids", [])
@@ -2349,20 +2369,8 @@ func _spawn_entity_from_birth_marker_state(birth_id: String, birth_state: Dictio
 	if _host_entities.has(entity_net_id) and _is_valid_node(_host_entities[entity_net_id]):
 		_spawned_from_birth_marker_entity_ids[entity_net_id] = true
 		return false
-	var category = str(birth_state.get("spawn_category", ""))
-	if category == "":
-		category = _category_from_entity_type(int(birth_state.get("entity_type", -1)))
-	if category == "":
-		return false
-	var scene_path = str(birth_state.get("spawn_scene_path", birth_state.get("scene_path", "")))
-	# Wait for the actual birth so even an immediate local kill has its drop roll and HP.
-	if Protocol.LOOT_ENEMY_SYNC_MODES.has(scene_path):
+	if loot_enemy:
 		_request_unknown_entity_resync(entity_net_id, category, "loot_birth_timeout")
-		return false
-	# Warnings precede the native evolution roll. Use the final reliable entity birth.
-	if category in ["enemy", "boss"] and RunData.enabled_dlcs.has("primal_dread"):
-		return false
-	if scene_path == "":
 		return false
 	var pos = birth_state.get("pos", {})
 	var entity_state = {
@@ -2485,9 +2493,7 @@ func _configure_birth_display_node(node: Node, birth_state: Dictionary) -> void:
 	var pos = _dict_to_vec2(birth_state.get("pos", {}))
 	var packed_scene = _load_packed_scene(str(birth_state.get("scene_path", "")))
 
-	# Use Brotato's real EntityBirth visual timing/flicker.
-	# overlay. The Host also sends a reserved entity_net_id in the warning packet,
-	# so the client can create the matching entity as soon as the marker expires.
+	# Use the native warning animation for single and group spawns.
 	var timeout_signal = "birth_group_timeout" if int(birth_state.get("group_count", -1)) > 0 else "birth_timeout"
 	if node.has_signal(timeout_signal) and not node.is_connected(timeout_signal, self, "_on_replica_birth_marker_timeout"):
 		node.connect(timeout_signal, self, "_on_replica_birth_marker_timeout", [id])
@@ -2572,6 +2578,8 @@ func _update_birth_markers() -> void:
 
 
 func _on_replica_birth_marker_timeout(birth: Node, id: String) -> void:
+	if _birth_markers.get(id) != birth:
+		return # A deferred timeout from the old position arrived after relocation.
 	# EntityBirth.birth() can already be queued with call_deferred() when quiescence starts.
 	# The callback therefore needs the same central lifecycle gate as packet-driven spawns.
 	if not _client_battle_accepts_combat_spawn_work("birth_marker_timeout"):
